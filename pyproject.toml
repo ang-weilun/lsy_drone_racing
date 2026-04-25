@@ -73,6 +73,9 @@ cmake = "*"
 compilers = ">=1.9.0, <1.11.0"
 make = "*"
 openblas = ">=0.3.30,<0.4"
+trimesh = ">=4.12.0,<5"
+rtree = ">=1.4.1,<2"
+cvxpy = ">=1.8.2,<2"
 
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
