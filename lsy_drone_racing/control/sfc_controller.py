@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 
 class SkeletonPoint(NamedTuple):
+    """Represents a skeleton point in the planned path with gate information."""
+
     pos: NDArray
     is_gate: bool
     gate_normal: NDArray | None
@@ -31,6 +33,8 @@ class SkeletonPoint(NamedTuple):
 
 
 class Capsule(NamedTuple):
+    """Represents a capsule obstacle (cylinder with spherical ends)."""
+
     p1: NDArray
     p2: NDArray
     radius: float
@@ -38,7 +42,15 @@ class Capsule(NamedTuple):
 
 
 class FlightCorridor:
-    def __init__(self, p1: NDArray, p2: NDArray):
+    """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
+
+    def __init__(self, p1: NDArray, p2: NDArray) -> None:
+        """Initialize a flight corridor between two waypoints.
+
+        Args:
+            p1: Start point of the corridor.
+            p2: End point of the corridor.
+        """
         self.A = []
         self.b = []
         self.p1 = p1
@@ -107,15 +119,22 @@ class StateController(Controller):
     W_JERK = 4.0
     W_CENTER = 0.1
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict) -> None:
+        """Initialize the Safe Flight Corridor controller.
+
+        Args:
+            obs: Dictionary of observations from the environment.
+            info: Dictionary of environment info.
+            config: Configuration dictionary.
+        """
         super().__init__(obs, info, config)
         self._freq = config.env.freq
         self._tick = 0
         self._spline_tick = 0
         self._finished = False
 
-        self.anchor_gap = 0.30
-        self.base_speed = 0.75
+        self.anchor_gap = 0.3
+        self.base_speed = 0.95
         self.points_per_segment = 4
 
         self.gate_outer = 0.72
@@ -137,9 +156,16 @@ class StateController(Controller):
         initial_vel = obs.get("vel", np.zeros(3))
         self.generate_spline(obs["pos"], initial_vel)
 
-    def generate_spline(self, current_pos: NDArray, current_vel: NDArray):
+    def generate_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
+        """Generate a B-spline trajectory through safe flight corridors.
+
+        Args:
+            current_pos: Current position of the drone.
+            current_vel: Current velocity of the drone.
+        """
         skeleton_path = self._calculate_anchors(current_pos[:3])
         self.skeleton_path = skeleton_path
+        self._current_pos_for_spline = current_pos[:3].copy()
         capsules = self._get_all_obstacle_capsules()
         corridors = self._generate_flight_corridors(skeleton_path, capsules)
 
@@ -250,9 +276,10 @@ class StateController(Controller):
 
             # Add separating half-spaces for all capsules
             for cap in capsules:
-                # Do not apply collision capsules from the gate we are currently routing through or approaching
-                # If either endpoint of the segment is within 1.0m of the capsule, assume it's part of the gate structure
-                # and the skeleton path is already safely routed through the opening.
+                # Do not apply collision capsules from the gate we are currently
+                # routing through or approaching. If either endpoint of the segment
+                # is within 1.0m of the capsule, assume it's part of the gate
+                # structure and the skeleton path is already safely routed through.
                 if cap.is_gate and (
                     np.linalg.norm(cap.p1 - pt1.pos) < 1.0 or np.linalg.norm(cap.p1 - pt2.pos) < 1.0
                 ):
@@ -289,34 +316,61 @@ class StateController(Controller):
         """Solves a QP to find optimal control points strictly within the Safe Corridors."""
         n_segments = len(corridors)
         pts_per_seg = self.points_per_segment
-        n_ctrl = n_segments * pts_per_seg
+        
+        # Determine first segment points based on distance to next waypoint
+        if len(skeleton_path) > 1:
+            dist_to_next = np.linalg.norm(skeleton_path[1].pos - skeleton_path[0].pos)
+            if dist_to_next < 0.25:
+                pts_first_seg = 1
+            elif dist_to_next < 0.50:
+                pts_first_seg = 2
+            elif dist_to_next < 0.75:
+                pts_first_seg = 3
+            else:
+                pts_first_seg = 4
+        else:
+            pts_first_seg = 1
+        
+        pts_rest_seg = pts_per_seg
+        n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
         P = cp.Variable((n_ctrl, 3))
         constraints = []
 
-        reference_points = np.vstack(
-            [
-                corridors[i].p1 + (j / pts_per_seg) * (corridors[i].p2 - corridors[i].p1)
-                for i in range(n_segments)
-                for j in range(pts_per_seg)
-            ]
-        )
+        # Build reference points with variable points per segment
+        reference_points_list = []
+        for i in range(n_segments):
+            n_pts = pts_first_seg if i == 0 else pts_rest_seg
+            for j in range(n_pts):
+                pt = corridors[i].p1 + (j / n_pts) * (corridors[i].p2 - corridors[i].p1)
+                reference_points_list.append(pt)
+        reference_points = np.array(reference_points_list)
 
+        # Apply corridor constraints with variable points per segment
         idx = 0
-        for corr in corridors:
+        for seg_idx, corr in enumerate(corridors):
             A = np.array(corr.A)
             b = np.array(corr.b)
-            for _ in range(pts_per_seg):
+            n_pts = pts_first_seg if seg_idx == 0 else pts_rest_seg
+            for _ in range(n_pts):
                 constraints.append(A @ P[idx] <= b)
                 idx += 1
 
-        constraints.extend([P[0] == skeleton_path[0].pos, P[-1] == skeleton_path[-1].pos])
+        constraints.extend([P[-1] == skeleton_path[-1].pos])
+
+        # Build a mapping from skeleton path indices to control point indices
+        cp_idx_map = [0]  # skeleton_path[0] maps to control point 0
+        idx = pts_first_seg
+        for seg_idx in range(1, n_segments):
+            cp_idx_map.append(idx)
+            idx += pts_rest_seg
+        cp_idx_map.append(n_ctrl - 1)  # Last skeleton point maps to last control point
 
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
-                gate_idx = i * pts_per_seg
+                gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
-                constraints.append(P[gate_idx] == skeleton_path[i].pos)
+                constraints.append(P[gate_cp_idx] == skeleton_path[i].pos)
 
         cost = (
             self.W_VEL * cp.sum_squares(cp.diff(P, axis=0))
@@ -325,31 +379,39 @@ class StateController(Controller):
             + self.W_CENTER * cp.sum_squares(P - reference_points)
         )
 
+        # Initial position and velocity continuity: anchor spline to current drone state
+        current_pos = self._current_pos_for_spline
+        cost += 10.0 * cp.sum_squares(P[0] - current_pos)  # Soft anchor P[0] near current pos
+        
         # C1 Continuity (Initial Velocity Matching)
         speed = np.linalg.norm(current_vel)
         if speed > 0.1:
-            # Predict where the drone will be in 0.1 seconds.
-            dt = 0.1
-            p1_target = skeleton_path[0].pos + current_vel * dt
-
-            cost += 5.0 * cp.sum_squares(P[1] - p1_target)
+            # Predict where the drone will be in the next 0.05 seconds
+            dt = 0.05
+            p_expected = current_pos + current_vel * dt
+            cost += 50.0 * cp.sum_squares(P[1] - p_expected)  # Strong velocity matching
+        else:
+            # If stationary, just keep next point close
+            cost += 10.0 * cp.sum_squares(P[1] - current_pos)
 
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
-                gate_idx = i * pts_per_seg
+                gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
 
                 # Enforce symmetry around the gate for smooth straight passage
-                if gate_idx - 1 >= 0 and gate_idx + 1 < n_ctrl:
-                    constraints.append(P[gate_idx - 1] + P[gate_idx + 1] == 2 * P[gate_idx])
+                if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
+                    constraints.append(
+                        P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx]
+                    )
 
                 # Softly penalize deviation from the normal line
-                if gate_idx - 1 >= 0:
-                    dp = P[gate_idx - 1] - skeleton_path[i].pos
+                if gate_cp_idx - 1 >= 0:
+                    dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
                     cost += 100.0 * cp.sum_squares(dp - proj)
-                if gate_idx + 1 < n_ctrl:
-                    dp = P[gate_idx + 1] - skeleton_path[i].pos
+                if gate_cp_idx + 1 < n_ctrl:
+                    dp = P[gate_cp_idx + 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
                     cost += 100.0 * cp.sum_squares(dp - proj)
 
@@ -473,12 +535,17 @@ class StateController(Controller):
 
         return path
 
-    def _check_environment_updates(self, obs: dict[str, NDArray[np.floating]]):
+    def _check_environment_updates(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Check and handle environment updates (moved objects, crossed gates).
+
+        Args:
+            obs: Dictionary of observations from the environment.
+        """
         pos, vel = obs["pos"], obs.get("vel", np.zeros(3))
         if self._prev_pos is None:
             self._prev_pos = pos.copy()
 
-        gate_crossed = self._check_gate_crossed(pos)
+        self._check_gate_crossed(pos)
         objects_moved = self._check_objects_moved(obs)
 
         if objects_moved:
@@ -529,6 +596,15 @@ class StateController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+        """Compute control outputs given current observations.
+
+        Args:
+            obs: Dictionary of observations from the environment.
+            info: Optional dictionary of environment info.
+
+        Returns:
+            Array containing desired position, velocity, acceleration, yaw, and zeros.
+        """
         self._check_environment_updates(obs)
 
         t = min(self._spline_tick / self._freq, self._t_total)
@@ -546,16 +622,43 @@ class StateController(Controller):
 
         return np.concatenate((des_pos, des_vel, des_acc, [yaw], np.zeros(3)), dtype=np.float32)
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Callback executed after each environment step.
+
+        Args:
+            action: Action taken in the environment.
+            obs: Dictionary of observations.
+            reward: Reward received.
+            terminated: Whether episode terminated.
+            truncated: Whether episode was truncated.
+            info: Dictionary of environment info.
+
+        Returns:
+            Whether the controller has finished executing its plan.
+        """
         self._tick += 1
         self._spline_tick += 1
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Reset controller state at the start of a new episode."""
         self._tick, self._spline_tick, self._finished, self.target_gate_idx = 0, 0, False, 0
         self._prev_pos = None
 
-    def render_callback(self, sim: Sim):
+    def render_callback(self, sim: Sim) -> None:
+        """Render visualization of the trajectory and waypoints.
+
+        Args:
+            sim: The simulator instance to draw on.
+        """
         if not hasattr(self, "_des_pos_spline"):
             return
         u = (
