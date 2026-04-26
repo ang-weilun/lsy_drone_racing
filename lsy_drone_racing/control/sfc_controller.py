@@ -316,7 +316,7 @@ class StateController(Controller):
         """Solves a QP to find optimal control points strictly within the Safe Corridors."""
         n_segments = len(corridors)
         pts_per_seg = self.points_per_segment
-        
+
         # Determine first segment points based on distance to next waypoint
         if len(skeleton_path) > 1:
             dist_to_next = np.linalg.norm(skeleton_path[1].pos - skeleton_path[0].pos)
@@ -330,7 +330,7 @@ class StateController(Controller):
                 pts_first_seg = 4
         else:
             pts_first_seg = 1
-        
+
         pts_rest_seg = pts_per_seg
         n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
@@ -382,7 +382,7 @@ class StateController(Controller):
         # Initial position and velocity continuity: anchor spline to current drone state
         current_pos = self._current_pos_for_spline
         cost += 10.0 * cp.sum_squares(P[0] - current_pos)  # Soft anchor P[0] near current pos
-        
+
         # C1 Continuity (Initial Velocity Matching)
         speed = np.linalg.norm(current_vel)
         if speed > 0.1:
