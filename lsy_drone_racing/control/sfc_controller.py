@@ -133,8 +133,8 @@ class StateController(Controller):
         self._spline_tick = 0
         self._finished = False
 
-        self.anchor_gap = 0.3
-        self.base_speed = 0.95
+        self.anchor_gap = 0.27
+        self.base_speed = 1.15
         self.points_per_segment = 4
 
         self.gate_outer = 0.72
