@@ -114,8 +114,8 @@ class StateController(Controller):
         self._spline_tick = 0
         self._finished = False
 
-        self.anchor_gap = 0.30
-        self.base_speed = 0.75
+        self.anchor_gap = 0.3
+        self.base_speed = 0.95
         self.points_per_segment = 4
 
         self.gate_outer = 0.72
@@ -140,6 +140,7 @@ class StateController(Controller):
     def generate_spline(self, current_pos: NDArray, current_vel: NDArray):
         skeleton_path = self._calculate_anchors(current_pos[:3])
         self.skeleton_path = skeleton_path
+        self._current_pos_for_spline = current_pos[:3].copy()
         capsules = self._get_all_obstacle_capsules()
         corridors = self._generate_flight_corridors(skeleton_path, capsules)
 
@@ -289,34 +290,61 @@ class StateController(Controller):
         """Solves a QP to find optimal control points strictly within the Safe Corridors."""
         n_segments = len(corridors)
         pts_per_seg = self.points_per_segment
-        n_ctrl = n_segments * pts_per_seg
+        
+        # Determine first segment points based on distance to next waypoint
+        if len(skeleton_path) > 1:
+            dist_to_next = np.linalg.norm(skeleton_path[1].pos - skeleton_path[0].pos)
+            if dist_to_next < 0.25:
+                pts_first_seg = 1
+            elif dist_to_next < 0.50:
+                pts_first_seg = 2
+            elif dist_to_next < 0.75:
+                pts_first_seg = 3
+            else:
+                pts_first_seg = 4
+        else:
+            pts_first_seg = 1
+        
+        pts_rest_seg = pts_per_seg
+        n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
         P = cp.Variable((n_ctrl, 3))
         constraints = []
 
-        reference_points = np.vstack(
-            [
-                corridors[i].p1 + (j / pts_per_seg) * (corridors[i].p2 - corridors[i].p1)
-                for i in range(n_segments)
-                for j in range(pts_per_seg)
-            ]
-        )
+        # Build reference points with variable points per segment
+        reference_points_list = []
+        for i in range(n_segments):
+            n_pts = pts_first_seg if i == 0 else pts_rest_seg
+            for j in range(n_pts):
+                pt = corridors[i].p1 + (j / n_pts) * (corridors[i].p2 - corridors[i].p1)
+                reference_points_list.append(pt)
+        reference_points = np.array(reference_points_list)
 
+        # Apply corridor constraints with variable points per segment
         idx = 0
-        for corr in corridors:
+        for seg_idx, corr in enumerate(corridors):
             A = np.array(corr.A)
             b = np.array(corr.b)
-            for _ in range(pts_per_seg):
+            n_pts = pts_first_seg if seg_idx == 0 else pts_rest_seg
+            for _ in range(n_pts):
                 constraints.append(A @ P[idx] <= b)
                 idx += 1
 
-        constraints.extend([P[0] == skeleton_path[0].pos, P[-1] == skeleton_path[-1].pos])
+        constraints.extend([P[-1] == skeleton_path[-1].pos])
+
+        # Build a mapping from skeleton path indices to control point indices
+        cp_idx_map = [0]  # skeleton_path[0] maps to control point 0
+        idx = pts_first_seg
+        for seg_idx in range(1, n_segments):
+            cp_idx_map.append(idx)
+            idx += pts_rest_seg
+        cp_idx_map.append(n_ctrl - 1)  # Last skeleton point maps to last control point
 
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
-                gate_idx = i * pts_per_seg
+                gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
-                constraints.append(P[gate_idx] == skeleton_path[i].pos)
+                constraints.append(P[gate_cp_idx] == skeleton_path[i].pos)
 
         cost = (
             self.W_VEL * cp.sum_squares(cp.diff(P, axis=0))
@@ -325,31 +353,37 @@ class StateController(Controller):
             + self.W_CENTER * cp.sum_squares(P - reference_points)
         )
 
+        # Initial position and velocity continuity: anchor spline to current drone state
+        current_pos = self._current_pos_for_spline
+        cost += 10.0 * cp.sum_squares(P[0] - current_pos)  # Soft anchor P[0] near current pos
+        
         # C1 Continuity (Initial Velocity Matching)
         speed = np.linalg.norm(current_vel)
         if speed > 0.1:
-            # Predict where the drone will be in 0.1 seconds.
-            dt = 0.1
-            p1_target = skeleton_path[0].pos + current_vel * dt
-
-            cost += 5.0 * cp.sum_squares(P[1] - p1_target)
+            # Predict where the drone will be in the next 0.05 seconds
+            dt = 0.05
+            p_expected = current_pos + current_vel * dt
+            cost += 50.0 * cp.sum_squares(P[1] - p_expected)  # Strong velocity matching
+        else:
+            # If stationary, just keep next point close
+            cost += 10.0 * cp.sum_squares(P[1] - current_pos)
 
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
-                gate_idx = i * pts_per_seg
+                gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
 
                 # Enforce symmetry around the gate for smooth straight passage
-                if gate_idx - 1 >= 0 and gate_idx + 1 < n_ctrl:
-                    constraints.append(P[gate_idx - 1] + P[gate_idx + 1] == 2 * P[gate_idx])
+                if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
+                    constraints.append(P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx])
 
                 # Softly penalize deviation from the normal line
-                if gate_idx - 1 >= 0:
-                    dp = P[gate_idx - 1] - skeleton_path[i].pos
+                if gate_cp_idx - 1 >= 0:
+                    dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
                     cost += 100.0 * cp.sum_squares(dp - proj)
-                if gate_idx + 1 < n_ctrl:
-                    dp = P[gate_idx + 1] - skeleton_path[i].pos
+                if gate_cp_idx + 1 < n_ctrl:
+                    dp = P[gate_cp_idx + 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
                     cost += 100.0 * cp.sum_squares(dp - proj)
 
