@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 
 class SkeletonPoint(NamedTuple):
+    """Represents a skeleton point in the planned path with gate information."""
+
     pos: NDArray
     is_gate: bool
     gate_normal: NDArray | None
@@ -31,6 +33,8 @@ class SkeletonPoint(NamedTuple):
 
 
 class Capsule(NamedTuple):
+    """Represents a capsule obstacle (cylinder with spherical ends)."""
+
     p1: NDArray
     p2: NDArray
     radius: float
@@ -38,7 +42,15 @@ class Capsule(NamedTuple):
 
 
 class FlightCorridor:
-    def __init__(self, p1: NDArray, p2: NDArray):
+    """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
+
+    def __init__(self, p1: NDArray, p2: NDArray) -> None:
+        """Initialize a flight corridor between two waypoints.
+
+        Args:
+            p1: Start point of the corridor.
+            p2: End point of the corridor.
+        """
         self.A = []
         self.b = []
         self.p1 = p1
@@ -107,7 +119,14 @@ class StateController(Controller):
     W_JERK = 4.0
     W_CENTER = 0.1
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict) -> None:
+        """Initialize the Safe Flight Corridor controller.
+
+        Args:
+            obs: Dictionary of observations from the environment.
+            info: Dictionary of environment info.
+            config: Configuration dictionary.
+        """
         super().__init__(obs, info, config)
         self._freq = config.env.freq
         self._tick = 0
@@ -137,7 +156,13 @@ class StateController(Controller):
         initial_vel = obs.get("vel", np.zeros(3))
         self.generate_spline(obs["pos"], initial_vel)
 
-    def generate_spline(self, current_pos: NDArray, current_vel: NDArray):
+    def generate_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
+        """Generate a B-spline trajectory through safe flight corridors.
+
+        Args:
+            current_pos: Current position of the drone.
+            current_vel: Current velocity of the drone.
+        """
         skeleton_path = self._calculate_anchors(current_pos[:3])
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
@@ -251,9 +276,10 @@ class StateController(Controller):
 
             # Add separating half-spaces for all capsules
             for cap in capsules:
-                # Do not apply collision capsules from the gate we are currently routing through or approaching
-                # If either endpoint of the segment is within 1.0m of the capsule, assume it's part of the gate structure
-                # and the skeleton path is already safely routed through the opening.
+                # Do not apply collision capsules from the gate we are currently
+                # routing through or approaching. If either endpoint of the segment
+                # is within 1.0m of the capsule, assume it's part of the gate
+                # structure and the skeleton path is already safely routed through.
                 if cap.is_gate and (
                     np.linalg.norm(cap.p1 - pt1.pos) < 1.0 or np.linalg.norm(cap.p1 - pt2.pos) < 1.0
                 ):
@@ -375,7 +401,9 @@ class StateController(Controller):
 
                 # Enforce symmetry around the gate for smooth straight passage
                 if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
-                    constraints.append(P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx])
+                    constraints.append(
+                        P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx]
+                    )
 
                 # Softly penalize deviation from the normal line
                 if gate_cp_idx - 1 >= 0:
@@ -507,12 +535,17 @@ class StateController(Controller):
 
         return path
 
-    def _check_environment_updates(self, obs: dict[str, NDArray[np.floating]]):
+    def _check_environment_updates(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Check and handle environment updates (moved objects, crossed gates).
+
+        Args:
+            obs: Dictionary of observations from the environment.
+        """
         pos, vel = obs["pos"], obs.get("vel", np.zeros(3))
         if self._prev_pos is None:
             self._prev_pos = pos.copy()
 
-        gate_crossed = self._check_gate_crossed(pos)
+        self._check_gate_crossed(pos)
         objects_moved = self._check_objects_moved(obs)
 
         if objects_moved:
@@ -563,6 +596,15 @@ class StateController(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+        """Compute control outputs given current observations.
+
+        Args:
+            obs: Dictionary of observations from the environment.
+            info: Optional dictionary of environment info.
+
+        Returns:
+            Array containing desired position, velocity, acceleration, yaw, and zeros.
+        """
         self._check_environment_updates(obs)
 
         t = min(self._spline_tick / self._freq, self._t_total)
@@ -580,16 +622,43 @@ class StateController(Controller):
 
         return np.concatenate((des_pos, des_vel, des_acc, [yaw], np.zeros(3)), dtype=np.float32)
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Callback executed after each environment step.
+
+        Args:
+            action: Action taken in the environment.
+            obs: Dictionary of observations.
+            reward: Reward received.
+            terminated: Whether episode terminated.
+            truncated: Whether episode was truncated.
+            info: Dictionary of environment info.
+
+        Returns:
+            Whether the controller has finished executing its plan.
+        """
         self._tick += 1
         self._spline_tick += 1
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
+        """Reset controller state at the start of a new episode."""
         self._tick, self._spline_tick, self._finished, self.target_gate_idx = 0, 0, False, 0
         self._prev_pos = None
 
-    def render_callback(self, sim: Sim):
+    def render_callback(self, sim: Sim) -> None:
+        """Render visualization of the trajectory and waypoints.
+
+        Args:
+            sim: The simulator instance to draw on.
+        """
         if not hasattr(self, "_des_pos_spline"):
             return
         u = (
