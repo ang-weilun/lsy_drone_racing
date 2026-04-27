@@ -114,10 +114,10 @@ def closest_points_segments(
 class StateController(Controller):
     """State controller following a Safe Flight Corridor optimized B-Spline trajectory."""
 
-    W_VEL = 1.0
-    W_ACC = 8.0
-    W_JERK = 4.0
-    W_CENTER = 0.1
+    W_VEL = 2.0
+    W_ACC = 6.0
+    W_JERK = 10.0
+    W_CENTER = 0.01
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict) -> None:
         """Initialize the Safe Flight Corridor controller.
@@ -133,8 +133,8 @@ class StateController(Controller):
         self._spline_tick = 0
         self._finished = False
 
-        self.anchor_gap = 0.27
-        self.base_speed = 1.15
+        self.anchor_gap = 0.5
+        self.base_speed = 1.0
         self.points_per_segment = 4
 
         self.gate_outer = 0.72
@@ -431,8 +431,6 @@ class StateController(Controller):
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
-        self.anchor_gap = 0.50
-
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i]
             normal = gate_normals[i].copy()
@@ -448,9 +446,9 @@ class StateController(Controller):
             # ENTRY SWING (U-turn approach logic)
             if np.dot(flow_dir, normal) < -0.1:
                 if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * 1.2
+                    swing_pos = pos + right * 0.5
                 else:
-                    swing_pos = pos - right * 1.2
+                    swing_pos = pos - right * 0.5
                 raw_path.append(SkeletonPoint(swing_pos, False, None, None, None))
 
             if np.dot(pos - raw_path[-1].pos, normal) > 0.05:
@@ -470,9 +468,9 @@ class StateController(Controller):
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
                     if np.dot(exit_vector, right) > 0:
-                        exit_swing = clearance_pos + right * 1.5 - normal * 1.0
+                        exit_swing = clearance_pos + right * 1.0 - normal * 0.7
                     else:
-                        exit_swing = clearance_pos - right * 1.5 - normal * 1.0
+                        exit_swing = clearance_pos - right * 1.0 - normal * 0.7
 
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None))
 
