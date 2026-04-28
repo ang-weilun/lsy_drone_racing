@@ -59,3 +59,56 @@ def test_pure_pd_no_acc_ff_drives_thrust_above_hover_when_below_setpoint():
         np.zeros(3), 0.0, 1.0, 0.0, None, np.zeros(3),
     )
     assert float(action[3]) > mass * G + KP[2] * 0.1 * 0.99  # PD term contributes
+
+
+def test_thrust_clamps_to_thrust_max():
+    """If F_des projection exceeds thrust_max, thrust is clipped."""
+    # Big positive z-error → big z-thrust demand → exceeds thrust_max=0.5 N
+    p = np.array([0.0, 0.0, 0.5])
+    p_ref = np.array([0.0, 0.0, 5.0])
+    action, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        np.zeros(3), 0.0, 0.5, 0.0, None, np.zeros(3),
+    )
+    assert abs(float(action[3]) - 0.5) < 1e-6, f"thrust should clip to 0.5, got {action[3]}"
+
+
+def test_integrator_frozen_on_saturation():
+    """When thrust saturates, the integrator is NOT updated this tick."""
+    p = np.array([0.0, 0.0, 0.5])
+    p_ref = np.array([0.0, 0.0, 5.0])
+    integrator = np.array([0.0, 0.0, 0.5])
+    _, new_int, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        integrator, 0.0, 0.5, 0.0, None, np.zeros(3),
+    )
+    assert np.allclose(new_int, integrator), "integrator should be frozen when thrust saturates"
+
+
+def test_integrator_advances_when_unsaturated():
+    """When thrust is comfortably within bounds, integrator updates by e_p * dt."""
+    p = np.array([0.0, 0.0, 1.0])
+    p_ref = np.array([0.05, 0.0, 1.0])
+    integrator = np.zeros(3)
+    _, new_int, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        integrator, 0.0, 1.0, 0.0, None, np.zeros(3),
+    )
+    assert new_int[0] > 0.0, f"integrator x should advance positive, got {new_int}"
+    assert new_int[0] < KI_RANGE[0]  # within clamp
+
+
+def test_integrator_clamped_to_ki_range():
+    """Integrator can never exceed ±KI_RANGE."""
+    p = np.array([0.0, 0.0, 1.0])
+    p_ref = np.array([100.0, 0.0, 1.0])  # absurd error
+    integrator = KI_RANGE.copy() - 0.001  # near-clamp
+    _, new_int, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        integrator, 0.0, 100.0, 0.0, None, np.zeros(3),
+    )
+    assert new_int[0] <= KI_RANGE[0] + 1e-9
