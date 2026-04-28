@@ -509,6 +509,14 @@ class SfcPlanner:
         pts_rest_seg = pts_per_seg
         n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
+        # Cubic B-spline fit and cp.diff(P, k=3) require n_ctrl >= 4. With
+        # pre/post anchors no longer in the skeleton, late-race replans
+        # (1 gate left, drone close to it) can produce a single corridor with
+        # n_ctrl as low as 1. Bump pts_first_seg to keep the spline well-defined.
+        if n_ctrl < 4:
+            pts_first_seg = 4 - (n_segments - 1) * pts_rest_seg
+            n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
+
         P = cp.Variable((n_ctrl, 3))
         constraints = []
 
