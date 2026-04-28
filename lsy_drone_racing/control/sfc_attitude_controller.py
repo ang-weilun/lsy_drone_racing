@@ -154,6 +154,7 @@ class SfcAttitudeController(Controller):
         self._rpy_prev = np.zeros(3)
         self._y_b_prev = None
         self._replan_idx = 0
+        self._last_diag: dict | None = None
         self.planner = SfcPlanner(obs, self._freq)
 
     def compute_control(self, obs, info=None):
@@ -183,6 +184,21 @@ class SfcAttitudeController(Controller):
                 self._i_error, self._thrust_min, self._thrust_max,
                 self._yaw_prev, self._y_b_prev, self._rpy_prev,
             )
+
+        rpy_act = np.asarray(R.from_quat(obs["quat"]).as_euler("xyz"), dtype=np.float64)
+        thrust_cmd = float(action[3])
+        eps_t = 1e-4
+        self._last_diag = {
+            "des_pos": np.asarray(des_pos, dtype=np.float64).copy(),
+            "des_vel": np.asarray(des_vel, dtype=np.float64).copy(),
+            "des_acc": np.asarray(des_acc, dtype=np.float64).copy(),
+            "thrust_cmd": thrust_cmd,
+            "at_thrust_min": thrust_cmd <= self._thrust_min + eps_t,
+            "at_thrust_max": thrust_cmd >= self._thrust_max - eps_t,
+            "i_error": self._i_error.copy(),
+            "rpy_cmd": np.asarray(action[:3], dtype=np.float64).copy(),
+            "rpy_act": rpy_act,
+        }
 
         return action
 

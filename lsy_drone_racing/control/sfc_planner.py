@@ -119,10 +119,10 @@ class SfcPlanner:
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 2.0          # m/s. Speed ceiling on straights.
-    TILT_LIMIT_PLANNER = 0.5    # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
-    A_LONG_MAX_FACTOR = 0.7     # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
-    V_FLOOR = 0.3               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
+    V_MAX_GLOBAL = 1.5        # m/s. Speed ceiling on straights.
+    TILT_LIMIT_PLANNER = 0.35 # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
+    A_LONG_MAX_FACTOR = 0.4    # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
+    V_FLOOR = 0.2               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
     N_TOPP_SAMPLES = 200        # Number of points to sample u ∈ [0, 1] when building the schedule.
 
     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
@@ -149,8 +149,11 @@ class SfcPlanner:
         self._last_replan_tick = -self.REPLAN_DEBOUNCE_TICKS  # allow first move-triggered replan
 
         self._t_to_u: CubicSpline | None = None
+        self.replan_events: list[dict] = []
+        self.last_replan_event: dict | None = None
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
+        self._record_replan_event(reason="init")
 
     def update(self, obs: dict[str, NDArray]) -> bool:
         """Sync target_gate_idx from obs and replan if any object moved (debounced)."""
@@ -164,7 +167,7 @@ class SfcPlanner:
             self.target_gate_idx = env_target
 
         # 2. Detect movement
-        moved = self._check_objects_moved(obs)
+        moved, reason = self._check_objects_moved(obs)
         if not moved:
             return False
         if self._tick - self._last_replan_tick < self.REPLAN_DEBOUNCE_TICKS:
@@ -174,6 +177,7 @@ class SfcPlanner:
 
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
         self._last_replan_tick = self._tick
+        self._record_replan_event(reason=reason)
         return True
 
     def evaluate(self, t: float) -> tuple[NDArray, NDArray, NDArray]:
@@ -228,6 +232,8 @@ class SfcPlanner:
         self.target_gate_idx = 0
         self._tick = 0
         self._last_replan_tick = -self.REPLAN_DEBOUNCE_TICKS
+        self.replan_events = []
+        self.last_replan_event = None
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
         """Generate a B-spline trajectory through safe flight corridors.
@@ -724,15 +730,16 @@ class SfcPlanner:
 
         return path
 
-    def _check_objects_moved(self, obs: dict[str, NDArray]) -> bool:
-        moved = False
+    def _check_objects_moved(self, obs: dict[str, NDArray]) -> tuple[bool, str]:
+        gate_moved = False
+        obs_moved = False
         new_gates_pos = obs["gates_pos"]
         if (
             len(self.gates_pos) > 0
             and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.05
         ):
             self.gates_pos, self.gates_quat = new_gates_pos.copy(), obs["gates_quat"].copy()
-            moved = True
+            gate_moved = True
 
         new_obs_pos = obs.get("obstacles_pos", np.array([]))
         if len(new_obs_pos) != len(self.obstacles_pos) or (
@@ -740,6 +747,33 @@ class SfcPlanner:
             and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.05
         ):
             self.obstacles_pos = new_obs_pos.copy()
-            moved = True
+            obs_moved = True
 
-        return moved
+        if gate_moved and obs_moved:
+            reason = "gate+obstacle_jitter"
+        elif gate_moved:
+            reason = "gate_jitter"
+        elif obs_moved:
+            reason = "obstacle_jitter"
+        else:
+            reason = ""
+        return gate_moved or obs_moved, reason
+
+    def current_spline_snapshot(self) -> dict:
+        """Return a dict fully describing the current spline (for trace dumps)."""
+        return {
+            "t_total": float(self._t_total),
+            "knots": np.asarray(self._des_pos_spline.t, dtype=np.float64).copy(),
+            "control_points": np.asarray(self._control_points, dtype=np.float64).copy(),
+            "k": int(self._des_pos_spline.k),
+            "target_gate_idx": int(self.target_gate_idx),
+        }
+
+    def _record_replan_event(self, reason: str) -> None:
+        evt = {
+            "tick": int(self._tick),
+            "reason": reason,
+            "snapshot": self.current_spline_snapshot(),
+        }
+        self.replan_events.append(evt)
+        self.last_replan_event = evt
