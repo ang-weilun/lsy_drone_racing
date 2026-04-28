@@ -179,18 +179,36 @@ class SfcPlanner:
     def evaluate(self, t: float) -> tuple[NDArray, NDArray, NDArray]:
         """Return (pos, vel, acc) at *seconds* into the current spline.
 
-        Maps t → u = t / t_total internally and scales BSpline derivatives by
-        1/t_total and 1/t_total² so the consumer receives true SI units.
+        Uses the TOPP-computed t→u cubic map (built in _build_spline) to convert
+        wall-clock time to spline parameter, then applies the full chain rule:
+          vel = r'(u) · du/dt
+          acc = r''(u) · (du/dt)² + r'(u) · d²u/dt²
+        Returns SI units (m, m/s, m/s²). Falls back to the legacy uniform
+        mapping when _t_to_u is None (TOPP failure path).
         """
         if self._t_total <= 0:
             cp_last = np.asarray(self._control_points[-1], dtype=np.float64)
             return cp_last, np.zeros(3), np.zeros(3)
+
         t_clamped = float(np.clip(t, 0.0, self._t_total))
-        u = t_clamped / self._t_total
-        du_dt = 1.0 / self._t_total
+
+        if self._t_to_u is not None:
+            u = float(self._t_to_u(t_clamped))
+            du_dt = float(self._t_to_u(t_clamped, 1))
+            d2u_dt2 = float(self._t_to_u(t_clamped, 2))
+        else:
+            # TOPP fallback: uniform schedule.
+            u = t_clamped / self._t_total
+            du_dt = 1.0 / self._t_total
+            d2u_dt2 = 0.0
+
+        u = float(np.clip(u, 0.0, 1.0))
+
+        r1 = np.asarray(self._des_pos_spline.derivative(nu=1)(u), dtype=np.float64)
+        r2 = np.asarray(self._des_pos_spline.derivative(nu=2)(u), dtype=np.float64)
         pos = np.asarray(self._des_pos_spline(u), dtype=np.float64)
-        vel = np.asarray(self._des_pos_spline.derivative(nu=1)(u) * du_dt, dtype=np.float64)
-        acc = np.asarray(self._des_pos_spline.derivative(nu=2)(u) * (du_dt**2), dtype=np.float64)
+        vel = r1 * du_dt
+        acc = r2 * (du_dt**2) + r1 * d2u_dt2
         return pos, vel, acc
 
     @property
