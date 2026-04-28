@@ -7,6 +7,7 @@ builder, and B-spline optimization. Consumed by both `sfc_controller.py`
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
 
 import cvxpy as cp
@@ -14,6 +15,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.spatial.transform import Rotation as R
+
+logger = logging.getLogger(__name__)
 
 
 class SkeletonPoint(NamedTuple):
@@ -145,6 +148,7 @@ class SfcPlanner:
         self._tick = 0
         self._last_replan_tick = -self.REPLAN_DEBOUNCE_TICKS  # allow first move-triggered replan
 
+        self._t_to_u: CubicSpline | None = None
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
 
@@ -239,7 +243,16 @@ class SfcPlanner:
             knots[i + k] = np.mean(u_params[i : i + k])
 
         self._des_pos_spline = BSpline(knots, control_points, k)
-        self._t_total = np.sum(cp_dists) / self.base_speed
+
+        v_start = float(np.linalg.norm(current_vel))
+        try:
+            self._t_to_u, self._t_total = self._compute_time_schedule(
+                self._des_pos_spline, v_start
+            )
+        except Exception as exc:  # noqa: BLE001 — fallback path
+            logger.warning("TOPP scheduling failed (%s); falling back to uniform schedule.", exc)
+            self._t_to_u = None
+            self._t_total = float(np.sum(cp_dists) / self.base_speed)
 
     def _compute_time_schedule(
         self, spline: BSpline, v_start: float
