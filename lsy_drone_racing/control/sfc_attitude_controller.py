@@ -2,7 +2,7 @@
 
 Wraps SfcPlanner and emits a 4D attitude command [roll, pitch, yaw, thrust]
 using a PID + acceleration-feedforward position controller (Mellinger-Kumar /
-Handout eq. 17). See docs/superpowers/specs/2026-04-28-sfc-attitude-controller-design.md.
+Handout eq. 17).
 """
 
 from __future__ import annotations
