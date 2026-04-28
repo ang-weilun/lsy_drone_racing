@@ -116,6 +116,7 @@ class SfcPlanner:
     W_ACC = 6.0
     W_JERK = 10.0
     W_CENTER = 0.01
+    W_GATE_ALIGN = 100.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
@@ -580,11 +581,11 @@ class SfcPlanner:
                 if gate_cp_idx - 1 >= 0:
                     dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += 100.0 * cp.sum_squares(dp - proj)
+                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
                 if gate_cp_idx + 1 < n_ctrl:
                     dp = P[gate_cp_idx + 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += 100.0 * cp.sum_squares(dp - proj)
+                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
 
         problem = cp.Problem(cp.Minimize(cost), constraints)
         try:
