@@ -49,6 +49,7 @@ class Capsule(NamedTuple):
     p2: NDArray
     radius: float
     is_gate: bool
+    gate_idx: int | None = None
 
 
 class FlightCorridor:
@@ -266,7 +267,7 @@ class StateController(Controller):
             )
 
         # Gates (Stands & 4-bar inner frames)
-        for pos, quat in zip(self.gates_pos, self.gates_quat):
+        for gate_i, (pos, quat) in enumerate(zip(self.gates_pos, self.gates_quat)):
             rot = R.from_quat(quat)
             up = rot.apply([0, 0, 1])
             right = rot.apply([0, 1, 0])
@@ -280,6 +281,7 @@ class StateController(Controller):
                         pos - up * (self.gate_outer / 2.0 + stand_h),
                         0.05 + margin,
                         True,
+                        gate_i,
                     )
                 )
 
@@ -293,6 +295,7 @@ class StateController(Controller):
                     pos + up * bar_dist + right * 0.36,
                     bar_radius,
                     True,
+                    gate_i,
                 )
             )
             capsules.append(
@@ -301,6 +304,7 @@ class StateController(Controller):
                     pos - up * bar_dist + right * 0.36,
                     bar_radius,
                     True,
+                    gate_i,
                 )
             )
             capsules.append(
@@ -309,6 +313,7 @@ class StateController(Controller):
                     pos - right * bar_dist - up * 0.36,
                     bar_radius,
                     True,
+                    gate_i,
                 )
             )
             capsules.append(
@@ -317,6 +322,7 @@ class StateController(Controller):
                     pos + right * bar_dist - up * 0.36,
                     bar_radius,
                     True,
+                    gate_i,
                 )
             )
 
@@ -326,6 +332,9 @@ class StateController(Controller):
         self, skeleton_path: list[SkeletonPoint], capsules: list[Capsule]
     ) -> list[FlightCorridor]:
         """Constructs a convex polyhedron for each segment via separating planes."""
+        # Precompute per-gate normal in world frame; used to scope the gate-skip rule.
+        gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
+
         corridors = []
         for i in range(len(skeleton_path) - 1):
             pt1 = skeleton_path[i]
@@ -334,14 +343,18 @@ class StateController(Controller):
 
             # Add separating half-spaces for all capsules
             for cap in capsules:
-                # Do not apply collision capsules from the gate we are currently
-                # routing through or approaching. If either endpoint of the segment
-                # is within 1.0m of the capsule, assume it's part of the gate
-                # structure and the skeleton path is already safely routed through.
-                if cap.is_gate and (
-                    np.linalg.norm(cap.p1 - pt1.pos) < 1.0 or np.linalg.norm(cap.p1 - pt2.pos) < 1.0
-                ):
-                    continue
+                # Skip a gate's frame capsules only for segments that cross
+                # the gate's plane (drone passing through the opening). For
+                # segments that stay on one side of the plane (post-gate
+                # transitions, approach lanes) the corridor must keep the
+                # frame as a real obstacle - its bars sit just off the path.
+                if cap.is_gate and cap.gate_idx is not None:
+                    g_pos = self.gates_pos[cap.gate_idx]
+                    g_normal = gate_normals[cap.gate_idx]
+                    d1 = float(np.dot(pt1.pos - g_pos, g_normal))
+                    d2 = float(np.dot(pt2.pos - g_pos, g_normal))
+                    if d1 * d2 <= 0.0:
+                        continue
 
                 c1, c2 = closest_points_segments(pt1.pos, pt2.pos, cap.p1, cap.p2)
                 vec = c1 - c2  # Points from obstacle towards the segment
