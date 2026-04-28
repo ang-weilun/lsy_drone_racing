@@ -51,16 +51,15 @@ def compute_attitude_command(
     yaw_prev: float,
     y_b_prev: NDArray | None,
     rpy_prev: NDArray,
-) -> tuple[NDArray, NDArray, float, NDArray, NDArray, dict]:
+) -> tuple[NDArray, NDArray, float, NDArray, NDArray]:
     """Mellinger-Kumar / Handout eq. 17 position controller.
 
     Returns:
         action: [roll, pitch, yaw, thrust] as float32, in radians and Newtons.
         integrator_next: updated integrator state (frozen if thrust saturated).
-        yaw_next: yaw used this tick (held from yaw_prev when speed too low).
+        yaw_next: yaw used this tick (always 0 — see body for why).
         y_b_next: new y-body axis (or previous if singularity guard fired).
         rpy_next: rpy after slew-rate limiter (also stored as prev for next tick).
-        diag: dict of internal diagnostic values.
     """
     e_p = p_ref - p
     e_v = v_ref - v
@@ -132,22 +131,7 @@ def compute_attitude_command(
     rpy_next[2] = ((rpy_next[2] + np.pi) % (2 * np.pi)) - np.pi
 
     action = np.array([rpy_next[0], rpy_next[1], rpy_next[2], thrust], dtype=np.float32)
-
-    yaw_lag = float(((yaw_next - yaw_actual + np.pi) % (2 * np.pi)) - np.pi)
-    diag = {
-        "e_p": e_p.copy(),
-        "e_v": (v_ref - v).copy(),
-        "F_des": F_des.copy(),
-        "thrust_unclipped": thrust_unclipped,
-        "thrust": thrust,
-        "rpy_des_before_slew": rpy_des.copy(),
-        "yaw_planned": yaw_next,
-        "actual_yaw": yaw_actual,
-        "yaw_lag": yaw_lag,
-        "i_error": integrator_next.copy(),
-    }
-
-    return action, integrator_next, yaw_next, y_b_next, rpy_next, diag
+    return action, integrator_next, yaw_next, y_b_next, rpy_next
 
 
 class SfcAttitudeController(Controller):
@@ -191,7 +175,7 @@ class SfcAttitudeController(Controller):
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
 
-        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev, _ = \
+        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
             compute_attitude_command(
                 obs["pos"], obs.get("vel", np.zeros(3)),
                 des_pos, des_vel, des_acc,

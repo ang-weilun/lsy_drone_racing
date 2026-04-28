@@ -31,7 +31,7 @@ def test_hover_equilibrium_emits_level_attitude_and_hover_thrust():
     y_b_prev = None
     rpy_prev = np.zeros(3)
 
-    action, new_int, new_yaw, new_y_b, new_rpy, diag = compute_attitude_command(
+    action, new_int, new_yaw, new_y_b, new_rpy = compute_attitude_command(
         p, v, p_ref, v_ref, a_ref, quat, mass,
         integrator, thrust_min, thrust_max, yaw_prev, y_b_prev, rpy_prev,
     )
@@ -145,7 +145,7 @@ def test_singularity_guard_returns_finite_unit_vector():
     """When z_b_des aligns with x_c, the cross-product norm goes to ~0; guard kicks in."""
     p = np.zeros(3); p_ref = np.array([100.0, 0.0, 0.0])
     y_b_prev = np.array([0.5, 0.5, 0.5]) / np.sqrt(0.75)  # arbitrary previous unit vector
-    _, _, _, new_y_b, _, _ = compute_attitude_command(
+    _, _, _, new_y_b, _ = compute_attitude_command(
         p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
         np.array([0.0, 0.0, 0.0, 1.0]), 0.0001,  # tiny mass → tiny m·g; F_des dominated by KP·e_p
         np.zeros(3), 0.0, 1e9, 0.0, y_b_prev, np.zeros(3),
