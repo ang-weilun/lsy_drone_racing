@@ -12,7 +12,7 @@ from typing import NamedTuple
 import cvxpy as cp
 import numpy as np
 from numpy.typing import NDArray
-from scipy.interpolate import BSpline
+from scipy.interpolate import BSpline, CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 
@@ -240,6 +240,67 @@ class SfcPlanner:
 
         self._des_pos_spline = BSpline(knots, control_points, k)
         self._t_total = np.sum(cp_dists) / self.base_speed
+
+    def _compute_time_schedule(
+        self, spline: BSpline, v_start: float
+    ) -> tuple[CubicSpline, float]:
+        """TOPP-style time parameterization: build a t→u cubic spline.
+
+        Given a fixed-geometry BSpline over u ∈ [0, 1] and the drone's current
+        speed, compute v(u) respecting:
+          - Lateral accel:  v² · κ(u) ≤ a_lat_max
+          - Longitudinal accel:  |dv/dt| ≤ a_long_max  (forward + backward sweeps)
+          - Global cap:  v ≤ V_MAX_GLOBAL
+          - Floor:  v ≥ V_FLOOR
+
+        Returns:
+            t_to_u: CubicSpline mapping wall-clock time → spline parameter u.
+            t_total: Total schedule duration in seconds.
+        """
+        g = 9.81
+        a_lat_max = g * np.tan(self.TILT_LIMIT_PLANNER)
+        a_long_max = self.A_LONG_MAX_FACTOR * a_lat_max
+        eps = 1e-6
+
+        N = self.N_TOPP_SAMPLES
+        u_k = np.linspace(0.0, 1.0, N)
+
+        # --- Step 1: sample geometry at each u_k ---
+        d1 = spline.derivative(nu=1)(u_k)        # shape (N, 3)
+        d2 = spline.derivative(nu=2)(u_k)        # shape (N, 3)
+        ds_du = np.linalg.norm(d1, axis=1)       # shape (N,)
+        cross = np.cross(d1, d2)                 # shape (N, 3)
+        kappa = np.linalg.norm(cross, axis=1) / np.maximum(ds_du**3, eps)
+
+        # --- Step 2: lateral-accel envelope + global cap ---
+        v_curve = np.sqrt(a_lat_max / np.maximum(kappa, eps))
+        v = np.minimum(v_curve, self.V_MAX_GLOBAL)
+
+        # --- Step 3: forward sweep (longitudinal accel from v_start) ---
+        v[0] = min(v[0], max(v_start, self.V_FLOOR))
+        for k in range(1, N):
+            ds = 0.5 * (ds_du[k] + ds_du[k - 1]) * (u_k[k] - u_k[k - 1])
+            v_max_fwd = np.sqrt(v[k - 1] ** 2 + 2.0 * a_long_max * ds)
+            v[k] = min(v[k], v_max_fwd)
+
+        # --- Step 4: backward sweep (must brake in time for upcoming curves) ---
+        for k in range(N - 2, -1, -1):
+            ds = 0.5 * (ds_du[k + 1] + ds_du[k]) * (u_k[k + 1] - u_k[k])
+            v_max_bwd = np.sqrt(v[k + 1] ** 2 + 2.0 * a_long_max * ds)
+            v[k] = min(v[k], v_max_bwd)
+
+        # --- Step 5: floor ---
+        v = np.maximum(v, self.V_FLOOR)
+
+        # --- Step 6: integrate t(u) = ∫ ds / v  via trapezoid on (1/v_avg)·ds ---
+        t = np.zeros(N)
+        for k in range(1, N):
+            ds = 0.5 * (ds_du[k] + ds_du[k - 1]) * (u_k[k] - u_k[k - 1])
+            v_avg = 0.5 * (v[k] + v[k - 1])
+            t[k] = t[k - 1] + ds / max(v_avg, self.V_FLOOR)
+
+        t_to_u = CubicSpline(t, u_k, bc_type="natural")
+        return t_to_u, float(t[-1])
 
     def _get_all_obstacle_capsules(self) -> list[Capsule]:
         """Converts all exact trimesh track boundaries into 3D capsule obstacles."""
