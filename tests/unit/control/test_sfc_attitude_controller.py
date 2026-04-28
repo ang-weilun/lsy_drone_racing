@@ -10,6 +10,8 @@ from lsy_drone_racing.control.sfc_attitude_controller import (
     KD,
     KI_RANGE,
     G,
+    TILT_LIMIT,
+    TILT_RATE_LIMIT,
     compute_attitude_command,
 )
 
@@ -152,3 +154,31 @@ def test_singularity_guard_returns_finite_unit_vector():
     # Just assert the result is a finite unit vector (not NaN from divide-by-zero).
     assert np.all(np.isfinite(new_y_b))
     assert abs(np.linalg.norm(new_y_b) - 1.0) < 1e-6
+
+
+def test_tilt_capped_to_TILT_LIMIT():
+    """Even with huge horizontal error, roll/pitch never exceed TILT_LIMIT (~28°)."""
+    p = np.zeros(3); p_ref = np.array([100.0, 100.0, 1.0])
+    # Allow rate limit to relax: rpy_prev set so the slew limit isn't the tighter bound
+    rpy_prev = np.array([0.5, 0.5, 0.0])
+    action, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        np.zeros(3), 0.0, 1.0, 0.0, None, rpy_prev,
+    )
+    assert abs(float(action[0])) <= TILT_LIMIT + 1e-6
+    assert abs(float(action[1])) <= TILT_LIMIT + 1e-6
+
+
+def test_slew_rate_limited_per_tick():
+    """Roll/pitch can change by at most TILT_RATE_LIMIT in one tick."""
+    p = np.zeros(3); p_ref = np.array([100.0, 0.0, 1.0])
+    rpy_prev = np.zeros(3)  # last tick was level
+    action, *_ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        np.zeros(3), 0.0, 1.0, 0.0, None, rpy_prev,
+    )
+    # Roll moved at most TILT_RATE_LIMIT per axis from rpy_prev=0
+    assert abs(float(action[0])) <= TILT_RATE_LIMIT + 1e-6
+    assert abs(float(action[1])) <= TILT_RATE_LIMIT + 1e-6
