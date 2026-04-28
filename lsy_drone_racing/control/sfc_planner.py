@@ -597,12 +597,6 @@ class SfcPlanner:
                     constraints.append(dp @ normal <= self.GATE_TUBE_HALF_LENGTH)
                     constraints.append(dp @ normal >= -self.GATE_TUBE_HALF_LENGTH)
 
-                # Enforce symmetry around the gate for smooth straight passage
-                if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
-                    constraints.append(
-                        P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx]
-                    )
-
                 # Softly penalize deviation from the normal line
                 if gate_cp_idx - 1 >= 0:
                     dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
