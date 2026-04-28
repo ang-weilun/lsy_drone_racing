@@ -192,3 +192,35 @@ def test_sfc_planner_episode_reset_clears_replan_events():
     planner.episode_reset()
     assert planner.replan_events == []
     assert planner.last_replan_event is None
+
+
+def test_tube_fence_holds_at_gate_planes():
+    """Spline lateral offset at each gate's plane must stay inside the tube."""
+    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from scipy.spatial.transform import Rotation as R
+
+    planner = SfcPlanner(_minimal_obs(), freq=50)
+    spline = planner.des_pos_spline
+
+    u_samples = np.linspace(0.0, 1.0, 2000)
+    pts = spline(u_samples)  # (N, 3)
+
+    gate_normals = R.from_quat(planner.gates_quat).apply([1.0, 0.0, 0.0])
+    for g_pos, g_normal in zip(planner.gates_pos, gate_normals):
+        signed = (pts - g_pos) @ g_normal  # (N,)
+        # Find indices where the spline crosses the gate plane.
+        crossings = np.where(np.diff(np.sign(signed)) != 0)[0]
+        for c in crossings:
+            # Linear interp of the crossing point.
+            t = signed[c] / (signed[c] - signed[c + 1])
+            crossing_pt = pts[c] + t * (pts[c + 1] - pts[c])
+            offset = crossing_pt - g_pos
+            lateral = offset - (offset @ g_normal) * g_normal
+            # Only check crossings near the gate centre (within 0.5 m laterally);
+            # the spline may cross the infinite gate plane elsewhere on the track.
+            if np.linalg.norm(lateral) > 0.5:
+                continue
+            assert np.linalg.norm(lateral) < planner.GATE_TUBE_RADIUS + 0.02, (
+                f"Gate at {g_pos}: lateral offset {np.linalg.norm(lateral):.3f} "
+                f"exceeds tube radius {planner.GATE_TUBE_RADIUS}"
+            )

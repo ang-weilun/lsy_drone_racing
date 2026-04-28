@@ -117,6 +117,9 @@ class SfcPlanner:
     W_JERK = 10.0
     W_CENTER = 0.01
     W_GATE_ALIGN = 100.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
+    GATE_TUBE_RADIUS = 0.18       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
+    GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre, both sides.
+    GATE_TUBE_N_FACETS = 8        # Polyhedral facets approximating the lateral cylinder.
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
@@ -570,6 +573,29 @@ class SfcPlanner:
             if skeleton_path[i].is_gate:
                 gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
+                right = skeleton_path[i].gate_right
+                up = skeleton_path[i].gate_up
+                gate_pos = skeleton_path[i].pos
+
+                # Polyhedral lateral fence: 8 half-spaces inscribed in a cylinder
+                # of radius GATE_TUBE_RADIUS around the gate-normal axis. We use
+                # a polyhedral approximation rather than cp.norm(..., 2) because
+                # the QP is solved with OSQP, which does not support SOC.
+                facet_dirs = []
+                for k in range(self.GATE_TUBE_N_FACETS):
+                    theta = 2.0 * np.pi * k / self.GATE_TUBE_N_FACETS
+                    facet_dirs.append(np.cos(theta) * right + np.sin(theta) * up)
+
+                for offset_idx in (gate_cp_idx - 1, gate_cp_idx + 1):
+                    if not (0 <= offset_idx < n_ctrl):
+                        continue
+                    dp = P[offset_idx] - gate_pos
+                    # Lateral fence: 8 facet half-spaces.
+                    for d in facet_dirs:
+                        constraints.append(dp @ d <= self.GATE_TUBE_RADIUS)
+                    # Axial fence: |dp · normal| <= half-length.
+                    constraints.append(dp @ normal <= self.GATE_TUBE_HALF_LENGTH)
+                    constraints.append(dp @ normal >= -self.GATE_TUBE_HALF_LENGTH)
 
                 # Enforce symmetry around the gate for smooth straight passage
                 if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
