@@ -118,7 +118,8 @@ class SfcPlanner:
     W_CENTER = 0.01
     W_GATE_ALIGN = 5.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
     GATE_TUBE_RADIUS = 0.18       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
-    GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre, both sides.
+    GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre (max).
+    GATE_TUBE_AXIAL_MIN = 0.15    # m. Min axial distance of P[i±1] from gate centre, signed by side.
     GATE_TUBE_N_FACETS = 8        # Polyhedral facets approximating the lateral cylinder.
     REPLAN_DEBOUNCE_TICKS = 5
 
@@ -610,16 +611,21 @@ class SfcPlanner:
                     theta = 2.0 * np.pi * k / self.GATE_TUBE_N_FACETS
                     facet_dirs.append(np.cos(theta) * right + np.sin(theta) * up)
 
-                for offset_idx in (gate_cp_idx - 1, gate_cp_idx + 1):
+                # Side convention: P[gate_idx − 1] sits on −n side, P[gate_idx + 1]
+                # on +n side. Without this signed split + min-axial fence, smoothness
+                # costs collapse both neighbours toward gate_pos, producing a tight
+                # high-curvature arc at the crossing that the controller can't track
+                # cleanly (residual ~0.09 m lateral error → frame-bar clip).
+                for offset_idx, sign in ((gate_cp_idx - 1, -1.0), (gate_cp_idx + 1, +1.0)):
                     if not (0 <= offset_idx < n_ctrl):
                         continue
                     dp = P[offset_idx] - gate_pos
                     # Lateral fence: 8 facet half-spaces.
                     for d in facet_dirs:
                         constraints.append(dp @ d <= self.GATE_TUBE_RADIUS)
-                    # Axial fence: |dp · normal| <= half-length.
-                    constraints.append(dp @ normal <= self.GATE_TUBE_HALF_LENGTH)
-                    constraints.append(dp @ normal >= -self.GATE_TUBE_HALF_LENGTH)
+                    # Axial fence: signed band [min, half_length] on the assigned side.
+                    constraints.append(sign * (dp @ normal) >= self.GATE_TUBE_AXIAL_MIN)
+                    constraints.append(sign * (dp @ normal) <= self.GATE_TUBE_HALF_LENGTH)
 
                 # Softly penalize deviation from the normal line
                 if gate_cp_idx - 1 >= 0:
