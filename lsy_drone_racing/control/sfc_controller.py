@@ -513,6 +513,32 @@ class StateController(Controller):
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
+        # Preserve the just-passed gate's clearance anchor when a replan fires
+        # mid-exit. Without this, the new skeleton goes straight from the
+        # drone (still inside the previous gate's exit zone) to the next
+        # gate's pre_pos, ignoring the forward-along-normal commitment the
+        # drone is currently flying out on. The drone ends up flying with
+        # momentum along the old route while the spline pulls it onto a path
+        # that demands an instantaneous direction change. Re-emitting only
+        # the clearance anchor (along the prev gate's normal) keeps the
+        # tangent aligned with the drone's current heading without forcing
+        # the perpendicular exit_swing detour, which over-commits when the
+        # drone has already started its turn.
+        prev_gate_idx = self.target_gate_idx - 1
+        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(
+            self.gates_pos
+        ):
+            prev_pos = self.gates_pos[prev_gate_idx]
+            prev_normal = gate_normals[prev_gate_idx]
+            d_post = float(np.dot(current_pos - prev_pos, prev_normal))
+            if 0.0 < d_post < 1.0:
+                next_pos = self.gates_pos[self.target_gate_idx]
+                prev_post_pos = prev_pos + prev_normal * self.anchor_gap
+                exit_vector = next_pos - prev_post_pos
+                if float(np.dot(exit_vector, prev_normal)) < -0.2:
+                    clearance_pos = prev_post_pos + prev_normal * 1.0
+                    raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
+
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i]
             normal = gate_normals[i].copy()
