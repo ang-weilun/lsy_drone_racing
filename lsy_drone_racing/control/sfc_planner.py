@@ -277,7 +277,7 @@ class SfcPlanner:
         v = np.minimum(v_curve, self.V_MAX_GLOBAL)
 
         # --- Step 3: forward sweep (longitudinal accel from v_start) ---
-        v[0] = min(v[0], max(v_start, self.V_FLOOR))
+        v[0] = min(v[0], v_start)
         for k in range(1, N):
             ds = 0.5 * (ds_du[k] + ds_du[k - 1]) * (u_k[k] - u_k[k - 1])
             v_max_fwd = np.sqrt(v[k - 1] ** 2 + 2.0 * a_long_max * ds)
@@ -299,7 +299,7 @@ class SfcPlanner:
             v_avg = 0.5 * (v[k] + v[k - 1])
             t[k] = t[k - 1] + ds / max(v_avg, self.V_FLOOR)
 
-        t_to_u = CubicSpline(t, u_k, bc_type="natural")
+        t_to_u = CubicSpline(t, u_k)  # not-a-knot (default) is more appropriate than "natural"
         return t_to_u, float(t[-1])
 
     def _get_all_obstacle_capsules(self) -> list[Capsule]:
