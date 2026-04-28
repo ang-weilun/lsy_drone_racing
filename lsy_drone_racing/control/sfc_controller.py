@@ -343,17 +343,28 @@ class StateController(Controller):
 
             # Add separating half-spaces for all capsules
             for cap in capsules:
-                # Skip a gate's frame capsules only for segments that cross
-                # the gate's plane (drone passing through the opening). For
-                # segments that stay on one side of the plane (post-gate
-                # transitions, approach lanes) the corridor must keep the
-                # frame as a real obstacle - its bars sit just off the path.
+                # Skip a gate's frame capsules only for segments that pass
+                # through the gate's opening. The segment must (a) cross the
+                # gate's normal plane and (b) cross it within the frame's
+                # radius - otherwise it's just going around the gate, and
+                # the corridor must keep the frame as a real obstacle.
                 if cap.is_gate and cap.gate_idx is not None:
                     g_pos = self.gates_pos[cap.gate_idx]
                     g_normal = gate_normals[cap.gate_idx]
                     d1 = float(np.dot(pt1.pos - g_pos, g_normal))
                     d2 = float(np.dot(pt2.pos - g_pos, g_normal))
-                    if d1 * d2 <= 0.0:
+                    # Frame outer radius is 0.36m; allow a small slack so the
+                    # pre/post anchors (which sit on the normal axis) still
+                    # qualify as a through-segment.
+                    near_radius = self.gate_outer / 2.0 + 0.10
+                    if d1 * d2 < 0.0:
+                        t = -d1 / (d2 - d1)
+                        crossing = pt1.pos + t * (pt2.pos - pt1.pos)
+                        if np.linalg.norm(crossing - g_pos) < near_radius:
+                            continue
+                    elif d1 == 0.0 and np.linalg.norm(pt1.pos - g_pos) < near_radius:
+                        continue
+                    elif d2 == 0.0 and np.linalg.norm(pt2.pos - g_pos) < near_radius:
                         continue
 
                 c1, c2 = closest_points_segments(pt1.pos, pt2.pos, cap.p1, cap.p2)
