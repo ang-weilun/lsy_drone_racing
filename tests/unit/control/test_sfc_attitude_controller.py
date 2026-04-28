@@ -112,3 +112,43 @@ def test_integrator_clamped_to_ki_range():
         integrator, 0.0, 100.0, 0.0, None, np.zeros(3),
     )
     assert new_int[0] <= KI_RANGE[0] + 1e-9
+
+
+def test_yaw_holds_previous_when_desired_speed_below_threshold():
+    """At low desired horizontal speed, yaw should stay at yaw_prev (not snap to 0)."""
+    yaw_prev = 1.234  # arbitrary held heading
+    _, _, new_yaw, *_ = compute_attitude_command(
+        np.zeros(3), np.zeros(3),
+        np.zeros(3), np.array([0.05, 0.0, 0.0]),  # speed_xy = 0.05 < threshold 0.1
+        np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        np.zeros(3), 0.0, 1.0, yaw_prev, None, np.zeros(3),
+    )
+    assert abs(new_yaw - yaw_prev) < 1e-9, f"yaw should hold {yaw_prev}, got {new_yaw}"
+
+
+def test_yaw_tracks_des_vel_when_above_threshold():
+    """At high desired horizontal speed, yaw aligns with des_vel direction."""
+    _, _, new_yaw, *_ = compute_attitude_command(
+        np.zeros(3), np.zeros(3),
+        np.zeros(3), np.array([1.0, 1.0, 0.0]),  # 45° heading
+        np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.043,
+        np.zeros(3), 0.0, 1.0, 0.0, None, np.zeros(3),
+    )
+    assert abs(new_yaw - np.pi / 4) < 1e-6
+
+
+def test_singularity_guard_returns_finite_unit_vector():
+    """When z_b_des aligns with x_c, the cross-product norm goes to ~0; guard kicks in."""
+    p = np.zeros(3); p_ref = np.array([100.0, 0.0, 0.0])
+    y_b_prev = np.array([0.5, 0.5, 0.5]) / np.sqrt(0.75)  # arbitrary previous unit vector
+    _, _, _, new_y_b, _ = compute_attitude_command(
+        p, np.zeros(3), p_ref, np.zeros(3), np.zeros(3),
+        np.array([0.0, 0.0, 0.0, 1.0]), 0.0001,  # tiny mass → tiny m·g; F_des dominated by KP·e_p
+        np.zeros(3), 0.0, 1e9, 0.0, y_b_prev, np.zeros(3),
+    )
+    # Either the guard fires (returns y_b_prev) or it doesn't (returns a normalized cross).
+    # Just assert the result is a finite unit vector (not NaN from divide-by-zero).
+    assert np.all(np.isfinite(new_y_b))
+    assert abs(np.linalg.norm(new_y_b) - 1.0) < 1e-6
