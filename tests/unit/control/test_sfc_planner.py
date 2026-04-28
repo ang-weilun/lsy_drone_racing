@@ -151,3 +151,44 @@ def test_sfc_planner_episode_reset_zeroes_counters():
 
     planner.episode_reset()
     assert planner.target_gate_idx == 0
+
+
+def test_sfc_planner_records_init_replan_event():
+    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+
+    planner = SfcPlanner(_minimal_obs(), freq=50)
+    assert len(planner.replan_events) == 1
+    evt = planner.replan_events[0]
+    assert evt["reason"] == "init"
+    assert evt["tick"] == 0
+    snap = evt["snapshot"]
+    for key in ("t_total", "knots", "control_points", "k", "target_gate_idx"):
+        assert key in snap
+    assert snap["t_total"] > 0
+    assert snap["k"] == 3
+
+
+def test_sfc_planner_records_replan_event_on_obstacle_move():
+    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+
+    obs = _minimal_obs()
+    planner = SfcPlanner(obs, freq=50)
+    for _ in range(6):
+        planner.update(obs)
+    obs2 = {**obs, "obstacles_pos": obs["obstacles_pos"].copy()}
+    obs2["obstacles_pos"][0] = obs["obstacles_pos"][0] + np.array([0.10, 0.0, 0.0])
+    assert planner.update(obs2) is True
+    # init + this replan
+    assert len(planner.replan_events) == 2
+    assert planner.replan_events[-1]["reason"] == "obstacle_jitter"
+    assert planner.last_replan_event is planner.replan_events[-1]
+
+
+def test_sfc_planner_episode_reset_clears_replan_events():
+    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+
+    planner = SfcPlanner(_minimal_obs(), freq=50)
+    assert len(planner.replan_events) == 1
+    planner.episode_reset()
+    assert planner.replan_events == []
+    assert planner.last_replan_event is None
