@@ -547,6 +547,22 @@ class SfcPlanner:
                 normal = skeleton_path[i].gate_normal
                 constraints.append(P[gate_cp_idx] == skeleton_path[i].pos)
 
+        # Re-inject pre/post anchor coordinates as reference targets for the
+        # gate-neighbour control points. Pre/post are no longer skeleton nodes
+        # (they used to break the corridor topology). The W_CENTER cost
+        # (weight 0.01) provides a tiny on-normal bias when nothing else is
+        # pushing the points off-axis. The hard tube fence + soft alignment
+        # cost are the load-bearing constraints; this is a comfort-blanket nudge.
+        for i in range(1, len(skeleton_path) - 1):
+            if skeleton_path[i].is_gate:
+                gate_cp_idx = cp_idx_map[i]
+                gate_pos = skeleton_path[i].pos
+                normal = skeleton_path[i].gate_normal
+                if gate_cp_idx - 1 >= 0:
+                    reference_points[gate_cp_idx - 1] = gate_pos - normal * self.anchor_gap
+                if gate_cp_idx + 1 < n_ctrl:
+                    reference_points[gate_cp_idx + 1] = gate_pos + normal * self.anchor_gap
+
         cost = (
             self.W_VEL * cp.sum_squares(cp.diff(P, axis=0))
             + self.W_ACC * cp.sum_squares(cp.diff(P, k=2, axis=0))
@@ -643,10 +659,11 @@ class SfcPlanner:
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
             if 0.0 < d_post < 1.0:
                 next_pos = self.gates_pos[self.target_gate_idx]
-                prev_post_pos = prev_pos + prev_normal * self.anchor_gap
-                exit_vector = next_pos - prev_post_pos
+                # Test against prev_pos + prev_normal * anchor_gap, the canonical
+                # post-gate exit point (no post_pos anchor in skeleton anymore).
+                exit_vector = next_pos - (prev_pos + prev_normal * self.anchor_gap)
                 if float(np.dot(exit_vector, prev_normal)) < -0.2:
-                    clearance_pos = prev_post_pos + prev_normal * 1.0
+                    clearance_pos = prev_pos + prev_normal * (self.anchor_gap + 1.0)
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
@@ -656,12 +673,11 @@ class SfcPlanner:
             right = rot.apply([0, 1, 0])
             up = rot.apply([0, 0, 1])
 
-            pre_pos = pos - normal * self.anchor_gap
-            post_pos = pos + normal * self.anchor_gap
-
             flow_dir = pos - raw_path[-1].pos
 
-            # ENTRY SWING (U-turn approach logic)
+            # ENTRY SWING (U-turn approach logic). Computed against gate centre
+            # rather than a pre_pos anchor — same dot-product test, ~0.5 m
+            # offset along normal does not flip the U-turn detection.
             if np.dot(flow_dir, normal) < -0.1:
                 if np.dot(raw_path[-1].pos - pos, right) > 0:
                     swing_pos = pos + right * 0.5
@@ -669,20 +685,17 @@ class SfcPlanner:
                     swing_pos = pos - right * 0.5
                 raw_path.append(SkeletonPoint(swing_pos, False, None, None, None))
 
-            if np.dot(pos - raw_path[-1].pos, normal) > 0.05:
-                raw_path.append(SkeletonPoint(pre_pos, False, None, None, None))
-
             raw_path.append(SkeletonPoint(pos, True, normal, right, up))
-            raw_path.append(SkeletonPoint(post_pos, False, None, None, None))
 
             # EXIT SWING (Hairpin / Reversal Logic)
             if i + 1 < len(self.gates_pos):
                 next_pos = self.gates_pos[i + 1]
-                exit_vector = next_pos - post_pos
+                # Test against pos + normal * anchor_gap, the canonical post-gate
+                # exit point, even though no post_pos anchor is in the skeleton.
+                exit_vector = next_pos - (pos + normal * self.anchor_gap)
 
-                # If the next gate is behind us (requires a sharp turn > 90 degrees)
                 if np.dot(exit_vector, normal) < -0.2:
-                    clearance_pos = post_pos + normal * 1.0
+                    clearance_pos = pos + normal * (self.anchor_gap + 1.0)
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
                     if np.dot(exit_vector, right) > 0:
