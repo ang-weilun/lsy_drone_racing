@@ -7,6 +7,8 @@ are detected. It uses exact Safe Flight Corridors (SFC) for hard safety margins.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import cvxpy as cp
@@ -20,6 +22,14 @@ from lsy_drone_racing.control import Controller
 if TYPE_CHECKING:
     from crazyflow import Sim
     from numpy.typing import NDArray
+
+
+def _dump_enabled() -> bool:
+    return os.environ.get("SFC_DUMP", "").lower() in ("1", "true", "yes")
+
+
+def _dump_path() -> str:
+    return os.environ.get("SFC_DUMP_PATH", "")
 
 
 class SkeletonPoint(NamedTuple):
@@ -153,6 +163,21 @@ class StateController(Controller):
         self.target_gate_idx = 0
         self._prev_pos = None
 
+        self._dump_active = _dump_enabled()
+        if self._dump_active:
+            self._dump_initial_gates_pos = obs["gates_pos"].copy()
+            self._dump_initial_gates_quat = obs["gates_quat"].copy()
+            self._dump_initial_obstacles_pos = (
+                obs.get("obstacles_pos", np.array([])).copy()
+                if obs.get("obstacles_pos") is not None
+                else np.array([])
+            )
+            self._dump_tick_rows = []
+            self._dump_replans = []
+            self._dump_replan_idx = -1  # incremented before first replan in generate_spline
+            self._dump_terminated_reason = "running"
+            self._dump_episode_idx = 0
+
         initial_vel = obs.get("vel", np.zeros(3))
         self.generate_spline(obs["pos"], initial_vel)
 
@@ -190,6 +215,39 @@ class StateController(Controller):
         self._des_pos_spline = BSpline(knots, control_points, k)
         self._t_total = np.sum(cp_dists) / self.base_speed
         self._spline_tick = 0
+
+        if self._dump_active:
+            self._dump_replan_idx += 1
+            anchors_pos = np.array([p.pos for p in skeleton_path], dtype=np.float64)
+            anchors_is_gate = np.array([p.is_gate for p in skeleton_path], dtype=bool)
+            anchors_normal = np.array(
+                [
+                    p.gate_normal if p.gate_normal is not None else np.full(3, np.nan)
+                    for p in skeleton_path
+                ],
+                dtype=np.float64,
+            )
+            self._dump_replans.append(
+                {
+                    "tick": self._tick,
+                    "target_gate_idx": int(self.target_gate_idx),
+                    "anchors_pos": anchors_pos,
+                    "anchors_is_gate": anchors_is_gate,
+                    "anchors_normal": anchors_normal,
+                    "control_points": np.asarray(control_points, dtype=np.float64),
+                    "knots": np.asarray(knots, dtype=np.float64),
+                    "t_total": float(self._t_total),
+                    "current_pos": np.asarray(current_pos[:3], dtype=np.float64),
+                    "current_vel": np.asarray(current_vel[:3], dtype=np.float64),
+                    "gates_pos": self.gates_pos.copy(),
+                    "gates_quat": self.gates_quat.copy(),
+                    "obstacles_pos": (
+                        self.obstacles_pos.copy()
+                        if len(self.obstacles_pos) > 0
+                        else np.zeros((0, 3))
+                    ),
+                }
+            )
 
     def _get_all_obstacle_capsules(self) -> list[Capsule]:
         """Converts all exact trimesh track boundaries into 3D capsule obstacles."""
@@ -618,7 +676,27 @@ class StateController(Controller):
 
         yaw = np.arctan2(des_vel[1], des_vel[0]) if np.linalg.norm(des_vel[:2]) > 0.1 else 0.0
 
-        return np.concatenate((des_pos, des_vel, des_acc, [yaw], np.zeros(3)), dtype=np.float32)
+        action = np.concatenate((des_pos, des_vel, des_acc, [yaw], np.zeros(3)), dtype=np.float32)
+
+        if self._dump_active:
+            self._dump_tick_rows.append(
+                {
+                    "tick": int(self._tick),
+                    "spline_tick": int(self._spline_tick),
+                    "t": float(t),
+                    "u": float(u),
+                    "pos": np.asarray(obs["pos"][:3], dtype=np.float64),
+                    "vel": np.asarray(obs.get("vel", np.zeros(3))[:3], dtype=np.float64),
+                    "des_pos": np.asarray(des_pos, dtype=np.float64),
+                    "des_vel": np.asarray(des_vel, dtype=np.float64),
+                    "des_acc": np.asarray(des_acc, dtype=np.float64),
+                    "yaw": float(yaw),
+                    "target_gate_idx": int(self.target_gate_idx),
+                    "replan_idx": int(self._dump_replan_idx),
+                }
+            )
+
+        return action
 
     def step_callback(
         self,
@@ -644,12 +722,92 @@ class StateController(Controller):
         """
         self._tick += 1
         self._spline_tick += 1
+
+        if self._dump_active and (terminated or truncated or self._finished):
+            if terminated and obs.get("target_gate", 0) != -1:
+                self._dump_terminated_reason = "collision"
+            elif truncated:
+                self._dump_terminated_reason = "timeout"
+            else:
+                self._dump_terminated_reason = "finished"
+            self._dump_final_target_gate = int(obs.get("target_gate", -2))
+            self._dump_final_pos = np.asarray(obs["pos"][:3], dtype=np.float64)
+
         return self._finished
 
     def episode_callback(self) -> None:
         """Reset controller state at the start of a new episode."""
+        if self._dump_active:
+            self._write_dump()
+            self._dump_tick_rows = []
+            self._dump_replans = []
+            self._dump_replan_idx = -1
+            self._dump_terminated_reason = "running"
+            self._dump_episode_idx += 1
         self._tick, self._spline_tick, self._finished, self.target_gate_idx = 0, 0, False, 0
         self._prev_pos = None
+
+    def _write_dump(self) -> None:
+        """Serialize collected dump buffers to an .npz file. Path resolution:
+
+        - SFC_DUMP_PATH unset → ./sfc_dump.npz (or sfc_dump_ep{N}.npz for n_runs>1)
+        - SFC_DUMP_PATH ends with /  → directory; episode files inside
+        - SFC_DUMP_PATH otherwise → exact file (single-episode runs) or
+          stem-suffixed (multi-episode runs, appends `_ep{N}`)
+        """
+        out = _dump_path() or "sfc_dump.npz"
+        path = Path(out)
+        if str(out).endswith(("/", os.sep)):
+            path.mkdir(parents=True, exist_ok=True)
+            path = path / f"episode_{self._dump_episode_idx:03d}.npz"
+        elif self._dump_episode_idx > 0 or hasattr(self, "_dump_force_suffix"):
+            path = path.with_name(
+                f"{path.stem}_ep{self._dump_episode_idx:03d}{path.suffix or '.npz'}"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self._dump_tick_rows:
+            tick_keys = list(self._dump_tick_rows[0].keys())
+            tick_arrs = {k: np.array([r[k] for r in self._dump_tick_rows]) for k in tick_keys}
+        else:
+            tick_arrs = {}
+
+        replan_obj_keys = (
+            "anchors_pos",
+            "anchors_is_gate",
+            "anchors_normal",
+            "control_points",
+            "knots",
+            "current_pos",
+            "current_vel",
+            "gates_pos",
+            "gates_quat",
+            "obstacles_pos",
+        )
+        replan_scalar_keys = ("tick", "target_gate_idx", "t_total")
+        replan_arrs = {}
+        for k in replan_scalar_keys:
+            replan_arrs[f"replan_{k}"] = np.array([r[k] for r in self._dump_replans])
+        for k in replan_obj_keys:
+            replan_arrs[f"replan_{k}"] = np.array(
+                [r[k] for r in self._dump_replans], dtype=object
+            )
+
+        meta = {
+            "terminated_reason": self._dump_terminated_reason,
+            "final_target_gate": getattr(self, "_dump_final_target_gate", -99),
+            "final_pos": getattr(self, "_dump_final_pos", np.full(3, np.nan)),
+            "initial_gates_pos": self._dump_initial_gates_pos,
+            "initial_gates_quat": self._dump_initial_gates_quat,
+            "initial_obstacles_pos": self._dump_initial_obstacles_pos,
+            "anchor_gap": self.anchor_gap,
+            "base_speed": self.base_speed,
+            "safety_margin": self.safety_margin,
+            "n_replans": len(self._dump_replans),
+            "n_ticks": len(self._dump_tick_rows),
+        }
+
+        np.savez_compressed(path, **tick_arrs, **replan_arrs, **{f"meta_{k}": v for k, v in meta.items()})
 
     def render_callback(self, sim: Sim) -> None:
         """Render visualization of the trajectory and waypoints.
