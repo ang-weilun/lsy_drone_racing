@@ -82,16 +82,24 @@ def compute_attitude_command(
     # Anti-windup: freeze integrator on saturation
     integrator_next = integrator if thrust != thrust_unclipped else integrator_tentative
 
-    # Yaw: hold previous when desired horizontal speed too low
+    # Yaw: hold previous when desired horizontal speed too low (this is the
+    # COMMANDED yaw — what we want the firmware to rotate the drone toward)
     speed_xy = float(np.linalg.norm(v_ref[:2]))
     yaw_next = (
         float(np.arctan2(v_ref[1], v_ref[0])) if speed_xy > YAW_SPEED_THRESHOLD else float(yaw_prev)
     )
 
-    # Build R_des from F_des direction + yaw, with singularity guard
+    # Build R_des using the drone's ACTUAL yaw (not commanded) so the (roll, pitch)
+    # decomposition produces the correct world-frame thrust direction regardless of
+    # yaw tracking lag. The Crazyflie firmware caps yaw rate at ~250°/s; when the
+    # planner sweeps yaw faster than that, the drone's actual yaw lags by tens of
+    # degrees, and a (roll, pitch) decomposition built at yaw_next would rotate
+    # the world-frame thrust by the lag angle. Decoupling is the standard
+    # geometric-controller fix (Mellinger 2011 §III).
+    yaw_actual = float(R.from_quat(quat).as_euler("xyz")[2])
     F_norm = float(np.linalg.norm(F_des))
     z_b_des = F_des / F_norm if F_norm > 1e-9 else np.array([0.0, 0.0, 1.0])
-    x_c = np.array([np.cos(yaw_next), np.sin(yaw_next), 0.0])
+    x_c = np.array([np.cos(yaw_actual), np.sin(yaw_actual), 0.0])
     y_b_unnorm = np.cross(z_b_des, x_c)
     y_b_norm = float(np.linalg.norm(y_b_unnorm))
     if y_b_norm < Y_CROSS_EPS:
@@ -102,9 +110,23 @@ def compute_attitude_command(
     R_des = np.column_stack([x_b_des, y_b_next, z_b_des])
     rpy_des = np.array(R.from_matrix(R_des).as_euler("xyz"))
 
+    # Override the extracted yaw with the COMMANDED yaw so the firmware rotates
+    # toward the planned heading at its own pace; meanwhile the (roll, pitch)
+    # tilts are applied in the drone's current body frame and produce correct
+    # world-frame thrust immediately.
+    rpy_des[2] = yaw_next
+
     # Tilt cap (per-axis), then slew-rate limit
     rpy_des[:2] = np.clip(rpy_des[:2], -TILT_LIMIT, TILT_LIMIT)
-    rpy_next = rpy_prev + np.clip(rpy_des - rpy_prev, -TILT_RATE_LIMIT, TILT_RATE_LIMIT)
+    delta = rpy_des - rpy_prev
+    # Yaw wraps at ±π; use shortest signed angular distance, otherwise the slew
+    # limit drives the drone the long way around (e.g. +3.0 → -3.0 rad is
+    # +0.28 rad the short way, but naive subtraction gives -6.0 rad → spin).
+    delta[2] = ((delta[2] + np.pi) % (2 * np.pi)) - np.pi
+    delta_clipped = np.clip(delta, -TILT_RATE_LIMIT, TILT_RATE_LIMIT)
+    rpy_next = rpy_prev + delta_clipped
+    # Keep stored yaw in [-π, π] so future deltas stay bounded
+    rpy_next[2] = ((rpy_next[2] + np.pi) % (2 * np.pi)) - np.pi
 
     action = np.array([rpy_next[0], rpy_next[1], rpy_next[2], thrust], dtype=np.float32)
     return action, integrator_next, yaw_next, y_b_next, rpy_next
@@ -129,6 +151,7 @@ class SfcAttitudeController(Controller):
         self._yaw_prev = None       # lazy-init from current heading on first tick
         self._rpy_prev = np.zeros(3)
         self._y_b_prev = None
+        self._replan_idx = 0
         self.planner = SfcPlanner(obs, self._freq)
 
     def compute_control(self, obs, info=None):
@@ -138,6 +161,7 @@ class SfcAttitudeController(Controller):
         replanned = self.planner.update(obs)
         if replanned:
             self._spline_tick = 0
+            self._replan_idx += 1
             new_pos0, _, _ = self.planner.evaluate(0.0)
             # Horizontal I reset only on big jump; vertical I always preserved.
             if np.linalg.norm(new_pos0[:2] - obs["pos"][:2]) > REPLAN_I_RESET_THRESHOLD:
@@ -157,6 +181,7 @@ class SfcAttitudeController(Controller):
                 self._i_error, self._thrust_min, self._thrust_max,
                 self._yaw_prev, self._y_b_prev, self._rpy_prev,
             )
+
         return action
 
     def step_callback(self, action, obs, reward, terminated, truncated, info):
@@ -172,6 +197,7 @@ class SfcAttitudeController(Controller):
         self._yaw_prev = None
         self._rpy_prev[:] = 0.0
         self._y_b_prev = None
+        self._replan_idx = 0
         self.planner.episode_reset()
 
     def render_callback(self, sim):
