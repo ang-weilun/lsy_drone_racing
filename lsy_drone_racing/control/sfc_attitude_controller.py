@@ -21,14 +21,14 @@ from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.sfc_planner import SfcPlanner
 
 # Position-controller gains (Newtons / metre, ported from attitude_controller.py)
-KP = np.array([0.4, 0.4, 1.25])
+KP = np.array([0.8, 0.8, 1.25])
 KI = np.array([0.05, 0.05, 0.05])
-KD = np.array([0.2, 0.2, 0.4])
+KD = np.array([0.283, 0.283, 0.4])
 KI_RANGE = np.array([2.0, 2.0, 2.0])         # symmetric integrator clamp
 G = 9.81
 
 # Saturation / smoothing
-TILT_LIMIT = 0.5                              # rad (~28°)
+TILT_LIMIT = 0.7                              # rad (~40°)
 TILT_RATE_LIMIT = 0.3                         # rad per 50 Hz tick
 YAW_SPEED_THRESHOLD = 0.1                     # m/s
 Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_des, x_c)
