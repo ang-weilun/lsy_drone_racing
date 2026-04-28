@@ -117,7 +117,7 @@ class SfcPlanner:
     W_JERK = 10.0
     W_CENTER = 0.01
     W_GATE_ALIGN = 5.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
-    GATE_TUBE_RADIUS = 0.20       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
+    GATE_TUBE_RADIUS = 0.18       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
     GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre, both sides.
     GATE_TUBE_N_FACETS = 8        # Polyhedral facets approximating the lateral cylinder.
     REPLAN_DEBOUNCE_TICKS = 5
