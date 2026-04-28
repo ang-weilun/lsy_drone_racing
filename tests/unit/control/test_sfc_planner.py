@@ -224,3 +224,56 @@ def test_tube_fence_holds_at_gate_planes():
                 f"Gate at {g_pos}: lateral offset {np.linalg.norm(lateral):.3f} "
                 f"exceeds tube radius {planner.GATE_TUBE_RADIUS}"
             )
+
+
+def test_diagonal_gate_entry_when_prior_anchor_is_offset():
+    """When the previous skeleton anchor is offset laterally from the gate normal,
+    the spline should pass through the gate centre with a non-trivial cross angle —
+    confirming the QP is using its diagonal freedom rather than forcing on-normal entry.
+    """
+    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+
+    # Build an obs where the drone starts well off the normal axis of gate 0.
+    # Gate 0 sits at (0, 0, 1) with yaw=0 → normal = +x. We start the drone
+    # at (-1.0, 1.0, 1.0) — 1.0m left of the normal axis.
+    obs = {
+        "pos": np.array([-1.0, 1.0, 1.0]),
+        "vel": np.array([0.0, 0.0, 0.0]),
+        "quat": np.array([0.0, 0.0, 0.0, 1.0]),
+        "gates_pos": np.array([[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]]),
+        "gates_quat": np.array(
+            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]
+        ),
+        "obstacles_pos": np.array([]).reshape(0, 3),
+        "target_gate": 0,
+    }
+
+    planner = SfcPlanner(obs, freq=50)
+    spline = planner.des_pos_spline
+
+    # Find spline parameter where it crosses gate 0's plane (x = 0).
+    u_samples = np.linspace(0.0, 1.0, 5000)
+    pts = spline(u_samples)
+    signed = pts[:, 0]  # gate normal is +x → signed distance is x-coord
+    crossings = np.where(np.diff(np.sign(signed)) != 0)[0]
+    assert len(crossings) >= 1, "spline must cross gate 0 plane"
+    c = crossings[0]
+    t = signed[c] / (signed[c] - signed[c + 1])
+    crossing_pt = pts[c] + t * (pts[c + 1] - pts[c])
+
+    # Position assertion: crossing point near gate centre (within 0.05 m).
+    assert np.linalg.norm(crossing_pt - np.array([0.0, 0.0, 1.0])) < 0.05
+
+    # Velocity-direction assertion: cross angle should be non-trivial.
+    # Spline's tangent at crossing parameter:
+    u_cross = u_samples[c] + t * (u_samples[c + 1] - u_samples[c])
+    tangent = np.asarray(spline.derivative(nu=1)(u_cross))
+    tangent /= np.linalg.norm(tangent)
+    cos_angle = abs(tangent[0])  # |dot(tangent, gate_normal)|
+
+    # If the QP forced on-normal entry, cos_angle would be ~1.0. Relaxation
+    # active → cos_angle < 0.95 (cross angle > ~18°).
+    assert cos_angle < 0.95, (
+        f"Cross-angle cosine {cos_angle:.3f} suggests QP is still forcing "
+        "on-normal entry — diagonal relaxation is not biting."
+    )
