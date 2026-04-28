@@ -15,6 +15,11 @@ from scipy.spatial.transform import Rotation as R
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+from drone_models.core import load_params
+
+from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.sfc_planner import SfcPlanner
+
 # Position-controller gains (Newtons / metre, ported from attitude_controller.py)
 KP = np.array([0.4, 0.4, 1.25])
 KI = np.array([0.05, 0.05, 0.05])
@@ -103,3 +108,78 @@ def compute_attitude_command(
 
     action = np.array([rpy_next[0], rpy_next[1], rpy_next[2], thrust], dtype=np.float32)
     return action, integrator_next, yaw_next, y_b_next, rpy_next
+
+
+class SfcAttitudeController(Controller):
+    """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+
+    def __init__(self, obs, info, config) -> None:
+        super().__init__(obs, info, config)
+        self._freq = config.env.freq
+        params = load_params(config.sim.physics, config.sim.drone_model)
+        self._mass = float(params["mass"])
+        # Per-motor thrust bounds × 4 motors = total collective thrust bounds (Newtons)
+        self._thrust_min = float(params["thrust_min"]) * 4.0
+        self._thrust_max = float(params["thrust_max"]) * 4.0
+
+        self._tick = 0
+        self._spline_tick = 0
+        self._finished = False
+        self._i_error = np.zeros(3)
+        self._yaw_prev = None       # lazy-init from current heading on first tick
+        self._rpy_prev = np.zeros(3)
+        self._y_b_prev = None
+        self.planner = SfcPlanner(obs, self._freq)
+
+    def compute_control(self, obs, info=None):
+        if self._yaw_prev is None:
+            self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+
+        replanned = self.planner.update(obs)
+        if replanned:
+            self._spline_tick = 0
+            new_pos0, _, _ = self.planner.evaluate(0.0)
+            # Horizontal I reset only on big jump; vertical I always preserved.
+            if np.linalg.norm(new_pos0[:2] - obs["pos"][:2]) > REPLAN_I_RESET_THRESHOLD:
+                self._i_error[:2] = 0.0
+
+        t = min(self._spline_tick / self._freq, self.planner.t_total)
+        des_pos, des_vel, des_acc = self.planner.evaluate(t)
+
+        if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
+            self._finished = True
+
+        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
+            compute_attitude_command(
+                obs["pos"], obs.get("vel", np.zeros(3)),
+                des_pos, des_vel, des_acc,
+                obs["quat"], self._mass,
+                self._i_error, self._thrust_min, self._thrust_max,
+                self._yaw_prev, self._y_b_prev, self._rpy_prev,
+            )
+        return action
+
+    def step_callback(self, action, obs, reward, terminated, truncated, info):
+        self._tick += 1
+        self._spline_tick += 1
+        return self._finished
+
+    def episode_callback(self):
+        self._tick = 0
+        self._spline_tick = 0
+        self._finished = False
+        self._i_error[:] = 0.0
+        self._yaw_prev = None
+        self._rpy_prev[:] = 0.0
+        self._y_b_prev = None
+        self.planner.episode_reset()
+
+    def render_callback(self, sim):
+        if self.planner.t_total <= 0:
+            return
+        from crazyflow.sim.visualize import draw_line, draw_points
+        u = min(self._spline_tick / self._freq, self.planner.t_total) / self.planner.t_total
+        draw_points(sim, self.planner.des_pos_spline(u).reshape(1, -1),
+                    rgba=(1.0, 0.0, 0.0, 1.0), size=0.04)
+        draw_line(sim, self.planner.des_pos_spline(np.linspace(0.0, 1.0, 100)),
+                  rgba=(0.0, 1.0, 0.0, 1.0))

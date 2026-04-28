@@ -182,3 +182,36 @@ def test_slew_rate_limited_per_tick():
     # Roll moved at most TILT_RATE_LIMIT per axis from rpy_prev=0
     assert abs(float(action[0])) <= TILT_RATE_LIMIT + 1e-6
     assert abs(float(action[1])) <= TILT_RATE_LIMIT + 1e-6
+
+
+def test_sfc_attitude_controller_instantiates_with_minimal_obs():
+    from lsy_drone_racing.control.sfc_attitude_controller import SfcAttitudeController
+    from ml_collections import ConfigDict
+
+    obs = {
+        "pos": np.array([-1.5, 0.75, 0.05]),
+        "vel": np.array([0.0, 0.0, 0.0]),
+        "quat": np.array([0.0, 0.0, 0.0, 1.0]),
+        "gates_pos": np.array([
+            [0.5, 0.25, 0.7], [1.05, 0.75, 1.2], [-1.0, -0.25, 0.7], [0.0, -0.75, 1.2]
+        ]),
+        "gates_quat": np.array([
+            [0.0, 0.0, np.sin(-0.78 / 2), np.cos(-0.78 / 2)],
+            [0.0, 0.0, np.sin(2.35 / 2), np.cos(2.35 / 2)],
+            [0.0, 0.0, np.sin(3.14 / 2), np.cos(3.14 / 2)],
+            [0.0, 0.0, 0.0, 1.0],
+        ]),
+        "obstacles_pos": np.array([
+            [0.0, 0.75, 1.55], [1.0, 0.25, 1.55], [-1.5, -0.25, 1.55], [-0.5, -0.75, 1.55]
+        ]),
+        "target_gate": 0,
+    }
+    config = ConfigDict({"env": {"freq": 50}, "sim": {"physics": "first_principles", "drone_model": "cf21B_500"}})
+
+    ctrl = SfcAttitudeController(obs, info={}, config=config)
+    action = ctrl.compute_control(obs)
+    assert action.shape == (4,)
+    assert action.dtype == np.float32
+    # At t=0 with zero error and zero des_vel, yaw_prev was lazy-init from current heading (0)
+    # so action[2] should be ~0 and thrust ~m·g.
+    assert abs(float(action[3]) - ctrl._mass * G) < 0.15  # generous; tilt from initial planner vel demand shifts thrust above hover
