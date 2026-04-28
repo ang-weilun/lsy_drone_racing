@@ -271,12 +271,16 @@ def test_diagonal_gate_entry_when_prior_anchor_is_offset():
     tangent /= np.linalg.norm(tangent)
     cos_angle = abs(tangent[0])  # |dot(tangent, gate_normal)|
 
-    # If the QP forced on-normal entry, cos_angle would be ~1.0. With the tube
-    # at 0.18 m and W_GATE_ALIGN=5, observed cos_angle in this scenario is
-    # around 0.95–0.96 (cross angle ~16–18°). Threshold 0.97 catches the
-    # relaxation effect (pre-relaxation = 1.0) without being so tight that
-    # small QP-solver-tolerance jitter trips it.
-    assert cos_angle < 0.97, (
-        f"Cross-angle cosine {cos_angle:.3f} suggests QP is still forcing "
-        "on-normal entry — diagonal relaxation is not biting."
+    # Pre-relaxation, the hard symmetry equality forced cos_angle = 1.0
+    # exactly. After relaxation (drop pre/post anchors, no symmetry, soft
+    # alignment cost), the QP has freedom to deviate. Threshold 0.99 is
+    # intentionally generous: gate-1 crash diagnosis showed strong diagonal
+    # entry causes frame-bar clips, so W_GATE_ALIGN was bumped to firmly
+    # suppress lateral offset. The relaxation that actually delivers laptime
+    # gain is the corridor-topology change (pre/post off the segmentation),
+    # not the entry angle. This test still confirms the QP is no longer
+    # rigidly forcing cos_angle = 1.0.
+    assert cos_angle < 0.99, (
+        f"Cross-angle cosine {cos_angle:.3f} — QP appears to be exactly "
+        "forcing on-normal entry; symmetry equality may be back."
     )
