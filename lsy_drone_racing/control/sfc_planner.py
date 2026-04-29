@@ -124,8 +124,8 @@ class SfcPlanner:
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 1.5        # m/s. Speed ceiling on straights.
-    TILT_LIMIT_PLANNER = 0.35 # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
+    V_MAX_GLOBAL = 2.0        # m/s. Speed ceiling on straights.
+    TILT_LIMIT_PLANNER = 0.5  # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
     A_LONG_MAX_FACTOR = 0.4    # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
     V_FLOOR = 0.2               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
     N_TOPP_SAMPLES = 200        # Number of points to sample u ∈ [0, 1] when building the schedule.

@@ -36,6 +36,15 @@ Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_
 # Replan handling (used by the controller class, not the helper)
 REPLAN_I_RESET_THRESHOLD = 0.10               # m, horizontal-I reset gate
 
+# Acceleration-FF lookahead. Evaluates the planner's a_ref at t + ACC_FF_LOOKAHEAD
+# (instead of t) when feeding mass·a_ref into F_des. Compensates for crazyflie
+# attitude-loop reaction lag (~10–20 ms): by the time the firmware tracks the
+# commanded rpy, the drone is at the right attitude for the *current* path
+# point rather than one tick behind. Set to 0.0 to disable. p_ref / v_ref are
+# still evaluated at t so the position/velocity error terms refer to the actual
+# current schedule point.
+ACC_FF_LOOKAHEAD = 0.10                       # s (5 outer-loop ticks at 50 Hz)
+
 
 def compute_attitude_command(
     p: NDArray,
@@ -173,13 +182,21 @@ class SfcAttitudeController(Controller):
         t = min(self._spline_tick / self._freq, self.planner.t_total)
         des_pos, des_vel, des_acc = self.planner.evaluate(t)
 
+        # Acceleration-FF lookahead: a_ref leads p_ref/v_ref by ACC_FF_LOOKAHEAD
+        # to compensate for firmware attitude-loop lag. Spline gives this exactly.
+        if ACC_FF_LOOKAHEAD > 0.0:
+            t_ff = min(t + ACC_FF_LOOKAHEAD, self.planner.t_total)
+            _, _, des_acc_ff = self.planner.evaluate(t_ff)
+        else:
+            des_acc_ff = des_acc
+
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
 
         action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
             compute_attitude_command(
                 obs["pos"], obs.get("vel", np.zeros(3)),
-                des_pos, des_vel, des_acc,
+                des_pos, des_vel, des_acc_ff,
                 obs["quat"], self._mass,
                 self._i_error, self._thrust_min, self._thrust_max,
                 self._yaw_prev, self._y_b_prev, self._rpy_prev,
