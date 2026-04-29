@@ -16,6 +16,8 @@ from numpy.typing import NDArray
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.spatial.transform import Rotation as R
 
+import lsy_drone_racing.control.sfc_config as cfg
+
 logger = logging.getLogger(__name__)
 
 
@@ -116,19 +118,14 @@ class SfcPlanner:
     W_ACC = 6.0
     W_JERK = 10.0
     W_CENTER = 0.01
-    W_GATE_ALIGN = 30.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
-    GATE_TUBE_RADIUS = 0.18       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
-    GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre (max).
-    GATE_TUBE_AXIAL_MIN = 0.0     # m. Min axial distance, signed by side. 0 = no min (just sign convention).
-    GATE_TUBE_N_FACETS = 8        # Polyhedral facets approximating the lateral cylinder.
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 2.0        # m/s. Speed ceiling on straights.
-    TILT_LIMIT_PLANNER = 0.5  # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
-    A_LONG_MAX_FACTOR = 0.4    # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
-    V_FLOOR = 0.2               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
-    N_TOPP_SAMPLES = 200        # Number of points to sample u ∈ [0, 1] when building the schedule.
+    V_MAX_GLOBAL = cfg.V_MAX_GLOBAL
+    TILT_LIMIT_PLANNER = cfg.TILT_LIMIT_PLANNER
+    A_LONG_MAX_FACTOR = cfg.A_LONG_MAX_FACTOR
+    V_FLOOR = cfg.V_FLOOR
+    N_TOPP_SAMPLES = cfg.N_TOPP_SAMPLES
 
     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
         self._freq = freq
@@ -154,11 +151,8 @@ class SfcPlanner:
         self._last_replan_tick = -self.REPLAN_DEBOUNCE_TICKS  # allow first move-triggered replan
 
         self._t_to_u: CubicSpline | None = None
-        self.replan_events: list[dict] = []
-        self.last_replan_event: dict | None = None
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
-        self._record_replan_event(reason="init")
 
     def update(self, obs: dict[str, NDArray]) -> bool:
         """Sync target_gate_idx from obs and replan if any object moved (debounced)."""
@@ -172,7 +166,7 @@ class SfcPlanner:
             self.target_gate_idx = env_target
 
         # 2. Detect movement
-        moved, reason = self._check_objects_moved(obs)
+        moved = self._check_objects_moved(obs)
         if not moved:
             return False
         if self._tick - self._last_replan_tick < self.REPLAN_DEBOUNCE_TICKS:
@@ -182,7 +176,6 @@ class SfcPlanner:
 
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
         self._last_replan_tick = self._tick
-        self._record_replan_event(reason=reason)
         return True
 
     def evaluate(self, t: float) -> tuple[NDArray, NDArray, NDArray]:
@@ -237,8 +230,6 @@ class SfcPlanner:
         self.target_gate_idx = 0
         self._tick = 0
         self._last_replan_tick = -self.REPLAN_DEBOUNCE_TICKS
-        self.replan_events = []
-        self.last_replan_event = None
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
         """Generate a B-spline trajectory through safe flight corridors.
@@ -510,14 +501,6 @@ class SfcPlanner:
         pts_rest_seg = pts_per_seg
         n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
-        # Cubic B-spline fit and cp.diff(P, k=3) require n_ctrl >= 4. With
-        # pre/post anchors no longer in the skeleton, late-race replans
-        # (1 gate left, drone close to it) can produce a single corridor with
-        # n_ctrl as low as 1. Bump pts_first_seg to keep the spline well-defined.
-        if n_ctrl < 4:
-            pts_first_seg = 4 - (n_segments - 1) * pts_rest_seg
-            n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
-
         P = cp.Variable((n_ctrl, 3))
         constraints = []
 
@@ -556,22 +539,6 @@ class SfcPlanner:
                 normal = skeleton_path[i].gate_normal
                 constraints.append(P[gate_cp_idx] == skeleton_path[i].pos)
 
-        # Re-inject pre/post anchor coordinates as reference targets for the
-        # gate-neighbour control points. Pre/post are no longer skeleton nodes
-        # (they used to break the corridor topology). The W_CENTER cost
-        # (weight 0.01) provides a tiny on-normal bias when nothing else is
-        # pushing the points off-axis. The hard tube fence + soft alignment
-        # cost are the load-bearing constraints; this is a comfort-blanket nudge.
-        for i in range(1, len(skeleton_path) - 1):
-            if skeleton_path[i].is_gate:
-                gate_cp_idx = cp_idx_map[i]
-                gate_pos = skeleton_path[i].pos
-                normal = skeleton_path[i].gate_normal
-                if gate_cp_idx - 1 >= 0:
-                    reference_points[gate_cp_idx - 1] = gate_pos - normal * self.anchor_gap
-                if gate_cp_idx + 1 < n_ctrl:
-                    reference_points[gate_cp_idx + 1] = gate_pos + normal * self.anchor_gap
-
         cost = (
             self.W_VEL * cp.sum_squares(cp.diff(P, axis=0))
             + self.W_ACC * cp.sum_squares(cp.diff(P, k=2, axis=0))
@@ -598,44 +565,22 @@ class SfcPlanner:
             if skeleton_path[i].is_gate:
                 gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
-                right = skeleton_path[i].gate_right
-                up = skeleton_path[i].gate_up
-                gate_pos = skeleton_path[i].pos
 
-                # Polyhedral lateral fence: 8 half-spaces inscribed in a cylinder
-                # of radius GATE_TUBE_RADIUS around the gate-normal axis. We use
-                # a polyhedral approximation rather than cp.norm(..., 2) because
-                # the QP is solved with OSQP, which does not support SOC.
-                facet_dirs = []
-                for k in range(self.GATE_TUBE_N_FACETS):
-                    theta = 2.0 * np.pi * k / self.GATE_TUBE_N_FACETS
-                    facet_dirs.append(np.cos(theta) * right + np.sin(theta) * up)
-
-                # Side convention: P[gate_idx − 1] sits on −n side, P[gate_idx + 1]
-                # on +n side. Without this signed split + min-axial fence, smoothness
-                # costs collapse both neighbours toward gate_pos, producing a tight
-                # high-curvature arc at the crossing that the controller can't track
-                # cleanly (residual ~0.09 m lateral error → frame-bar clip).
-                for offset_idx, sign in ((gate_cp_idx - 1, -1.0), (gate_cp_idx + 1, +1.0)):
-                    if not (0 <= offset_idx < n_ctrl):
-                        continue
-                    dp = P[offset_idx] - gate_pos
-                    # Lateral fence: 8 facet half-spaces.
-                    for d in facet_dirs:
-                        constraints.append(dp @ d <= self.GATE_TUBE_RADIUS)
-                    # Axial fence: signed band [min, half_length] on the assigned side.
-                    constraints.append(sign * (dp @ normal) >= self.GATE_TUBE_AXIAL_MIN)
-                    constraints.append(sign * (dp @ normal) <= self.GATE_TUBE_HALF_LENGTH)
+                # Enforce symmetry around the gate for smooth straight passage
+                if gate_cp_idx - 1 >= 0 and gate_cp_idx + 1 < n_ctrl:
+                    constraints.append(
+                        P[gate_cp_idx - 1] + P[gate_cp_idx + 1] == 2 * P[gate_cp_idx]
+                    )
 
                 # Softly penalize deviation from the normal line
                 if gate_cp_idx - 1 >= 0:
                     dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
+                    cost += 100.0 * cp.sum_squares(dp - proj)
                 if gate_cp_idx + 1 < n_ctrl:
                     dp = P[gate_cp_idx + 1] - skeleton_path[i].pos
                     proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
+                    cost += 100.0 * cp.sum_squares(dp - proj)
 
         problem = cp.Problem(cp.Minimize(cost), constraints)
         try:
@@ -673,11 +618,10 @@ class SfcPlanner:
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
             if 0.0 < d_post < 1.0:
                 next_pos = self.gates_pos[self.target_gate_idx]
-                # Test against prev_pos + prev_normal * anchor_gap, the canonical
-                # post-gate exit point (no post_pos anchor in skeleton anymore).
-                exit_vector = next_pos - (prev_pos + prev_normal * self.anchor_gap)
+                prev_post_pos = prev_pos + prev_normal * self.anchor_gap
+                exit_vector = next_pos - prev_post_pos
                 if float(np.dot(exit_vector, prev_normal)) < -0.2:
-                    clearance_pos = prev_pos + prev_normal * (self.anchor_gap + 1.0)
+                    clearance_pos = prev_post_pos + prev_normal * 1.0
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
@@ -687,37 +631,111 @@ class SfcPlanner:
             right = rot.apply([0, 1, 0])
             up = rot.apply([0, 0, 1])
 
+            pre_pos = pos - normal * self.anchor_gap
+            post_pos = pos + normal * self.anchor_gap
+
             flow_dir = pos - raw_path[-1].pos
 
-            # ENTRY SWING (U-turn approach logic). Computed against gate centre
-            # rather than a pre_pos anchor — same dot-product test, ~0.5 m
-            # offset along normal does not flip the U-turn detection.
+            # ENTRY SWING (U-turn approach logic)
+            # If approaching the gate from the wrong side, we need a U-turn maneuver.
             if np.dot(flow_dir, normal) < -0.1:
-                if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * 0.5
+                is_next_to = False
+                faces_different = False
+                if i > 0:
+                    prev_pos = self.gates_pos[i - 1]
+                    prev_normal = gate_normals[i - 1]
+                    dp = pos - prev_pos
+                    
+                    # Calculate lateral (side-to-side) vs longitudinal (front-to-back) offset
+                    # relative to the CURRENT gate's orientation.
+                    dist_lat = abs(float(np.dot(dp, right)))
+                    dist_long = abs(float(np.dot(dp, normal)))
+                    
+                    # If the lateral offset is larger, the gates are placed side-by-side.
+                    # If the longitudinal offset is larger, they are placed in-line (back-to-back).
+                    is_next_to = dist_lat > dist_long
+                    
+                    # Check if the previous gate and current gate face opposite directions.
+                    faces_different = np.dot(normal, prev_normal) < 0.0
+
+                # Determine the type of U-turn needed:
+                # Vertical/Drop-down U-turn is used when gates are in-line (back-to-back)
+                # and facing opposite directions.
+                if faces_different and not is_next_to:
+                    # Vertical U-turn: Drop down into the gate from above
+                    swing_pos = pre_pos + up * 0.8
                 else:
-                    swing_pos = pos - right * 0.5
+                    # Lateral U-turn: For side-by-side gates or gates facing the same general direction.
+                    # Choose left or right approach based on the drone's incoming position.
+                    dot_r = np.dot(raw_path[-1].pos - pos, right)
+                    lat_dir = right if dot_r > 0 else -right
+                    swing_pos = pos + lat_dir * 0.5
                 raw_path.append(SkeletonPoint(swing_pos, False, None, None, None))
 
+            if np.dot(pos - raw_path[-1].pos, normal) > 0.05:
+                raw_path.append(SkeletonPoint(pre_pos, False, None, None, None))
+
             raw_path.append(SkeletonPoint(pos, True, normal, right, up))
+            raw_path.append(SkeletonPoint(post_pos, False, None, None, None))
 
             # EXIT SWING (Hairpin / Reversal Logic)
             if i + 1 < len(self.gates_pos):
                 next_pos = self.gates_pos[i + 1]
-                # Test against pos + normal * anchor_gap, the canonical post-gate
-                # exit point, even though no post_pos anchor is in the skeleton.
-                exit_vector = next_pos - (pos + normal * self.anchor_gap)
+                next_normal = gate_normals[i + 1]
+                exit_vector = next_pos - post_pos
 
+                # If the next gate is behind us (requires a sharp turn > 90 degrees)
                 if np.dot(exit_vector, normal) < -0.2:
-                    clearance_pos = pos + normal * (self.anchor_gap + 1.0)
+                    clearance_pos = post_pos + normal * 1.0
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
-                    if np.dot(exit_vector, right) > 0:
-                        exit_swing = clearance_pos + right * 1.0 - normal * 0.7
+                    # Calculate lateral vs longitudinal offset to the NEXT gate
+                    # relative to the CURRENT gate's orientation.
+                    dp = next_pos - pos
+                    dist_lat = abs(float(np.dot(dp, right)))
+                    dist_long = abs(float(np.dot(dp, normal)))
+                    
+                    # If the lateral offset is larger, the next gate is placed side-by-side.
+                    # If the longitudinal offset is larger, it is in-line (back-to-back).
+                    is_next_to = dist_lat > dist_long
+                    
+                    # Check if the current gate and the next gate face opposite directions.
+                    faces_different = np.dot(normal, next_normal) < 0.0
+
+                    # Determine the type of U-turn needed to exit the current gate
+                    # and prepare for the next gate.
+                    if faces_different and not is_next_to:
+                        # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.
+                        # The drone reverses direction by flying up and directly over the current gate.
+                        exit_swing = pos + up * 1.2
                     else:
-                        exit_swing = clearance_pos - right * 1.0 - normal * 0.7
+                        # Lateral U-turn: Used for side-by-side gates.
+                        # The drone swings out laterally to the left or right to re-orient.
+                        dot_r = np.dot(exit_vector, right)
+                        lat_dir = right if dot_r > 0 else -right
+                        exit_swing = clearance_pos + lat_dir * 1.0 - normal * 0.7
 
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None))
+                else:
+                    # Smarter intermediate waypoint handling for non-U-turn setups
+                    next_pre_pos = next_pos - next_normal * self.anchor_gap
+                    dp = (next_pre_pos - post_pos)[:2]
+                    d1 = normal[:2]
+                    d2 = -next_normal[:2]
+                    
+                    det = d1[0] * d2[1] - d1[1] * d2[0]
+                    if abs(det) > 1e-3:
+                        t1 = (dp[0] * d2[1] - dp[1] * d2[0]) / det
+                        t2 = (d1[0] * dp[1] - d1[1] * dp[0]) / det
+                        
+                        if t1 > 0.2 and t2 > 0.2:
+                            intersect1 = post_pos + normal * t1
+                            intersect2 = next_pre_pos - next_normal * t2
+                            midpoint = (intersect1 + intersect2) / 2.0
+                            
+                            max_dist = np.linalg.norm(next_pre_pos - post_pos)
+                            if np.linalg.norm(midpoint - post_pos) < max_dist * 1.5:
+                                raw_path.append(SkeletonPoint(midpoint, False, None, None, None))
 
         obs_circles = []
         for p in self.obstacles_pos:
@@ -778,16 +796,15 @@ class SfcPlanner:
 
         return path
 
-    def _check_objects_moved(self, obs: dict[str, NDArray]) -> tuple[bool, str]:
-        gate_moved = False
-        obs_moved = False
+    def _check_objects_moved(self, obs: dict[str, NDArray]) -> bool:
+        moved = False
         new_gates_pos = obs["gates_pos"]
         if (
             len(self.gates_pos) > 0
             and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.05
         ):
             self.gates_pos, self.gates_quat = new_gates_pos.copy(), obs["gates_quat"].copy()
-            gate_moved = True
+            moved = True
 
         new_obs_pos = obs.get("obstacles_pos", np.array([]))
         if len(new_obs_pos) != len(self.obstacles_pos) or (
@@ -795,33 +812,6 @@ class SfcPlanner:
             and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.05
         ):
             self.obstacles_pos = new_obs_pos.copy()
-            obs_moved = True
+            moved = True
 
-        if gate_moved and obs_moved:
-            reason = "gate+obstacle_jitter"
-        elif gate_moved:
-            reason = "gate_jitter"
-        elif obs_moved:
-            reason = "obstacle_jitter"
-        else:
-            reason = ""
-        return gate_moved or obs_moved, reason
-
-    def current_spline_snapshot(self) -> dict:
-        """Return a dict fully describing the current spline (for trace dumps)."""
-        return {
-            "t_total": float(self._t_total),
-            "knots": np.asarray(self._des_pos_spline.t, dtype=np.float64).copy(),
-            "control_points": np.asarray(self._control_points, dtype=np.float64).copy(),
-            "k": int(self._des_pos_spline.k),
-            "target_gate_idx": int(self.target_gate_idx),
-        }
-
-    def _record_replan_event(self, reason: str) -> None:
-        evt = {
-            "tick": int(self._tick),
-            "reason": reason,
-            "snapshot": self.current_spline_snapshot(),
-        }
-        self.replan_events.append(evt)
-        self.last_replan_event = evt
+        return moved

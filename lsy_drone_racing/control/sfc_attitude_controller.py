@@ -19,31 +19,23 @@ from drone_models.core import load_params
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.sfc_planner import SfcPlanner
+import lsy_drone_racing.control.sfc_config as cfg
 
 # Position-controller gains (Newtons / metre, ported from attitude_controller.py)
-KP = np.array([0.8, 0.8, 1.25])
-KI = np.array([0.05, 0.05, 0.05])
-KD = np.array([0.283, 0.283, 0.4])
-KI_RANGE = np.array([2.0, 2.0, 2.0])         # symmetric integrator clamp
+KP = cfg.KP
+KI = cfg.KI
+KD = cfg.KD
+KI_RANGE = cfg.KI_RANGE
 G = 9.81
 
 # Saturation / smoothing
-TILT_LIMIT = 0.7                              # rad (~40°)
-TILT_RATE_LIMIT = 0.3                         # rad per 50 Hz tick
-YAW_SPEED_THRESHOLD = 0.1                     # m/s
+TILT_LIMIT = cfg.TILT_LIMIT
+TILT_RATE_LIMIT = cfg.TILT_RATE_LIMIT
+YAW_SPEED_THRESHOLD = 0.3                     # m/s
 Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_des, x_c)
 
 # Replan handling (used by the controller class, not the helper)
 REPLAN_I_RESET_THRESHOLD = 0.10               # m, horizontal-I reset gate
-
-# Acceleration-FF lookahead. Evaluates the planner's a_ref at t + ACC_FF_LOOKAHEAD
-# (instead of t) when feeding mass·a_ref into F_des. Compensates for crazyflie
-# attitude-loop reaction lag (~10–20 ms): by the time the firmware tracks the
-# commanded rpy, the drone is at the right attitude for the *current* path
-# point rather than one tick behind. Set to 0.0 to disable. p_ref / v_ref are
-# still evaluated at t so the position/velocity error terms refer to the actual
-# current schedule point.
-ACC_FF_LOOKAHEAD = 0.10                       # s (5 outer-loop ticks at 50 Hz)
 
 
 def compute_attitude_command(
@@ -163,7 +155,6 @@ class SfcAttitudeController(Controller):
         self._rpy_prev = np.zeros(3)
         self._y_b_prev = None
         self._replan_idx = 0
-        self._last_diag: dict | None = None
         self.planner = SfcPlanner(obs, self._freq)
 
     def compute_control(self, obs, info=None):
@@ -182,13 +173,30 @@ class SfcAttitudeController(Controller):
         t = min(self._spline_tick / self._freq, self.planner.t_total)
         des_pos, des_vel, des_acc = self.planner.evaluate(t)
 
-        # Acceleration-FF lookahead: a_ref leads p_ref/v_ref by ACC_FF_LOOKAHEAD
-        # to compensate for firmware attitude-loop lag. Spline gives this exactly.
-        if ACC_FF_LOOKAHEAD > 0.0:
-            t_ff = min(t + ACC_FF_LOOKAHEAD, self.planner.t_total)
-            _, _, des_acc_ff = self.planner.evaluate(t_ff)
-        else:
-            des_acc_ff = des_acc
+        # Allow target to follow the drone if the drone flies faster (mainly on straights)
+        vel_norm = float(np.linalg.norm(des_vel))
+        if vel_norm > 1.0:
+            tangent = des_vel / vel_norm
+            a_lat = des_acc - float(np.dot(des_acc, tangent)) * tangent
+            if np.linalg.norm(a_lat) < 2.0:  # Straight-ish path
+                lookahead = 1.5  # seconds
+                t_max = min(t + lookahead, self.planner.t_total)
+                if t_max > t:
+                    t_search = np.linspace(t, t_max, 10)
+                    min_dist = float(np.linalg.norm(obs["pos"] - des_pos))
+                    best_t = t
+                    
+                    for ts in t_search[1:]:
+                        p, _, _ = self.planner.evaluate(float(ts))
+                        dist = float(np.linalg.norm(obs["pos"] - p))
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_t = float(ts)
+                    
+                    if best_t > t:
+                        self._spline_tick = best_t * self._freq
+                        t = best_t
+                        des_pos, des_vel, des_acc = self.planner.evaluate(t)
 
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
@@ -196,26 +204,11 @@ class SfcAttitudeController(Controller):
         action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
             compute_attitude_command(
                 obs["pos"], obs.get("vel", np.zeros(3)),
-                des_pos, des_vel, des_acc_ff,
+                des_pos, des_vel, des_acc,
                 obs["quat"], self._mass,
                 self._i_error, self._thrust_min, self._thrust_max,
                 self._yaw_prev, self._y_b_prev, self._rpy_prev,
             )
-
-        rpy_act = np.asarray(R.from_quat(obs["quat"]).as_euler("xyz"), dtype=np.float64)
-        thrust_cmd = float(action[3])
-        eps_t = 1e-4
-        self._last_diag = {
-            "des_pos": np.asarray(des_pos, dtype=np.float64).copy(),
-            "des_vel": np.asarray(des_vel, dtype=np.float64).copy(),
-            "des_acc": np.asarray(des_acc, dtype=np.float64).copy(),
-            "thrust_cmd": thrust_cmd,
-            "at_thrust_min": thrust_cmd <= self._thrust_min + eps_t,
-            "at_thrust_max": thrust_cmd >= self._thrust_max - eps_t,
-            "i_error": self._i_error.copy(),
-            "rpy_cmd": np.asarray(action[:3], dtype=np.float64).copy(),
-            "rpy_act": rpy_act,
-        }
 
         return action
 
