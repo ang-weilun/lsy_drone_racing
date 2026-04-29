@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from lsy_drone_racing.control.sfc_planner import (
+from lsy_drone_racing.control.sfc_planner_relaxed import (
     Capsule,
     FlightCorridor,
     SkeletonPoint,
@@ -72,7 +72,7 @@ def _minimal_obs():
 
 
 def test_sfc_planner_constructs_initial_spline():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
     assert planner.t_total > 0
@@ -81,7 +81,7 @@ def test_sfc_planner_constructs_initial_spline():
 
 def test_sfc_planner_evaluate_returns_time_scaled_derivatives():
     """vel and acc must be in m/s and m/s², not in BSpline parameter units."""
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
     pos0, vel0, acc0 = planner.evaluate(0.0)
@@ -93,7 +93,7 @@ def test_sfc_planner_evaluate_returns_time_scaled_derivatives():
 
 
 def test_sfc_planner_update_returns_false_when_nothing_moves():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -101,7 +101,7 @@ def test_sfc_planner_update_returns_false_when_nothing_moves():
 
 
 def test_sfc_planner_update_replans_when_obstacle_moves_above_threshold():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -115,7 +115,7 @@ def test_sfc_planner_update_replans_when_obstacle_moves_above_threshold():
 
 
 def test_sfc_planner_update_debounces_consecutive_replans():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -131,7 +131,7 @@ def test_sfc_planner_update_debounces_consecutive_replans():
 
 
 def test_sfc_planner_update_syncs_target_gate_from_obs():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -141,7 +141,7 @@ def test_sfc_planner_update_syncs_target_gate_from_obs():
 
 
 def test_sfc_planner_episode_reset_zeroes_counters():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -154,7 +154,7 @@ def test_sfc_planner_episode_reset_zeroes_counters():
 
 
 def test_sfc_planner_records_init_replan_event():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
     assert len(planner.replan_events) == 1
@@ -169,7 +169,7 @@ def test_sfc_planner_records_init_replan_event():
 
 
 def test_sfc_planner_records_replan_event_on_obstacle_move():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     obs = _minimal_obs()
     planner = SfcPlanner(obs, freq=50)
@@ -185,7 +185,7 @@ def test_sfc_planner_records_replan_event_on_obstacle_move():
 
 
 def test_sfc_planner_episode_reset_clears_replan_events():
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
     assert len(planner.replan_events) == 1
@@ -196,7 +196,7 @@ def test_sfc_planner_episode_reset_clears_replan_events():
 
 def test_tube_fence_holds_at_gate_planes():
     """Spline lateral offset at each gate's plane must stay inside the tube."""
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
     from scipy.spatial.transform import Rotation as R
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
@@ -231,7 +231,7 @@ def test_diagonal_gate_entry_when_prior_anchor_is_offset():
     the spline should pass through the gate centre with a non-trivial cross angle —
     confirming the QP is using its diagonal freedom rather than forcing on-normal entry.
     """
-    from lsy_drone_racing.control.sfc_planner import SfcPlanner
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     # Build an obs where the drone starts well off the normal axis of gate 0.
     # Gate 0 sits at (0, 0, 1) with yaw=0 → normal = +x. We start the drone
