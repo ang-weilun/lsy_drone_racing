@@ -173,6 +173,31 @@ class SfcAttitudeController(Controller):
         t = min(self._spline_tick / self._freq, self.planner.t_total)
         des_pos, des_vel, des_acc = self.planner.evaluate(t)
 
+        # Allow target to follow the drone if the drone flies faster (mainly on straights)
+        vel_norm = float(np.linalg.norm(des_vel))
+        if vel_norm > 1.0:
+            tangent = des_vel / vel_norm
+            a_lat = des_acc - float(np.dot(des_acc, tangent)) * tangent
+            if np.linalg.norm(a_lat) < 2.0:  # Straight-ish path
+                lookahead = 1.5  # seconds
+                t_max = min(t + lookahead, self.planner.t_total)
+                if t_max > t:
+                    t_search = np.linspace(t, t_max, 10)
+                    min_dist = float(np.linalg.norm(obs["pos"] - des_pos))
+                    best_t = t
+                    
+                    for ts in t_search[1:]:
+                        p, _, _ = self.planner.evaluate(float(ts))
+                        dist = float(np.linalg.norm(obs["pos"] - p))
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_t = float(ts)
+                    
+                    if best_t > t:
+                        self._spline_tick = best_t * self._freq
+                        t = best_t
+                        des_pos, des_vel, des_acc = self.planner.evaluate(t)
+
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
 
