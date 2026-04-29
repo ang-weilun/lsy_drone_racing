@@ -19,18 +19,19 @@ from drone_models.core import load_params
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.sfc_planner import SfcPlanner
+import lsy_drone_racing.control.sfc_config as cfg
 
 # Position-controller gains (Newtons / metre, ported from attitude_controller.py)
-KP = np.array([0.4, 0.4, 1.25])
-KI = np.array([0.05, 0.05, 0.05])
-KD = np.array([0.2, 0.2, 0.4])
-KI_RANGE = np.array([2.0, 2.0, 2.0])         # symmetric integrator clamp
+KP = cfg.KP
+KI = cfg.KI
+KD = cfg.KD
+KI_RANGE = cfg.KI_RANGE
 G = 9.81
 
 # Saturation / smoothing
-TILT_LIMIT = 0.5                              # rad (~28°)
-TILT_RATE_LIMIT = 0.3                         # rad per 50 Hz tick
-YAW_SPEED_THRESHOLD = 0.1                     # m/s
+TILT_LIMIT = cfg.TILT_LIMIT
+TILT_RATE_LIMIT = cfg.TILT_RATE_LIMIT
+YAW_SPEED_THRESHOLD = 0.3                     # m/s
 Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_des, x_c)
 
 # Replan handling (used by the controller class, not the helper)

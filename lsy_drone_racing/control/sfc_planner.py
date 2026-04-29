@@ -16,6 +16,8 @@ from numpy.typing import NDArray
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.spatial.transform import Rotation as R
 
+import lsy_drone_racing.control.sfc_config as cfg
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,11 +121,11 @@ class SfcPlanner:
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 2.0          # m/s. Speed ceiling on straights.
-    TILT_LIMIT_PLANNER = 0.5    # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
-    A_LONG_MAX_FACTOR = 0.7     # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
-    V_FLOOR = 0.3               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
-    N_TOPP_SAMPLES = 200        # Number of points to sample u ∈ [0, 1] when building the schedule.
+    V_MAX_GLOBAL = cfg.V_MAX_GLOBAL
+    TILT_LIMIT_PLANNER = cfg.TILT_LIMIT_PLANNER
+    A_LONG_MAX_FACTOR = cfg.A_LONG_MAX_FACTOR
+    V_FLOOR = cfg.V_FLOOR
+    N_TOPP_SAMPLES = cfg.N_TOPP_SAMPLES
 
     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
         self._freq = freq
