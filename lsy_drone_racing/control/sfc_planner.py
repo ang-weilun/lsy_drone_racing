@@ -637,11 +637,39 @@ class SfcPlanner:
             flow_dir = pos - raw_path[-1].pos
 
             # ENTRY SWING (U-turn approach logic)
+            # If approaching the gate from the wrong side, we need a U-turn maneuver.
             if np.dot(flow_dir, normal) < -0.1:
-                if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * 0.5
+                is_next_to = False
+                faces_different = False
+                if i > 0:
+                    prev_pos = self.gates_pos[i - 1]
+                    prev_normal = gate_normals[i - 1]
+                    dp = pos - prev_pos
+                    
+                    # Calculate lateral (side-to-side) vs longitudinal (front-to-back) offset
+                    # relative to the CURRENT gate's orientation.
+                    dist_lat = abs(float(np.dot(dp, right)))
+                    dist_long = abs(float(np.dot(dp, normal)))
+                    
+                    # If the lateral offset is larger, the gates are placed side-by-side.
+                    # If the longitudinal offset is larger, they are placed in-line (back-to-back).
+                    is_next_to = dist_lat > dist_long
+                    
+                    # Check if the previous gate and current gate face opposite directions.
+                    faces_different = np.dot(normal, prev_normal) < 0.0
+
+                # Determine the type of U-turn needed:
+                # Vertical/Drop-down U-turn is used when gates are in-line (back-to-back)
+                # and facing opposite directions.
+                if faces_different and not is_next_to:
+                    # Vertical U-turn: Drop down into the gate from above
+                    swing_pos = pre_pos + up * 0.8
                 else:
-                    swing_pos = pos - right * 0.5
+                    # Lateral U-turn: For side-by-side gates or gates facing the same general direction.
+                    # Choose left or right approach based on the drone's incoming position.
+                    dot_r = np.dot(raw_path[-1].pos - pos, right)
+                    lat_dir = right if dot_r > 0 else -right
+                    swing_pos = pos + lat_dir * 0.5
                 raw_path.append(SkeletonPoint(swing_pos, False, None, None, None))
 
             if np.dot(pos - raw_path[-1].pos, normal) > 0.05:
@@ -653,6 +681,7 @@ class SfcPlanner:
             # EXIT SWING (Hairpin / Reversal Logic)
             if i + 1 < len(self.gates_pos):
                 next_pos = self.gates_pos[i + 1]
+                next_normal = gate_normals[i + 1]
                 exit_vector = next_pos - post_pos
 
                 # If the next gate is behind us (requires a sharp turn > 90 degrees)
@@ -660,12 +689,53 @@ class SfcPlanner:
                     clearance_pos = post_pos + normal * 1.0
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
-                    if np.dot(exit_vector, right) > 0:
-                        exit_swing = clearance_pos + right * 1.0 - normal * 0.7
+                    # Calculate lateral vs longitudinal offset to the NEXT gate
+                    # relative to the CURRENT gate's orientation.
+                    dp = next_pos - pos
+                    dist_lat = abs(float(np.dot(dp, right)))
+                    dist_long = abs(float(np.dot(dp, normal)))
+                    
+                    # If the lateral offset is larger, the next gate is placed side-by-side.
+                    # If the longitudinal offset is larger, it is in-line (back-to-back).
+                    is_next_to = dist_lat > dist_long
+                    
+                    # Check if the current gate and the next gate face opposite directions.
+                    faces_different = np.dot(normal, next_normal) < 0.0
+
+                    # Determine the type of U-turn needed to exit the current gate
+                    # and prepare for the next gate.
+                    if faces_different and not is_next_to:
+                        # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.
+                        # The drone reverses direction by flying up and directly over the current gate.
+                        exit_swing = pos + up * 1.2
                     else:
-                        exit_swing = clearance_pos - right * 1.0 - normal * 0.7
+                        # Lateral U-turn: Used for side-by-side gates.
+                        # The drone swings out laterally to the left or right to re-orient.
+                        dot_r = np.dot(exit_vector, right)
+                        lat_dir = right if dot_r > 0 else -right
+                        exit_swing = clearance_pos + lat_dir * 1.0 - normal * 0.7
 
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None))
+                else:
+                    # Smarter intermediate waypoint handling for non-U-turn setups
+                    next_pre_pos = next_pos - next_normal * self.anchor_gap
+                    dp = (next_pre_pos - post_pos)[:2]
+                    d1 = normal[:2]
+                    d2 = -next_normal[:2]
+                    
+                    det = d1[0] * d2[1] - d1[1] * d2[0]
+                    if abs(det) > 1e-3:
+                        t1 = (dp[0] * d2[1] - dp[1] * d2[0]) / det
+                        t2 = (d1[0] * dp[1] - d1[1] * dp[0]) / det
+                        
+                        if t1 > 0.2 and t2 > 0.2:
+                            intersect1 = post_pos + normal * t1
+                            intersect2 = next_pre_pos - next_normal * t2
+                            midpoint = (intersect1 + intersect2) / 2.0
+                            
+                            max_dist = np.linalg.norm(next_pre_pos - post_pos)
+                            if np.linalg.norm(midpoint - post_pos) < max_dist * 1.5:
+                                raw_path.append(SkeletonPoint(midpoint, False, None, None, None))
 
         obs_circles = []
         for p in self.obstacles_pos:
