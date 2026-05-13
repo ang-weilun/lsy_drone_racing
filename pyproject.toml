@@ -68,11 +68,6 @@ platforms = ["linux-64"]
 python = ">=3.11.12,<3.14"
 pip = ">=25.0.1,<26"
 ruff = "*"
-# Compilers needed for acados
-cmake = "*"
-compilers = ">=1.9.0, <1.11.0"
-make = "*"
-openblas = ">=0.3.30,<0.4"
 trimesh = ">=4.12.0,<5"
 rtree = ">=1.4.1,<2"
 cvxpy = ">=1.8.2,<2"
@@ -80,21 +75,31 @@ cvxpy = ">=1.8.2,<2"
 [tool.pixi.pypi-dependencies]
 lsy_drone_racing = { path = ".", editable = true }
 
-[tool.pixi.activation]
-scripts = ["tools/setup_acados.sh"]
-
 [tool.pixi.tasks]
 evaluate = { cmd = "python scripts/evaluate.py", description = "Evaluate the controller" }
 
 ### environments
 [tool.pixi.environments]
-default = { features = ["sim"], solve-group = "default" }
-deploy = { features = ["sim", "gpu", "kilted", "deploy"] }
-gpu = { features = ["sim", "gpu"], solve-group = "default" }
-tests = { features = ["sim", "rl", "tests"], solve-group = "default" }
-gpu-tests = { features = ["sim", "gpu", "tests"], solve-group = "default" }
-gamepad = { features = ["sim", "gamepad"], solve-group = "default" }
-profile = { features = ["sim", "profile", "gpu"], solve-group = "default" }
+default = { features = ["sim", "acados"], solve-group = "default" }
+deploy = { features = ["sim", "gpu", "kilted", "deploy", "acados"] }
+gpu = { features = ["sim", "gpu", "acados"], solve-group = "default" }
+tests = { features = ["sim", "rl", "tests", "acados"], solve-group = "default" }
+gpu-tests = { features = ["sim", "gpu", "tests", "acados"], solve-group = "default" }
+gamepad = { features = ["sim", "gamepad", "acados"], solve-group = "default" }
+profile = { features = ["sim", "profile", "gpu", "acados"], solve-group = "default" }
+train = { features = ["sim", "gpu", "rl"], solve-group = "default" }
+
+## feature [acados]
+# Opt-in: pulls in compilers + builds acados from source via tools/setup_acados.sh.
+# The RL `train` env intentionally omits this to keep cold-start fast.
+[tool.pixi.feature.acados.dependencies]
+cmake = "*"
+compilers = ">=1.9.0, <1.11.0"
+make = "*"
+openblas = ">=0.3.30,<0.4"
+
+[tool.pixi.feature.acados.activation]
+scripts = ["tools/setup_acados.sh"]
 
 ## feature [kilted]
 [tool.pixi.feature.kilted]
