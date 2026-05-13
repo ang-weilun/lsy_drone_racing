@@ -840,9 +840,9 @@ def _save_checkpoint(
         "rng_key": train_state.rng_key,
         "env_rng_key": env.rng_key,
         "env_sim_rng_key": _env_sim_rng_key(env),
-        "global_step": jnp.asarray(train_state.global_step, dtype=jnp.int64),
+        "global_step": jnp.asarray(train_state.global_step, dtype=jnp.int32),
         "iteration": jnp.asarray(train_state.iteration, dtype=jnp.int32),
-        "total_timesteps": jnp.asarray(total_timesteps, dtype=jnp.int64),
+        "total_timesteps": jnp.asarray(total_timesteps, dtype=jnp.int32),
     }
     checkpointer = ocp.PyTreeCheckpointer()
     checkpointer.save(

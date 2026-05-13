@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from jax import Array
-from jax.scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.rl_song.config import (
     ACTOR_OBS_DIM,
@@ -28,6 +27,7 @@ ROTATION_RAW_DIM: int = 6
 ROTATION_VECTOR_DIM: int = 3
 DEFAULT_INIT_LOG_STD: float = PPOConfig().init_log_std
 ROTATION_NORM_EPS: float = 1e-8
+GIMBAL_LOCK_EPS: float = 1e-6
 LOG_TWO_PI: float = 1.8378770664093453
 LOG_TWO_PI_E: float = 2.8378770664093453
 ROT6D_IDENTITY_BIAS: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -234,7 +234,7 @@ def raw_to_env_action(
     )
     r3 = jnp.cross(r1, r2, axis=-1)
     rotation_matrix = jnp.stack([r1, r2, r3], axis=-1)
-    euler_xyz = Rotation.from_matrix(rotation_matrix).as_euler("xyz")
+    euler_xyz = _matrix_to_euler_xyz(rotation_matrix)
     env_action = jnp.concatenate([euler_xyz, thrust], axis=-1)
     _validate_last_dim(env_action, ENV_ACTION_DIM, "env_action")
     return env_action
@@ -245,6 +245,52 @@ def _normal_log_prob(mu: Array, log_std: Array, action: Array) -> Array:
     variance_scaled = jnp.square((action - mu) / jnp.exp(log_std))
     per_dim_log_prob = -0.5 * (variance_scaled + 2.0 * log_std + LOG_TWO_PI)
     return jnp.sum(per_dim_log_prob, axis=-1)
+
+
+def _matrix_to_euler_xyz(rotation_matrix: Array) -> Array:
+    """Convert a 3x3 rotation matrix to extrinsic xyz Euler angles in pure JAX.
+
+    Parameters
+    ----------
+    rotation_matrix : Array, shape (..., 3, 3)
+        Orthonormal matrix produced by Gram-Schmidt of the 6D rotation head.
+
+    Returns
+    -------
+    Array, shape (..., 3)
+        Extrinsic xyz Euler angles ``[roll, pitch, yaw]``. Matches the
+        convention of
+        ``scipy.spatial.transform.Rotation.from_matrix(R).as_euler('xyz')``
+        and therefore the env's
+        ``Rotation.from_euler('xyz', rpy).as_quat()`` round-trip.
+
+    Notes
+    -----
+    Hand-rolled rather than calling
+    ``jax.scipy.spatial.transform.Rotation.from_matrix`` then ``.as_euler``
+    because the scipy wrapper goes through ``np.vectorize`` and adds ~70 s of
+    overhead per training run in the PPO rollout's hot path. Per CLAUDE.md
+    "Reimplement only when the library is incompatible with our constraints
+    (real-time budget)" — cProfile data justifies the exemption.
+
+    The gimbal-lock branch follows scipy's convention: when
+    ``|cos(pitch)| < GIMBAL_LOCK_EPS`` we set ``roll = 0`` and absorb the
+    residual rotation into ``yaw``.
+    """
+    sin_beta = -rotation_matrix[..., 2, 0]
+    cos_beta = jnp.sqrt(
+        jnp.square(rotation_matrix[..., 0, 0]) + jnp.square(rotation_matrix[..., 1, 0])
+    )
+    beta = jnp.arctan2(sin_beta, cos_beta)
+    alpha = jnp.arctan2(rotation_matrix[..., 2, 1], rotation_matrix[..., 2, 2])
+    gamma = jnp.arctan2(rotation_matrix[..., 1, 0], rotation_matrix[..., 0, 0])
+    gimbal_lock = cos_beta < GIMBAL_LOCK_EPS
+    alpha = jnp.where(gimbal_lock, jnp.zeros_like(alpha), alpha)
+    gamma_locked = jnp.arctan2(
+        -rotation_matrix[..., 0, 1], rotation_matrix[..., 1, 1]
+    )
+    gamma = jnp.where(gimbal_lock, gamma_locked, gamma)
+    return jnp.stack([alpha, beta, gamma], axis=-1)
 
 
 def _validate_last_dim(array: Array, expected_dim: int, name: str) -> None:
