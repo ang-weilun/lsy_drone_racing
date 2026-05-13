@@ -92,6 +92,7 @@ tests = { features = ["sim", "rl", "tests"], solve-group = "default" }
 gpu-tests = { features = ["sim", "gpu", "tests"], solve-group = "default" }
 gamepad = { features = ["sim", "gamepad"], solve-group = "default" }
 profile = { features = ["sim", "profile", "gpu"], solve-group = "default" }
+rl-train = { features = ["sim", "gpu", "rl-jax"], solve-group = "default" }
 
 ## feature [kilted]
 [tool.pixi.feature.kilted]
@@ -122,6 +123,17 @@ pytest = "*"
 
 [tool.pixi.feature.profile.dependencies]
 pyinstrument = "*"
+
+## feature [rl-jax]
+[tool.pixi.feature.rl-jax.pypi-dependencies]
+flax = "*"
+orbax-checkpoint = "*"
+tyro = "*"
+wandb = "*"
+
+[tool.pixi.feature.rl-jax.tasks]
+train-rl-song = { cmd = "python -m lsy_drone_racing.control.rl_song.train", description = "Train the Song-2023 RL policy" }
+eval-rl-song = { cmd = "python -m lsy_drone_racing.control.rl_song.eval", description = "Evaluate a trained RL policy" }
 
 ########################
 # Linting and formatting settings
