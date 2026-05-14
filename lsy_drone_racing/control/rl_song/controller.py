@@ -27,6 +27,12 @@ from lsy_drone_racing.control.rl_song.policy import (
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 CHECKPOINT_PREFIX: str = "step_"
 TOTAL_THRUST_MULTIPLIER: float = 4.0
+# Default run directory for the deployed policy. Used when the config does not
+# carry ``controller.checkpoint`` (e.g. the level toml files, where only
+# ``controller.file`` and ``env.control_mode`` may be set).
+DEFAULT_CHECKPOINT_DIR: Path = (
+    Path(__file__).resolve().parent / "checkpoints" / "stage1_seed0_v7_pergate_jackpot"
+)
 
 
 class RLSongController(Controller):
@@ -51,9 +57,10 @@ class RLSongController(Controller):
             usual ``sim.physics`` / ``sim.drone_model`` entries.
         """
         super().__init__(obs, info, config)
-        checkpoint = _restore_checkpoint(
-            _resolve_checkpoint_path(_config_value(config, "controller", "checkpoint"))
-        )
+        checkpoint_path = _config_value_optional(config, "controller", "checkpoint")
+        if checkpoint_path is None:
+            checkpoint_path = DEFAULT_CHECKPOINT_DIR
+        checkpoint = _restore_checkpoint(_resolve_checkpoint_path(checkpoint_path))
         self.actor_params = checkpoint["actor_params"]
         self.normalizer = _normalizer_from_checkpoint(checkpoint["normalizer"])
 
@@ -64,6 +71,25 @@ class RLSongController(Controller):
         self.thrust_max = float(drone_params["thrust_max"] * TOTAL_THRUST_MULTIPLIER)
         self.prev_action_env_4vec = jnp.zeros((ENV_ACTION_DIM,), dtype=jnp.float32)
         self._deterministic_inference = jax.jit(_deterministic_env_action)
+
+    def step_callback(
+        self,
+        action: npt.NDArray[np.floating],
+        obs: dict[str, npt.NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Return ``False`` so the env (not the controller) decides termination.
+
+        The base :class:`Controller`'s default returns ``True`` (despite its
+        comment), which would break ``sim.py``'s rollout loop after one step.
+        The RL policy has no internal stopping criterion — it runs until the
+        env terminates or truncates.
+        """
+        _ = action, obs, reward, terminated, truncated, info
+        return False
 
     def compute_control(
         self,
@@ -127,6 +153,21 @@ def _config_value(config: Any, *keys: str) -> Any:
         else:
             if not hasattr(value, key):
                 raise ValueError(f"Missing config key: {'.'.join(keys)}")
+            value = getattr(value, key)
+    return value
+
+
+def _config_value_optional(config: Any, *keys: str) -> Any | None:
+    """Like :func:`_config_value` but returns ``None`` if any key is missing."""
+    value = config
+    for key in keys:
+        if isinstance(value, dict):
+            if key not in value:
+                return None
+            value = value[key]
+        else:
+            if not hasattr(value, key):
+                return None
             value = getattr(value, key)
     return value
 
