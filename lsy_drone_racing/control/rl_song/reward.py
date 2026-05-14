@@ -92,7 +92,9 @@ def step_reward(
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
     r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-    r_prog = r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
+    r_prog = reward_cfg.progress_coef * (
+        r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
+    )
 
     r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(
         env_obs["ang_vel"], ord=1, axis=-1

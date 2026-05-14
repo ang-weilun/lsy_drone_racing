@@ -54,7 +54,10 @@ class PPOConfig:
     gamma: float = 0.98
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.0
+    # Non-zero entropy bonus keeps the policy exploring early on. The first
+    # untuned run with ent_coef=0 collapsed to a stable hover (entropy ~ -6.5)
+    # before reaching any gate.
+    ent_coef: float = 0.005
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
@@ -88,8 +91,16 @@ class RewardConfig:
     doubling the coefficient when halving the step rate.
     """
 
+    # Multiplier on the Song progress term ||g - p_{k-1}|| - ||g - p_k||. The
+    # bare Song formulation gives per-step values ~0.003 against an omega
+    # penalty ~0.0023, leaving navigation barely-positive vs hovering. Scaling
+    # the progress term makes "move toward the gate" dominate the per-step
+    # signal.
+    progress_coef: float = 5.0
     omega_coef: float = 0.02
-    crash_penalty: float = 10.0
+    # Crash penalty was 10.0; reduced because the original ratio of -10 crash
+    # to ~+0.003 per-step progress collapsed the policy to a safe hover.
+    crash_penalty: float = 5.0
     finish_bonus: float = 10.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     obstacle_weight: float = 0.5
