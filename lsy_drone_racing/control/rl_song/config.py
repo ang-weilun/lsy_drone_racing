@@ -54,10 +54,12 @@ class PPOConfig:
     gamma: float = 0.98
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    # Non-zero entropy bonus keeps the policy exploring early on. The first
-    # untuned run with ent_coef=0 collapsed to a stable hover (entropy ~ -6.5)
-    # before reaching any gate.
-    ent_coef: float = 0.005
+    # Non-zero entropy bonus keeps the policy exploring. The v1 run with
+    # ent_coef=0 collapsed to a stable hover (final entropy ~ -6.5); v2 with
+    # ent_coef=0.005 reached "approach gate 1 but don't cross" with final
+    # entropy ~ -1.7. v3 doubles it to keep exploration alive long enough to
+    # discover that crossing gate 1 leads to gate 2 (which is also reachable).
+    ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
@@ -91,12 +93,11 @@ class RewardConfig:
     doubling the coefficient when halving the step rate.
     """
 
-    # Multiplier on the Song progress term ||g - p_{k-1}|| - ||g - p_k||. The
-    # bare Song formulation gives per-step values ~0.003 against an omega
-    # penalty ~0.0023, leaving navigation barely-positive vs hovering. Scaling
-    # the progress term makes "move toward the gate" dominate the per-step
-    # signal.
-    progress_coef: float = 5.0
+    # Multiplier on the Song progress term ||g - p_{k-1}|| - ||g - p_k||. v2
+    # ran at 5.0 and produced a policy that parked next to gate 1 without
+    # crossing (~0.2m off the opening center, ep_ret +7.5). v3 doubles to 10.0
+    # to accelerate the approach phase and the post-crossing dash to gate 2.
+    progress_coef: float = 10.0
     omega_coef: float = 0.02
     # Crash penalty was 10.0; reduced because the original ratio of -10 crash
     # to ~+0.003 per-step progress collapsed the policy to a safe hover.
@@ -105,8 +106,12 @@ class RewardConfig:
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     obstacle_weight: float = 0.5
     obstacle_sigma: float = 0.2  # m
-    # Optional bonus on first crossing of each gate; placeholder, see §7.
-    gate_pass_bonus: float = 1.0
+    # Big jackpot on gate crossing. v2 ran at 1.0 and the policy discovered
+    # that crossing gate 1 forfeited ~+10 of accumulated parking reward (and
+    # immediately switched the target to a far-away gate 2), so it preferred
+    # to camp. v3 makes the jackpot worth ~3x the parking value to flip the
+    # incentive.
+    gate_pass_bonus: float = 20.0
     use_gate_pass_bonus: bool = True
 
 
