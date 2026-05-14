@@ -798,7 +798,7 @@ def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
     FileNotFoundError
         If ``init_from`` does not exist or contains no checkpoints.
     """
-    init_run_dir = Path(init_from).expanduser()
+    init_run_dir = Path(init_from).expanduser().resolve()
     if not init_run_dir.exists():
         raise FileNotFoundError(f"init_from path does not exist: {init_run_dir}")
     checkpoint_path = _latest_checkpoint_path(init_run_dir)
