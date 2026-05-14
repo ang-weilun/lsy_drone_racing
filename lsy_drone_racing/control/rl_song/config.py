@@ -57,11 +57,15 @@ class PPOConfig:
     # Initial entropy bonus. The v3 1e8-step run with constant ent_coef=0.01
     # plateaued at target_gate=1.73 because entropy kept climbing (final
     # +16.3): the bonus rewarded action-spread faster than the policy could
-    # refine, so it never committed past gates 0-1. v4 linearly anneals from
-    # ent_coef -> ent_coef_final across training so early iterations explore
-    # (discover gates 0-1) and late iterations commit (refine gates 1-2-3).
+    # refine, so it never committed past gates 0-1. v4 introduced a linear
+    # anneal from ent_coef -> ent_coef_final across training so early
+    # iterations explore (discover gates 0-1) and late iterations commit
+    # (refine gates 1-2-3-4). v5 (2e8 with floor 0.001) reached finish_rate
+    # ~0.5% but stayed at entropy +15.9, suggesting the floor was still too
+    # high. v6 drops the floor to zero so the entropy bonus fully vanishes by
+    # end of training and the policy can commit deterministically.
     ent_coef: float = 0.01
-    ent_coef_final: float = 0.001
+    ent_coef_final: float = 0.0
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
