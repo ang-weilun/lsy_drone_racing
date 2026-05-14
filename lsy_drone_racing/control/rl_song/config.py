@@ -54,12 +54,14 @@ class PPOConfig:
     gamma: float = 0.98
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    # Non-zero entropy bonus keeps the policy exploring. The v1 run with
-    # ent_coef=0 collapsed to a stable hover (final entropy ~ -6.5); v2 with
-    # ent_coef=0.005 reached "approach gate 1 but don't cross" with final
-    # entropy ~ -1.7. v3 doubles it to keep exploration alive long enough to
-    # discover that crossing gate 1 leads to gate 2 (which is also reachable).
+    # Initial entropy bonus. The v3 1e8-step run with constant ent_coef=0.01
+    # plateaued at target_gate=1.73 because entropy kept climbing (final
+    # +16.3): the bonus rewarded action-spread faster than the policy could
+    # refine, so it never committed past gates 0-1. v4 linearly anneals from
+    # ent_coef -> ent_coef_final across training so early iterations explore
+    # (discover gates 0-1) and late iterations commit (refine gates 1-2-3).
     ent_coef: float = 0.01
+    ent_coef_final: float = 0.001
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4

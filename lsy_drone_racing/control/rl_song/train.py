@@ -221,13 +221,16 @@ def train(args: CLIArgs) -> None:
             ppo_cfg.gae_lambda,
         )
         batch = _flatten_rollout(rollout, advantages, returns)
+        current_ent_coef = _current_ent_coef(ppo_cfg, iteration)
         actor_state, critic_state, train_metrics = _update_policy(
             actor_state,
             critic_state,
             batch,
             ppo_cfg,
             np.random.default_rng(train_cfg.seed + iteration),
+            current_ent_coef,
         )
+        train_metrics["ent_coef"] = current_ent_coef
 
         env.update_normalizer_from_batch(
             rollout["actor_obs"].reshape((-1, ACTOR_OBS_DIM))
@@ -560,12 +563,36 @@ def _flatten_rollout(
     )
 
 
+def _current_ent_coef(ppo_cfg: PPOConfig, iteration: int) -> float:
+    """Linearly interpolate the entropy coefficient across training.
+
+    Parameters
+    ----------
+    ppo_cfg : PPOConfig
+        Training hyperparameters with ``ent_coef`` initial and
+        ``ent_coef_final`` end values.
+    iteration : int
+        One-indexed PPO iteration number.
+
+    Returns
+    -------
+    float
+        Entropy coefficient for this iteration.
+    """
+    if ppo_cfg.n_iterations <= 1:
+        return ppo_cfg.ent_coef_final
+    progress = (iteration - 1) / (ppo_cfg.n_iterations - 1)
+    progress = max(0.0, min(1.0, progress))
+    return ppo_cfg.ent_coef + (ppo_cfg.ent_coef_final - ppo_cfg.ent_coef) * progress
+
+
 def _update_policy(
     actor_state: TrainState,
     critic_state: TrainState,
     batch: RolloutBatch,
     ppo_cfg: PPOConfig,
     rng: np.random.Generator,
+    ent_coef: float,
 ) -> tuple[TrainState, TrainState, dict[str, float]]:
     """Run PPO epochs over one flattened rollout batch."""
     batch_size = batch.actor_obs.shape[0]
@@ -579,6 +606,7 @@ def _update_policy(
         "clip_fraction": 0.0,
         "updates": 0.0,
     }
+    ent_coef_jax = jnp.asarray(ent_coef, dtype=jnp.float32)
 
     for _ in range(ppo_cfg.update_epochs):
         rng.shuffle(batch_indices)
@@ -589,7 +617,7 @@ def _update_policy(
                 lambda value: value[minibatch_indices], batch
             )
             actor_state, critic_state, metrics = _train_minibatch(
-                actor_state, critic_state, minibatch, ppo_cfg
+                actor_state, critic_state, minibatch, ent_coef_jax, ppo_cfg
             )
             for key in metrics_accum:
                 if key != "updates":
@@ -604,14 +632,19 @@ def _update_policy(
     }
 
 
-@partial(jax.jit, static_argnums=3)
+@partial(jax.jit, static_argnums=4)
 def _train_minibatch(
     actor_state: TrainState,
     critic_state: TrainState,
     batch: RolloutBatch,
+    ent_coef: Array,
     ppo_cfg: PPOConfig,
 ) -> tuple[TrainState, TrainState, dict[str, Array]]:
-    """Apply one PPO minibatch update to the separate actor and critic."""
+    """Apply one PPO minibatch update to the separate actor and critic.
+
+    ``ent_coef`` is a runtime scalar (annealed across training) so the JIT
+    cache is preserved across iterations.
+    """
 
     def actor_loss_fn(params: dict[str, Any]) -> tuple[Array, dict[str, Array]]:
         new_logprob, entropy = log_prob_of(
@@ -633,7 +666,7 @@ def _train_minibatch(
         clip_fraction = jnp.mean(
             (jnp.abs(ratio - 1.0) > ppo_cfg.clip_coef).astype(jnp.float32)
         )
-        loss = policy_loss - ppo_cfg.ent_coef * entropy_loss
+        loss = policy_loss - ent_coef * entropy_loss
         return loss, {
             "policy_loss": policy_loss,
             "entropy": entropy_loss,
@@ -762,6 +795,7 @@ def _log_iteration(
         "losses/old_approx_kl": train_metrics["old_approx_kl"],
         "losses/approx_kl": train_metrics["approx_kl"],
         "losses/clip_fraction": train_metrics["clip_fraction"],
+        "charts/ent_coef": train_metrics.get("ent_coef", ppo_cfg.ent_coef),
         "rollout/ep_ret": rollout_metrics["ep_ret"],
         "rollout/ep_len": rollout_metrics["ep_len"],
         "rollout/episodes": rollout_metrics["episodes"],
