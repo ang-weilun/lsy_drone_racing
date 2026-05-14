@@ -119,6 +119,12 @@ class RewardConfig:
     # incentive.
     gate_pass_bonus: float = 20.0
     use_gate_pass_bonus: bool = True
+    # v7: scale ``gate_pass_bonus`` by ``(target_gate_index + 1)``. With the
+    # default ``gate_pass_bonus = 20``, gate 1 pays 20, gate 2 pays 40, gate
+    # 3 pays 60, gate 4 pays 80. v5 and v6 plateaued at finish_rate ~0.5–0.6%
+    # with a flat 20-per-gate jackpot; the per-gate scaling is intended to
+    # increase the marginal return on pushing past gate 2.
+    scale_gate_bonus_by_index: bool = True
 
 
 @dataclass(frozen=True)

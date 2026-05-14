@@ -485,6 +485,9 @@ def _rollout_metrics(
         ),
         "episodes": float(np.asarray(completed_count)),
         "target_gate_mean": float(np.asarray(jnp.mean(outputs.target_gate_progress))),
+        "max_gate_mean": float(
+            np.asarray(metric_sums.completed_max_gate_sum / completed_denominator)
+        ),
         "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
         "finish_rate": float(
             np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))
@@ -800,6 +803,7 @@ def _log_iteration(
         "rollout/ep_len": rollout_metrics["ep_len"],
         "rollout/episodes": rollout_metrics["episodes"],
         "rollout/target_gate": rollout_metrics["target_gate_mean"],
+        "rollout/max_gate": rollout_metrics["max_gate_mean"],
         "rollout/crash_rate": rollout_metrics["crash_rate"],
         "rollout/finish_rate": rollout_metrics["finish_rate"],
     }

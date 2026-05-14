@@ -124,11 +124,19 @@ class RolloutMetricSums(NamedTuple):
     ------
     completed_return_sum, completed_length_sum, completed_count : Array
         Scalar sums over episodes completed during the rollout.
+    completed_max_gate_sum : Array
+        Scalar sum of the per-episode maximum target-gate index reached, in
+        the same ``target_gate_progress`` scale used elsewhere (``n_gates``
+        means the lap was finished). Dividing by ``completed_count`` gives
+        the average best-gate-reached per finished episode and is robust to
+        the episode-length bias that distorts ``target_gate_mean`` for fast
+        policies.
     """
 
     completed_return_sum: Array
     completed_length_sum: Array
     completed_count: Array
+    completed_max_gate_sum: Array
 
 
 class RolloutScanResult(NamedTuple):
@@ -176,9 +184,11 @@ class _ScanCarry(NamedTuple):
     next_done: Array
     episode_returns: Array
     episode_lengths: Array
+    episode_max_gate: Array
     completed_return_sum: Array
     completed_length_sum: Array
     completed_count: Array
+    completed_max_gate_sum: Array
 
 
 @partial(
@@ -250,6 +260,7 @@ def scan_rollout(
         static_cfg,
     )
     zero_scalar = jnp.asarray(0.0, dtype=jnp.float32)
+    episode_max_gate = jnp.zeros_like(episode_returns)
     initial_carry = _ScanCarry(
         env_data=env_data,
         prev_action_env_4vec=prev_action_env_4vec,
@@ -258,9 +269,11 @@ def scan_rollout(
         next_done=next_done,
         episode_returns=episode_returns,
         episode_lengths=episode_lengths,
+        episode_max_gate=episode_max_gate,
         completed_return_sum=zero_scalar,
         completed_length_sum=zero_scalar,
         completed_count=zero_scalar,
+        completed_max_gate_sum=zero_scalar,
     )
 
     def scan_step(
@@ -322,11 +335,23 @@ def scan_rollout(
         done = done_bool.astype(jnp.float32)
         episode_returns = carry.episode_returns + reward
         episode_lengths = carry.episode_lengths + 1.0
+
+        n_gates = env_obs["gates_pos"].shape[1]
+        target_gate_progress = jnp.where(
+            finished,
+            n_gates,
+            current_target,
+        ).astype(jnp.float32)
+        episode_max_gate = jnp.maximum(carry.episode_max_gate, target_gate_progress)
+
         completed_return_sum = carry.completed_return_sum + jnp.sum(
             jnp.where(done_bool, episode_returns, 0.0)
         )
         completed_length_sum = carry.completed_length_sum + jnp.sum(
             jnp.where(done_bool, episode_lengths, 0.0)
+        )
+        completed_max_gate_sum = carry.completed_max_gate_sum + jnp.sum(
+            jnp.where(done_bool, episode_max_gate, 0.0)
         )
         completed_count = carry.completed_count + jnp.sum(done)
 
@@ -344,13 +369,7 @@ def scan_rollout(
         )
         next_episode_returns = jnp.where(done_bool, 0.0, episode_returns)
         next_episode_lengths = jnp.where(done_bool, 0.0, episode_lengths)
-
-        n_gates = env_obs["gates_pos"].shape[1]
-        target_gate_progress = jnp.where(
-            finished,
-            n_gates,
-            current_target,
-        ).astype(jnp.float32)
+        next_episode_max_gate = jnp.where(done_bool, 0.0, episode_max_gate)
         crash = terminated & ~finished
 
         next_carry = _ScanCarry(
@@ -361,9 +380,11 @@ def scan_rollout(
             next_done=done,
             episode_returns=next_episode_returns,
             episode_lengths=next_episode_lengths,
+            episode_max_gate=next_episode_max_gate,
             completed_return_sum=completed_return_sum,
             completed_length_sum=completed_length_sum,
             completed_count=completed_count,
+            completed_max_gate_sum=completed_max_gate_sum,
         )
         transition = RolloutScanOutputs(
             actor_obs=actor_obs,
@@ -401,6 +422,7 @@ def scan_rollout(
         completed_return_sum=final_carry.completed_return_sum,
         completed_length_sum=final_carry.completed_length_sum,
         completed_count=final_carry.completed_count,
+        completed_max_gate_sum=final_carry.completed_max_gate_sum,
     )
     return RolloutScanResult(
         env_data=final_carry.env_data,

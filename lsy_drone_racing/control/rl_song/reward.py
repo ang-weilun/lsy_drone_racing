@@ -110,11 +110,22 @@ def step_reward(
         obstacle_barrier * obstacle_active, axis=-1
     )
 
+    # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
+    # pre-step target index because of the ``prev_target >= 0`` branch above,
+    # which is the index of the gate just passed. Scaling by ``(target_idx +
+    # 1)`` makes gate 1 worth 1x, gate 2 worth 2x, ..., gate 4 worth 4x of the
+    # base ``gate_pass_bonus``. The intent is to pull the policy through the
+    # harder late-gate transitions where v5/v6 plateaued.
     gate_bonus_weight = jnp.asarray(reward_cfg.gate_pass_bonus, dtype=pos.dtype)
+    gate_bonus_scale = jnp.where(
+        jnp.asarray(reward_cfg.scale_gate_bonus_by_index, dtype=bool),
+        target_idx.astype(pos.dtype) + 1.0,
+        jnp.ones_like(r_prog),
+    )
     gate_bonus_enabled = jnp.asarray(reward_cfg.use_gate_pass_bonus, dtype=bool)
     r_gate_bonus = jnp.where(
         gate_bonus_enabled & gate_just_passed,
-        gate_bonus_weight,
+        gate_bonus_weight * gate_bonus_scale,
         jnp.zeros_like(r_prog),
     )
 
