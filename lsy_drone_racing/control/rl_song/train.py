@@ -38,11 +38,7 @@ from lsy_drone_racing.control.rl_song.config import (
 )
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
 from lsy_drone_racing.control.rl_song.obs import NormalizerState
-from lsy_drone_racing.control.rl_song.policy import (
-    Actor,
-    Critic,
-    log_prob_of,
-)
+from lsy_drone_racing.control.rl_song.policy import Actor, Critic, log_prob_of
 from lsy_drone_racing.control.rl_song.rollout import (
     RolloutMetricSums,
     RolloutScanOutputs,
@@ -70,6 +66,25 @@ class CLIArgs:
     wandb_entity: str | None = None
     run_name: str | None = None
     no_wandb: bool = False
+    # Path to another run's checkpoint directory (e.g.
+    # ``checkpoints/stage1_seed0_v7_pergate_jackpot``). When set AND no
+    # checkpoint exists for the current ``run_name``, the actor / critic
+    # parameters and observation normalizer are seeded from the latest
+    # checkpoint in this directory. The optimizer state, stage index, and
+    # global step are NOT loaded, so the new run starts at iteration 1 with a
+    # fresh LR / entropy schedule. Use to warm-start one curriculum stage
+    # from another (e.g. stage 3 from a stage 1 policy).
+    init_from: str | None = None
+    # Override ``PPOConfig.gamma`` (default 0.98). At 50 Hz the default gives
+    # an effective half-life of ~34 steps (~0.68 s), which truncates credit
+    # assignment well before a full 10 s episode. Set 0.997 (~6.9 s) or higher
+    # when running γ-horizon ablations.
+    gamma: float | None = None
+    # Override ``PPOConfig.ent_coef`` (default 0.005). Used on warm-starts when
+    # the loaded policy is already at low entropy: the default schedule would
+    # re-bloom entropy by ~10 units before annealing back down, wasting
+    # 100-200M steps. Set 0.001 to keep the policy committed.
+    ent_coef_start: float | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -157,17 +172,20 @@ def train(args: CLIArgs) -> None:
         normalizer = _normalizer_from_checkpoint(restored["normalizer"])
         env_rng_key = restored["env_rng_key"]
         env_sim_rng_key = restored["env_sim_rng_key"]
+    elif args.init_from is not None:
+        init_data = _load_init_checkpoint(args.init_from)
+        actor_state = actor_state.replace(params=init_data["actor_params"])
+        critic_state = critic_state.replace(params=init_data["critic_params"])
+        normalizer = _normalizer_from_checkpoint(init_data["normalizer"])
 
-    env = RLSongVecEnv(
-        train_cfg,
-        stage_idx=start_stage_idx,
-        seed=train_cfg.seed,
-        device="gpu",
-    )
+    env = RLSongVecEnv(train_cfg, stage_idx=start_stage_idx, seed=train_cfg.seed, device="gpu")
 
     wandb_run = _init_wandb(args, train_cfg, run_name, restored is not None)
     if restored is None:
         next_obs, _ = env.reset(seed=train_cfg.seed + start_stage_idx)
+        if normalizer is not None:
+            env.set_normalizer(normalizer)
+            next_obs = env.build_observations()
     else:
         if normalizer is not None:
             env.set_normalizer(normalizer)
@@ -179,16 +197,10 @@ def train(args: CLIArgs) -> None:
     episode_returns = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
     episode_lengths = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
     next_done = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
-    target_gate_history: deque[float] = deque(
-        maxlen=train_cfg.curriculum.promotion_window_rollouts
-    )
-    crash_rate_history: deque[float] = deque(
-        maxlen=train_cfg.curriculum.promotion_window_rollouts
-    )
+    target_gate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
+    crash_rate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
     start_time = time.time()
-    next_checkpoint_step = _next_checkpoint_step(
-        global_step, train_cfg.checkpoint_every_steps
-    )
+    next_checkpoint_step = _next_checkpoint_step(global_step, train_cfg.checkpoint_every_steps)
 
     for iteration in range(start_iteration, ppo_cfg.n_iterations + 1):
         rollout = _collect_rollout(
@@ -208,9 +220,7 @@ def train(args: CLIArgs) -> None:
         episode_lengths = rollout["episode_lengths"]
         global_step += ppo_cfg.batch_size
 
-        next_value = _critic_value(
-            critic_state.params, next_obs["critic_obs"]
-        ).reshape(-1)
+        next_value = _critic_value(critic_state.params, next_obs["critic_obs"]).reshape(-1)
         advantages, returns = _compute_gae(
             rollout["rewards"],
             rollout["dones"],
@@ -232,20 +242,14 @@ def train(args: CLIArgs) -> None:
         )
         train_metrics["ent_coef"] = current_ent_coef
 
-        env.update_normalizer_from_batch(
-            rollout["actor_obs"].reshape((-1, ACTOR_OBS_DIM))
-        )
+        env.update_normalizer_from_batch(rollout["actor_obs"].reshape((-1, ACTOR_OBS_DIM)))
         next_obs = env.build_observations()
 
         rollout_metrics = rollout["metrics"]
         target_gate_history.append(rollout_metrics["target_gate_mean"])
         crash_rate_history.append(rollout_metrics["crash_rate"])
         _maybe_promote_curriculum(
-            env,
-            train_cfg,
-            iteration,
-            target_gate_history,
-            crash_rate_history,
+            env, train_cfg, iteration, target_gate_history, crash_rate_history
         )
 
         if env.stage_idx != start_stage_idx:
@@ -271,13 +275,7 @@ def train(args: CLIArgs) -> None:
         if global_step >= next_checkpoint_step:
             _save_checkpoint(
                 run_dir,
-                TrainStateBundle(
-                    actor_state,
-                    critic_state,
-                    rng_key,
-                    global_step,
-                    iteration,
-                ),
+                TrainStateBundle(actor_state, critic_state, rng_key, global_step, iteration),
                 env,
                 ppo_cfg.total_timesteps,
             )
@@ -293,13 +291,7 @@ def train(args: CLIArgs) -> None:
 
     _save_checkpoint(
         run_dir,
-        TrainStateBundle(
-            actor_state,
-            critic_state,
-            rng_key,
-            global_step,
-            ppo_cfg.n_iterations,
-        ),
+        TrainStateBundle(actor_state, critic_state, rng_key, global_step, ppo_cfg.n_iterations),
         env,
         ppo_cfg.total_timesteps,
     )
@@ -314,6 +306,10 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
     ppo_cfg = cfg.ppo
     if args.total_timesteps is not None:
         ppo_cfg = replace(ppo_cfg, total_timesteps=args.total_timesteps)
+    if args.gamma is not None:
+        ppo_cfg = replace(ppo_cfg, gamma=args.gamma)
+    if args.ent_coef_start is not None:
+        ppo_cfg = replace(ppo_cfg, ent_coef=args.ent_coef_start)
     return replace(
         cfg,
         ppo=ppo_cfg,
@@ -335,8 +331,7 @@ def _validate_ppo_config(ppo_cfg: PPOConfig) -> None:
     expected_minibatch = ppo_cfg.batch_size // ppo_cfg.n_minibatches
     if ppo_cfg.minibatch_size != expected_minibatch:
         raise ValueError(
-            f"ppo.minibatch_size must be {expected_minibatch}; got "
-            f"{ppo_cfg.minibatch_size}"
+            f"ppo.minibatch_size must be {expected_minibatch}; got {ppo_cfg.minibatch_size}"
         )
     if ppo_cfg.n_iterations < 1:
         raise ValueError(
@@ -355,9 +350,7 @@ def _resolve_run_name(args: CLIArgs, train_cfg: TrainConfig) -> str:
     return f"stage{train_cfg.initial_stage_index + 1}_seed{train_cfg.seed}_{timestamp}"
 
 
-def _init_train_states(
-    ppo_cfg: PPOConfig, rng_key: Array
-) -> tuple[TrainState, TrainState]:
+def _init_train_states(ppo_cfg: PPOConfig, rng_key: Array) -> tuple[TrainState, TrainState]:
     """Initialize separate actor and critic train states."""
     actor_key, critic_key = jax.random.split(rng_key)
     dummy_obs = jnp.zeros((1, ACTOR_OBS_DIM), dtype=jnp.float32)
@@ -366,32 +359,18 @@ def _init_train_states(
     actor_params = actor.init(actor_key, dummy_obs)["params"]
     critic_params = critic.init(critic_key, dummy_obs)["params"]
 
-    schedule_steps = (
-        ppo_cfg.n_iterations * ppo_cfg.update_epochs * ppo_cfg.n_minibatches
-    )
+    schedule_steps = ppo_cfg.n_iterations * ppo_cfg.update_epochs * ppo_cfg.n_minibatches
     lr_schedule = optax.linear_schedule(
-        init_value=ppo_cfg.learning_rate,
-        end_value=0.0,
-        transition_steps=max(schedule_steps, 1),
+        init_value=ppo_cfg.learning_rate, end_value=0.0, transition_steps=max(schedule_steps, 1)
     )
     actor_tx = optax.chain(
-        optax.clip_by_global_norm(ppo_cfg.max_grad_norm),
-        optax.adam(lr_schedule),
+        optax.clip_by_global_norm(ppo_cfg.max_grad_norm), optax.adam(lr_schedule)
     )
     critic_tx = optax.chain(
-        optax.clip_by_global_norm(ppo_cfg.max_grad_norm),
-        optax.adam(lr_schedule),
+        optax.clip_by_global_norm(ppo_cfg.max_grad_norm), optax.adam(lr_schedule)
     )
-    actor_state = TrainState.create(
-        apply_fn=actor.apply,
-        params=actor_params,
-        tx=actor_tx,
-    )
-    critic_state = TrainState.create(
-        apply_fn=critic.apply,
-        params=critic_params,
-        tx=critic_tx,
-    )
+    actor_state = TrainState.create(apply_fn=actor.apply, params=actor_params, tx=actor_tx)
+    critic_state = TrainState.create(apply_fn=critic.apply, params=critic_params, tx=critic_tx)
     return actor_state, critic_state
 
 
@@ -410,6 +389,10 @@ def _collect_rollout(
         raise RuntimeError("Cannot collect a rollout before env construction.")
 
     static_cfg = _rollout_static_config(env, ppo_cfg)
+    # Track-perturbation placement buffers. Wrapper guarantees they're
+    # initialized after ``env.reset()`` even for non-level-3 stages; for
+    # those stages ``track_perturbation_enabled=False`` so the scan ignores
+    # them and they round-trip unchanged.
     scan_result = scan_rollout(
         env.env.data,
         actor_state.params,
@@ -421,6 +404,9 @@ def _collect_rollout(
         next_done,
         episode_returns,
         episode_lengths,
+        env.placed_gates_pos,
+        env.placed_gates_quat,
+        env.placed_obstacles_pos,
         env.env._step,
         env.env._reset,
         static_cfg,
@@ -431,6 +417,9 @@ def _collect_rollout(
     env.rng_key = scan_result.reset_rng_key
     env.current_env_obs = scan_result.next_env_obs
     env.prev_env_obs = scan_result.next_env_obs
+    env.placed_gates_pos = scan_result.placed_gates_pos
+    env.placed_gates_quat = scan_result.placed_gates_quat
+    env.placed_obstacles_pos = scan_result.placed_obstacles_pos
     metrics = _rollout_metrics(scan_result.outputs, scan_result.metrics)
 
     return {
@@ -450,12 +439,10 @@ def _collect_rollout(
     }
 
 
-def _rollout_static_config(
-    env: RLSongVecEnv,
-    ppo_cfg: PPOConfig,
-) -> RolloutStaticConfig:
+def _rollout_static_config(env: RLSongVecEnv, ppo_cfg: PPOConfig) -> RolloutStaticConfig:
     """Build the static config for the compiled rollout path."""
     thrust_min, thrust_max = env.get_thrust_bounds()
+    gate_pos_max, obstacle_pos_max = env.track_perturbation_bounds(env.stage)
     return RolloutStaticConfig(
         n_steps=ppo_cfg.n_steps,
         n_envs=ppo_cfg.n_envs,
@@ -466,29 +453,30 @@ def _rollout_static_config(
         reset_pos_perturb_m=env.stage.reset_pos_perturb_m,
         reset_vel_perturb_mps=env.stage.reset_vel_perturb_mps,
         reset_yaw_perturb_rad=env.stage.reset_yaw_perturb_rad,
+        track_perturbation_enabled=(env.stage.level == 3),
+        gate_pos_perturb_max=gate_pos_max,
+        obstacle_pos_perturb_max=obstacle_pos_max,
+        segment_init_prob=env.stage.segment_init_prob,
+        segment_init_perturb_m=env.stage.segment_init_perturb_m,
     )
 
 
 def _rollout_metrics(
-    outputs: RolloutScanOutputs,
-    metric_sums: RolloutMetricSums,
+    outputs: RolloutScanOutputs, metric_sums: RolloutMetricSums
 ) -> dict[str, float]:
     """Convert scanned rollout tensors into Python logging metrics."""
     completed_count = metric_sums.completed_count
     completed_denominator = jnp.maximum(completed_count, 1.0)
     metrics = {
-        "ep_ret": float(
-            np.asarray(metric_sums.completed_return_sum / completed_denominator)
-        ),
-        "ep_len": float(
-            np.asarray(metric_sums.completed_length_sum / completed_denominator)
-        ),
+        "ep_ret": float(np.asarray(metric_sums.completed_return_sum / completed_denominator)),
+        "ep_len": float(np.asarray(metric_sums.completed_length_sum / completed_denominator)),
         "episodes": float(np.asarray(completed_count)),
         "target_gate_mean": float(np.asarray(jnp.mean(outputs.target_gate_progress))),
-        "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
-        "finish_rate": float(
-            np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))
+        "max_gate_mean": float(
+            np.asarray(metric_sums.completed_max_gate_sum / completed_denominator)
         ),
+        "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
+        "finish_rate": float(np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))),
     }
     for key, value_component in outputs.reward_components.items():
         metrics[key] = float(np.asarray(jnp.mean(value_component)))
@@ -538,19 +526,13 @@ def _compute_gae(
         return (advantage, value, nonterminal), advantage
 
     initial = (jnp.zeros_like(next_value), next_value, 1.0 - next_done)
-    _, advantages_rev = jax.lax.scan(
-        scan_step,
-        initial,
-        (rewards[::-1], dones[::-1], values[::-1]),
-    )
+    _, advantages_rev = jax.lax.scan(scan_step, initial, (rewards[::-1], dones[::-1], values[::-1]))
     advantages = advantages_rev[::-1]
     returns = advantages + values
     return advantages, returns
 
 
-def _flatten_rollout(
-    rollout: dict[str, Any], advantages: Array, returns: Array
-) -> RolloutBatch:
+def _flatten_rollout(rollout: dict[str, Any], advantages: Array, returns: Array) -> RolloutBatch:
     """Flatten rollout tensors into PPO batch tensors."""
     return RolloutBatch(
         actor_obs=rollout["actor_obs"].reshape((-1, ACTOR_OBS_DIM)),
@@ -613,9 +595,7 @@ def _update_policy(
         for start in range(0, batch_size, ppo_cfg.minibatch_size):
             end = start + ppo_cfg.minibatch_size
             minibatch_indices = jnp.asarray(batch_indices[start:end])
-            minibatch = jax.tree_util.tree_map(
-                lambda value: value[minibatch_indices], batch
-            )
+            minibatch = jax.tree_util.tree_map(lambda value: value[minibatch_indices], batch)
             actor_state, critic_state, metrics = _train_minibatch(
                 actor_state, critic_state, minibatch, ent_coef_jax, ppo_cfg
             )
@@ -625,11 +605,11 @@ def _update_policy(
             metrics_accum["updates"] += 1.0
 
     update_count = max(metrics_accum["updates"], 1.0)
-    return actor_state, critic_state, {
-        key: value / update_count
-        for key, value in metrics_accum.items()
-        if key != "updates"
-    }
+    return (
+        actor_state,
+        critic_state,
+        {key: value / update_count for key, value in metrics_accum.items() if key != "updates"},
+    )
 
 
 @partial(jax.jit, static_argnums=4)
@@ -647,9 +627,7 @@ def _train_minibatch(
     """
 
     def actor_loss_fn(params: dict[str, Any]) -> tuple[Array, dict[str, Array]]:
-        new_logprob, entropy = log_prob_of(
-            params, batch.actor_obs, batch.raw_actions
-        )
+        new_logprob, entropy = log_prob_of(params, batch.actor_obs, batch.raw_actions)
         logratio = new_logprob - batch.logprobs
         ratio = jnp.exp(logratio)
         advantages = (batch.advantages - jnp.mean(batch.advantages)) / (
@@ -663,9 +641,7 @@ def _train_minibatch(
         entropy_loss = jnp.mean(entropy)
         old_approx_kl = jnp.mean(-logratio)
         approx_kl = jnp.mean((ratio - 1.0) - logratio)
-        clip_fraction = jnp.mean(
-            (jnp.abs(ratio - 1.0) > ppo_cfg.clip_coef).astype(jnp.float32)
-        )
+        clip_fraction = jnp.mean((jnp.abs(ratio - 1.0) > ppo_cfg.clip_coef).astype(jnp.float32))
         loss = policy_loss - ent_coef * entropy_loss
         return loss, {
             "policy_loss": policy_loss,
@@ -679,9 +655,7 @@ def _train_minibatch(
         new_values = Critic().apply({"params": params}, batch.critic_obs).reshape(-1)
         value_loss_unclipped = jnp.square(new_values - batch.returns)
         value_clipped = batch.values + jnp.clip(
-            new_values - batch.values,
-            -ppo_cfg.clip_coef,
-            ppo_cfg.clip_coef,
+            new_values - batch.values, -ppo_cfg.clip_coef, ppo_cfg.clip_coef
         )
         value_loss_clipped = jnp.square(value_clipped - batch.returns)
         value_loss = VALUE_LOSS_SCALE * jnp.mean(
@@ -689,12 +663,12 @@ def _train_minibatch(
         )
         return ppo_cfg.vf_coef * value_loss, value_loss
 
-    (actor_loss, actor_metrics), actor_grads = jax.value_and_grad(
-        actor_loss_fn, has_aux=True
-    )(actor_state.params)
-    (critic_loss, value_loss), critic_grads = jax.value_and_grad(
-        critic_loss_fn, has_aux=True
-    )(critic_state.params)
+    (actor_loss, actor_metrics), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
+        actor_state.params
+    )
+    (critic_loss, value_loss), critic_grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
+        critic_state.params
+    )
     actor_state = actor_state.apply_gradients(grads=actor_grads)
     critic_state = critic_state.apply_gradients(grads=critic_grads)
     metrics = {
@@ -738,12 +712,7 @@ def _maybe_promote_curriculum(
         crash_rate_history.clear()
 
 
-def _init_wandb(
-    args: CLIArgs,
-    train_cfg: TrainConfig,
-    run_name: str,
-    resume: bool,
-) -> Any | None:
+def _init_wandb(args: CLIArgs, train_cfg: TrainConfig, run_name: str, resume: bool) -> Any | None:
     """Initialize wandb unless disabled by CLI."""
     if args.no_wandb:
         return None
@@ -775,13 +744,9 @@ def _log_iteration(
     start_time: float,
 ) -> None:
     """Log PPO and rollout metrics to wandb."""
-    schedule_steps = (
-        ppo_cfg.n_iterations * ppo_cfg.update_epochs * ppo_cfg.n_minibatches
-    )
+    schedule_steps = ppo_cfg.n_iterations * ppo_cfg.update_epochs * ppo_cfg.n_minibatches
     lr_schedule = optax.linear_schedule(
-        init_value=ppo_cfg.learning_rate,
-        end_value=0.0,
-        transition_steps=max(schedule_steps, 1),
+        init_value=ppo_cfg.learning_rate, end_value=0.0, transition_steps=max(schedule_steps, 1)
     )
     elapsed = time.time() - start_time
     log_data = {
@@ -800,6 +765,7 @@ def _log_iteration(
         "rollout/ep_len": rollout_metrics["ep_len"],
         "rollout/episodes": rollout_metrics["episodes"],
         "rollout/target_gate": rollout_metrics["target_gate_mean"],
+        "rollout/max_gate": rollout_metrics["max_gate_mean"],
         "rollout/crash_rate": rollout_metrics["crash_rate"],
         "rollout/finish_rate": rollout_metrics["finish_rate"],
     }
@@ -839,11 +805,40 @@ def _restore_if_available(run_dir: Path) -> dict[str, Any] | None:
     return checkpointer.restore(checkpoint_path)
 
 
+def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
+    """Load actor / critic params and normalizer from another run's checkpoint.
+
+    Parameters
+    ----------
+    init_from : str
+        Path to a run directory containing one or more
+        ``step_NNNNNNNNNNNN`` Orbax checkpoint subdirectories. The latest
+        checkpoint in the directory is loaded.
+
+    Returns
+    -------
+    dict[str, Any]
+        Restored checkpoint mapping (full pytree). Callers should pick out
+        ``actor_params``, ``critic_params``, and ``normalizer``; the rest of
+        the keys (opt state, stage index, RNG keys, step counters) are
+        ignored on purpose so warm-start runs begin with a fresh schedule.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``init_from`` does not exist or contains no checkpoints.
+    """
+    init_run_dir = Path(init_from).expanduser().resolve()
+    if not init_run_dir.exists():
+        raise FileNotFoundError(f"init_from path does not exist: {init_run_dir}")
+    checkpoint_path = _latest_checkpoint_path(init_run_dir)
+    if checkpoint_path is None:
+        raise FileNotFoundError(f"No Orbax checkpoint found under {init_run_dir}")
+    return ocp.PyTreeCheckpointer().restore(checkpoint_path)
+
+
 def _save_checkpoint(
-    run_dir: Path,
-    train_state: TrainStateBundle,
-    env: RLSongVecEnv,
-    total_timesteps: int,
+    run_dir: Path, train_state: TrainStateBundle, env: RLSongVecEnv, total_timesteps: int
 ) -> None:
     """Save a complete PPO training checkpoint with Orbax."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -864,29 +859,17 @@ def _save_checkpoint(
         "total_timesteps": jnp.asarray(total_timesteps, dtype=jnp.int32),
     }
     checkpointer = ocp.PyTreeCheckpointer()
-    checkpointer.save(
-        _checkpoint_path(run_dir, train_state.global_step),
-        checkpoint,
-        force=True,
-    )
+    checkpointer.save(_checkpoint_path(run_dir, train_state.global_step), checkpoint, force=True)
 
 
 def _normalizer_to_checkpoint(normalizer: NormalizerState) -> dict[str, Array]:
     """Serialize a normalizer NamedTuple as a plain mapping."""
-    return {
-        "mean": normalizer.mean,
-        "var": normalizer.var,
-        "count": normalizer.count,
-    }
+    return {"mean": normalizer.mean, "var": normalizer.var, "count": normalizer.count}
 
 
 def _normalizer_from_checkpoint(data: dict[str, Array]) -> NormalizerState:
     """Restore a normalizer from a checkpoint mapping."""
-    return NormalizerState(
-        mean=data["mean"],
-        var=data["var"],
-        count=data["count"],
-    )
+    return NormalizerState(mean=data["mean"], var=data["var"], count=data["count"])
 
 
 def _env_sim_rng_key(env: RLSongVecEnv) -> Array:
@@ -909,9 +892,7 @@ def _next_checkpoint_step(global_step: int, checkpoint_every_steps: int) -> int:
     """Return the next checkpoint boundary after ``global_step``."""
     if checkpoint_every_steps <= 0:
         raise ValueError("checkpoint_every_steps must be positive.")
-    return (
-        global_step // checkpoint_every_steps + 1
-    ) * checkpoint_every_steps
+    return (global_step // checkpoint_every_steps + 1) * checkpoint_every_steps
 
 
 if __name__ == "__main__":

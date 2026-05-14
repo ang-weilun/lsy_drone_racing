@@ -278,29 +278,47 @@ def build_actor_obs(
 
 
 def build_critic_obs(
-    env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
+    env_obs: dict[str, Array],
+    prev_action: Array,
+    normalizer: NormalizerState,
+    true_gates_pos: Array | None = None,
+    true_gates_quat: Array | None = None,
+    true_obstacles_pos: Array | None = None,
 ) -> Array:
     """Encode one observation as the critic tensor.
 
-    Week 1 behavior: identical to :func:`build_actor_obs`. The asymmetric
-    actor/critic seam is wired through so that stage-3+ can substitute
-    privileged information (unmasked true gate corners + DR realization) here
-    without touching the actor or the training loop.
+    Asymmetric actor/critic: when ``true_*`` arguments are provided, the
+    critic sees the unmasked (post-randomization, pre-visited-mask) gate and
+    obstacle poses instead of the partially-observed values in ``env_obs``.
+    Layout and dimensionality are identical to :func:`build_actor_obs`; only
+    the *values* of the gate/obstacle channels change.
 
     Parameters
     ----------
     env_obs, prev_action, normalizer
         See :func:`build_actor_obs`.
+    true_gates_pos : Array, shape (n_gates, 3), optional
+        Unmasked true gate positions from ``env.data.gates_pos``. When
+        ``None``, the masked value from ``env_obs`` is used.
+    true_gates_quat : Array, shape (n_gates, 4), optional
+        Unmasked true gate orientations from ``env.data.gates_quat``.
+    true_obstacles_pos : Array, shape (n_obstacles, 3), optional
+        Unmasked true obstacle positions from ``env.data.obstacles_pos``.
 
     Returns
     -------
     Array, shape (ACTOR_OBS_DIM,)
-        Currently equal to the actor obs. Will diverge at stage 3+.
+        Normalized critic observation. Same dimensionality as the actor obs;
+        the affine normalizer (calibrated on actor obs statistics) is reused.
     """
-    # TODO(stage3): substitute true gate corners (ignoring visited mask),
-    # true (un-noised) drone state, and the current DR realization. Requires
-    # reaching into the env's pre-masking ``sim_data`` from the wrapper.
-    return build_actor_obs(env_obs, prev_action, normalizer)
+    privileged_obs = dict(env_obs)
+    if true_gates_pos is not None:
+        privileged_obs["gates_pos"] = true_gates_pos
+    if true_gates_quat is not None:
+        privileged_obs["gates_quat"] = true_gates_quat
+    if true_obstacles_pos is not None:
+        privileged_obs["obstacles_pos"] = true_obstacles_pos
+    return build_actor_obs(privileged_obs, prev_action, normalizer)
 
 
 def vmap_build_actor_obs(
@@ -327,7 +345,12 @@ def vmap_build_actor_obs(
 
 
 def vmap_build_critic_obs(
-    env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
+    env_obs: dict[str, Array],
+    prev_action: Array,
+    normalizer: NormalizerState,
+    true_gates_pos: Array | None = None,
+    true_gates_quat: Array | None = None,
+    true_obstacles_pos: Array | None = None,
 ) -> Array:
     """Batched variant of :func:`build_critic_obs` over the leading axis.
 
@@ -338,13 +361,22 @@ def vmap_build_critic_obs(
     prev_action : Array, shape (n_envs, 4)
     normalizer : NormalizerState
         Broadcast over the batch.
+    true_gates_pos : Array, shape (n_envs, n_gates, 3), optional
+    true_gates_quat : Array, shape (n_envs, n_gates, 4), optional
+    true_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
+        Privileged unmasked poses. When all three are ``None`` the critic
+        falls back to the actor encoding (no information advantage).
 
     Returns
     -------
     Array, shape (n_envs, ACTOR_OBS_DIM)
-        Normalized critic observations. Currently equal to actor observations;
-        kept separate for the stage-3 privileged critic seam.
+        Normalized critic observations.
     """
-    return jax.vmap(build_critic_obs, in_axes=({k: 0 for k in env_obs}, 0, None))(
-        env_obs, prev_action, normalizer
-    )
+    privileged_obs = dict(env_obs)
+    if true_gates_pos is not None:
+        privileged_obs["gates_pos"] = true_gates_pos
+    if true_gates_quat is not None:
+        privileged_obs["gates_quat"] = true_gates_quat
+    if true_obstacles_pos is not None:
+        privileged_obs["obstacles_pos"] = true_obstacles_pos
+    return vmap_build_actor_obs(privileged_obs, prev_action, normalizer)

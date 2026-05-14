@@ -73,62 +73,55 @@ def step_reward(
     """
     _ = truncated
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
-    obstacles_pos = (
-        env_obs["obstacles_pos"]
-        if true_obstacles_pos is None
-        else true_obstacles_pos
-    )
+    obstacles_pos = env_obs["obstacles_pos"] if true_obstacles_pos is None else true_obstacles_pos
 
     prev_target = prev_env_obs["target_gate"]
     current_target = env_obs["target_gate"]
-    target_idx = jnp.where(
-        prev_target >= 0,
-        prev_target,
-        jnp.maximum(current_target, 0),
-    )
+    target_idx = jnp.where(prev_target >= 0, prev_target, jnp.maximum(current_target, 0))
     env_idx = jnp.arange(gates_pos.shape[0])
     gate_pos = gates_pos[env_idx, target_idx]
 
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
     r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-    r_prog = reward_cfg.progress_coef * (
-        r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
-    )
+    r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
-    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(
-        env_obs["ang_vel"], ord=1, axis=-1
-    )
+    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
 
     obstacle_delta = pos[:, None, :] - obstacles_pos
     obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta), axis=-1)
     obstacle_active = 1.0 - env_obs["obstacles_visited"].astype(jnp.float32)
-    obstacle_barrier = jnp.exp(
-        -obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma)
-    )
-    r_obs = -reward_cfg.obstacle_weight * jnp.sum(
-        obstacle_barrier * obstacle_active, axis=-1
-    )
+    obstacle_barrier = jnp.exp(-obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma))
+    r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier * obstacle_active, axis=-1)
 
+    # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
+    # pre-step target index because of the ``prev_target >= 0`` branch above,
+    # which is the index of the gate just passed. Scaling by ``(target_idx +
+    # 1)`` makes gate 1 worth 1x, gate 2 worth 2x, ..., gate 4 worth 4x of the
+    # base ``gate_pass_bonus``. The intent is to pull the policy through the
+    # harder late-gate transitions where v5/v6 plateaued.
     gate_bonus_weight = jnp.asarray(reward_cfg.gate_pass_bonus, dtype=pos.dtype)
+    gate_bonus_scale = jnp.where(
+        jnp.asarray(reward_cfg.scale_gate_bonus_by_index, dtype=bool),
+        target_idx.astype(pos.dtype) + 1.0,
+        jnp.ones_like(r_prog),
+    )
     gate_bonus_enabled = jnp.asarray(reward_cfg.use_gate_pass_bonus, dtype=bool)
     r_gate_bonus = jnp.where(
         gate_bonus_enabled & gate_just_passed,
-        gate_bonus_weight,
+        gate_bonus_weight * gate_bonus_scale,
         jnp.zeros_like(r_prog),
     )
 
-    r_finish = jnp.where(
-        finished,
-        reward_cfg.finish_bonus,
-        jnp.zeros_like(r_prog),
-    )
-    r_crash = jnp.where(
-        terminated & ~finished,
-        -reward_cfg.crash_penalty,
-        jnp.zeros_like(r_prog),
-    )
+    r_finish = jnp.where(finished, reward_cfg.finish_bonus, jnp.zeros_like(r_prog))
+    r_crash = jnp.where(terminated & ~finished, -reward_cfg.crash_penalty, jnp.zeros_like(r_prog))
     r_terminal = r_finish + r_crash
+
+    # v8: per-step time penalty to break the hover Q=0 attractor. Without it,
+    # a random-init policy on a randomized track collects 0 progress reward
+    # on average and times out at the episode cap, leaving "do nothing" as
+    # the best policy under the entropy bonus. See ``RewardConfig.time_penalty``.
+    r_time = jnp.full_like(r_prog, -reward_cfg.time_penalty)
 
     components = {
         "r_prog": r_prog,
@@ -136,6 +129,7 @@ def step_reward(
         "r_obs": r_obs,
         "r_gate_bonus": r_gate_bonus,
         "r_terminal": r_terminal,
+        "r_time": r_time,
     }
-    reward = r_prog + r_omega + r_obs + r_gate_bonus + r_terminal
+    reward = r_prog + r_omega + r_obs + r_gate_bonus + r_terminal + r_time
     return reward, components

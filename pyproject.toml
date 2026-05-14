@@ -130,6 +130,7 @@ flax = "*"
 orbax-checkpoint = "*"
 tyro = "*"
 wandb = "*"
+imageio-ffmpeg = ">=0.6.0, <0.7"
 
 [tool.pixi.feature.rl-jax.tasks]
 train-rl-song = { cmd = "python -m lsy_drone_racing.control.rl_song.train", description = "Train the Song-2023 RL policy" }

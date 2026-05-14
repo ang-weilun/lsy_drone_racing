@@ -65,6 +65,25 @@ class RLSongController(Controller):
         self.prev_action_env_4vec = jnp.zeros((ENV_ACTION_DIM,), dtype=jnp.float32)
         self._deterministic_inference = jax.jit(_deterministic_env_action)
 
+    def step_callback(
+        self,
+        action: npt.NDArray[np.floating],
+        obs: dict[str, npt.NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
+        """Return ``False`` so the env (not the controller) decides termination.
+
+        The base :class:`Controller`'s default returns ``True`` (despite its
+        comment), which would break ``sim.py``'s rollout loop after one step.
+        The RL policy has no internal stopping criterion — it runs until the
+        env terminates or truncates.
+        """
+        _ = action, obs, reward, terminated, truncated, info
+        return False
+
     def compute_control(
         self,
         obs: dict[str, npt.NDArray[np.floating]],

@@ -47,8 +47,17 @@ class PPOConfig:
     """
 
     n_envs: int = 4096
-    n_steps: int = 50  # 1 s rollout at 50 Hz
-    n_minibatches: int = 25  # batch_size / minibatch_size = 204800 / 8192
+    # v9: rollout length 50 → 100 (1 s → 2 s at 50 Hz). With γ=0.997 the
+    # effective discount horizon is ~6.9 s; a 1 s rollout forced GAE to lean
+    # heavily on the critic bootstrap at the rollout boundary, which both
+    # external reviewers flagged as a bias source ("γ horizon is now ~7 s
+    # but PPO rollout truncates at 1 s, so GAE is over-relying on critic
+    # estimation"). Doubling rollout length lets GAE compute advantages
+    # from more on-policy reward and less bootstrapped value, especially
+    # important now that the load-bearing reward (finish_bonus=100) only
+    # arrives at the end of multi-second episodes.
+    n_steps: int = 100  # 2 s rollout at 50 Hz
+    n_minibatches: int = 50  # batch_size / minibatch_size = 409600 / 8192
     minibatch_size: int = 8192
     update_epochs: int = 5
     gamma: float = 0.98
@@ -64,7 +73,13 @@ class PPOConfig:
     # ~0.5% but stayed at entropy +15.9, suggesting the floor was still too
     # high. v6 drops the floor to zero so the entropy bonus fully vanishes by
     # end of training and the policy can commit deterministically.
-    ent_coef: float = 0.01
+    # v8: halve initial entropy bonus (0.01 → 0.005). Stage 3 from scratch
+    # with gate randomization fell into a hover attractor at ent_coef=0.01;
+    # at entropy ~25-40 the bonus (0.005-0.01 × 25-40 ≈ 0.13-0.40 per step)
+    # was competitive with progress reward, so the policy never committed
+    # to forward motion. Halving keeps exploration active early but lets the
+    # progress signal dominate once gates are crossed.
+    ent_coef: float = 0.005
     ent_coef_final: float = 0.0
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
@@ -108,17 +123,37 @@ class RewardConfig:
     # Crash penalty was 10.0; reduced because the original ratio of -10 crash
     # to ~+0.003 per-step progress collapsed the policy to a safe hover.
     crash_penalty: float = 5.0
-    finish_bonus: float = 10.0
+    # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
+    # per-gate jackpot below. The reward economics from v8 paid +60 for
+    # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
+    # Putting the load-bearing reward on race completion makes finishing
+    # dominant by an order of magnitude under any realistic episode horizon.
+    finish_bonus: float = 100.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     obstacle_weight: float = 0.5
     obstacle_sigma: float = 0.2  # m
-    # Big jackpot on gate crossing. v2 ran at 1.0 and the policy discovered
-    # that crossing gate 1 forfeited ~+10 of accumulated parking reward (and
-    # immediately switched the target to a far-away gate 2), so it preferred
-    # to camp. v3 makes the jackpot worth ~3x the parking value to flip the
-    # incentive.
-    gate_pass_bonus: float = 20.0
+    # v9: shrink gate jackpot from 20 to 2. The v7/v8 jackpot of 20×(idx+1)
+    # paid 20/40/60/80 per gate, dominating r_prog (~+0.17/step ≈ +8.5 per
+    # 50-step rollout) by 2-10×. Song 2023 and Kaufmann 2023 use dense
+    # progress as the primary signal with only a small per-gate event marker;
+    # external review of the v8 results flagged the 20-80 jackpot as the
+    # proximate cause of the "rush through gate 2 then crash" local optimum.
+    gate_pass_bonus: float = 2.0
     use_gate_pass_bonus: bool = True
+    # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
+    # the incentive to rush past earlier gates to bank the larger later-gate
+    # jackpot. The dense progress reward already pulls the policy through
+    # later gates without needing an escalating discrete payoff.
+    scale_gate_bonus_by_index: bool = False
+    # v8: per-step time penalty. With randomized gates the random-init policy
+    # has zero progress in expectation, while a stationary "hover" policy
+    # collects zero shaping reward and just times out — making hover the Q≈0
+    # attractor that drives the action distribution back to uniform under the
+    # entropy bonus. A small constant subtraction makes hover-timeout cost
+    # 0.05 × 500 = -25, so any episode that reaches even one gate (+20 jackpot)
+    # strictly dominates. Philosophy-aligned with Song 2023's "minimize lap
+    # time" objective without changing the reward terms they use.
+    time_penalty: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -163,6 +198,28 @@ class CurriculumStage:
     reset_yaw_perturb_rad: float
     promote_target_gate_mean: float
     promote_crash_rate_max: float = float("inf")
+    # v8: scales the gate_pos, gate_rpy, and obstacle_pos randomization ranges
+    # loaded from ``config/levelN.toml`` (and selected via
+    # ``TRACK_RANDOMIZATION_KEYS`` in the env wrapper). A value of 1.0 uses the
+    # full level-3 randomization budget (±0.15 m on gate_pos and obstacle_pos).
+    # Smaller values produce an easier near-fixed-track regime so the policy
+    # can first learn approach-to-nominal before adapting to noise; values
+    # below 1.0 are intended for the ``stage3a/b/c`` warm-up sub-stages. Has
+    # no effect on stages with ``level != 3`` (level 1 has no gate/obstacle
+    # randomization to scale).
+    gate_rand_scale: float = 1.0
+    # v9 (Song 2023 §III-B Phase 1): probability that an env is re-spawned
+    # at the midpoint of a random path segment (hovering, vel=0, identity
+    # attitude, target_gate=k) instead of the toml start position. Covers
+    # the full state space immediately so the policy is exposed to gate-3
+    # and gate-4 observations from step 0, fixing the "policy never trains
+    # on later-gate states because it crashed earlier" pathology. Set to
+    # 0.5 on level-3 stages; harmless 0.0 default elsewhere.
+    segment_init_prob: float = 0.0
+    # Half-width of uniform position jitter applied to the segment midpoint
+    # so the policy sees a distribution of states around each segment center
+    # rather than a single point.
+    segment_init_perturb_m: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -175,14 +232,35 @@ class CurriculumConfig:
 
 
 def default_curriculum() -> CurriculumConfig:
-    """Return the four-stage manual curriculum from design doc §9.
+    """Return the curriculum.
+
+    Layout
+    ------
+    Stages 1-2 are legacy fixed-track stages, kept for reproducibility but
+    no longer used as the canonical entry point. The level-3 (track
+    randomization) work is split across three v8 sub-stages with progressively
+    larger gate/obstacle randomization scale, replacing the single
+    ``stage3_level3_no_dr`` that route-memorizing warm-starts kept failing on:
+
+    * ``stage3a`` (idx 2, ``gate_rand_scale=0.20``): nearly-fixed track
+      (≈±0.03 m on gate_pos), where a randomly-initialized policy can
+      reliably stumble onto gate 1 within feasible compute and the
+      gate-pass reward starts driving credit assignment.
+    * ``stage3b`` (idx 3, ``gate_rand_scale=0.50``): half-randomization,
+      teaches generalization away from the nominal position before the
+      full level-3 budget.
+    * ``stage3c`` (idx 4, ``gate_rand_scale=1.00``): full level-3
+      randomization (±0.15 m). This is the actual deployment-matching
+      stage; everything before is just curriculum.
+
+    The terminal ``stage4_level3_dr`` (idx 5, full DR) is unchanged.
 
     Returns
     -------
     CurriculumConfig
-        Stages 1 (deterministic level-1), 2 (deterministic level-1 with reset
-        perturbation), 3 (level-3 no DR), 4 (level-3 with full DR).
+        Six-stage curriculum (legacy 1-2, new 3a/b/c, terminal 4).
     """
+    pi_over_4 = 0.7853981633974483
     return CurriculumConfig(
         stages=(
             CurriculumStage(
@@ -200,17 +278,52 @@ def default_curriculum() -> CurriculumConfig:
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.5,
-                reset_yaw_perturb_rad=0.7853981633974483,  # pi/4
+                reset_yaw_perturb_rad=pi_over_4,
                 promote_target_gate_mean=3.5,
             ),
             CurriculumStage(
-                name="stage3_level3_no_dr",
+                name="stage3a_level3_rand0.2",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
-                reset_vel_perturb_mps=0.5,
-                reset_yaw_perturb_rad=0.7853981633974483,
-                promote_target_gate_mean=3.0,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=0.20,
+                segment_init_prob=0.5,
+                # Lowered from 2.5 → 1.8 after the v8 layer-2-fix from-scratch
+                # run plateaued at target_gate ~0.95 / max_gate ~1.45 (reaches
+                # gate 2 on ~45% of episodes) without promoting. 2.5 was the
+                # original 3-gates-passed target; with the policy already
+                # consistently clearing gate 1 and reaching gate 2, promoting
+                # to the harder stage 3b (scale 0.50) should force more
+                # cautious flying and break the fast-but-crashy local optimum.
+                promote_target_gate_mean=1.8,
+                promote_crash_rate_max=0.3,
+            ),
+            CurriculumStage(
+                name="stage3b_level3_rand0.5",
+                level=3,
+                use_domain_randomization=False,
+                reset_pos_perturb_m=0.2,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=0.50,
+                segment_init_prob=0.5,
+                promote_target_gate_mean=1.8,
+                promote_crash_rate_max=0.3,
+            ),
+            CurriculumStage(
+                name="stage3c_level3_rand1.0",
+                level=3,
+                use_domain_randomization=False,
+                reset_pos_perturb_m=0.2,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=1.00,
+                segment_init_prob=0.5,
+                # Stage 3 deployment target — do not auto-promote into stage 4
+                # (DR) during this experiment.
+                promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
             CurriculumStage(
@@ -218,8 +331,9 @@ def default_curriculum() -> CurriculumConfig:
                 level=3,
                 use_domain_randomization=True,
                 reset_pos_perturb_m=0.2,
-                reset_vel_perturb_mps=0.5,
-                reset_yaw_perturb_rad=0.7853981633974483,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=1.00,
                 promote_target_gate_mean=float("inf"),  # terminal stage
             ),
         )
