@@ -11,33 +11,20 @@ import jax.numpy as jnp
 from jax import Array
 
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
-from lsy_drone_racing.control.rl_song.config import (
-    ENV_ACTION_DIM,
-    RewardConfig,
-)
-from lsy_drone_racing.control.rl_song.policy import (
-    Critic,
-    raw_to_env_action,
-    sample_and_log_prob,
-)
+from lsy_drone_racing.control.rl_song.config import ENV_ACTION_DIM, RewardConfig
+from lsy_drone_racing.control.rl_song.policy import Critic, raw_to_env_action, sample_and_log_prob
 from lsy_drone_racing.control.rl_song.reward import step_reward
-from lsy_drone_racing.envs.race_core import (
-    EnvData,
-    _reset_env_data,
-    obs as race_core_obs,
-)
+from lsy_drone_racing.envs.race_core import EnvData, _reset_env_data, obs as race_core_obs
 
 SINGLE_DRONE_INDEX: int = 0
 RESET_RNG_SPLITS: int = 4
 YAW_TO_HALF_ANGLE: float = 0.5  # quaternion half-angle factor
 
 EnvStepFn = Callable[
-    [EnvData, Array],
-    tuple[EnvData, tuple[dict[str, Array], Array, Array, Array, dict]],
+    [EnvData, Array], tuple[EnvData, tuple[dict[str, Array], Array, Array, Array, dict]]
 ]
 EnvResetFn = Callable[
-    [EnvData, int | None, Array | None],
-    tuple[EnvData, tuple[dict[str, Array], dict]],
+    [EnvData, int | None, Array | None], tuple[EnvData, tuple[dict[str, Array], dict]]
 ]
 
 
@@ -191,10 +178,7 @@ class _ScanCarry(NamedTuple):
     completed_max_gate_sum: Array
 
 
-@partial(
-    jax.jit,
-    static_argnames=("env_step_fn", "env_reset_fn", "static_cfg"),
-)
+@partial(jax.jit, static_argnames=("env_step_fn", "env_reset_fn", "static_cfg"))
 def scan_rollout(
     env_data: EnvData,
     actor_params: dict,
@@ -253,11 +237,7 @@ def scan_rollout(
     calling SciPy inside the trace.
     """
     _validate_scan_inputs(
-        prev_action_env_4vec,
-        next_done,
-        episode_returns,
-        episode_lengths,
-        static_cfg,
+        prev_action_env_4vec, next_done, episode_returns, episode_lengths, static_cfg
     )
     zero_scalar = jnp.asarray(0.0, dtype=jnp.float32)
     episode_max_gate = jnp.zeros_like(episode_returns)
@@ -276,36 +256,22 @@ def scan_rollout(
         completed_max_gate_sum=zero_scalar,
     )
 
-    def scan_step(
-        carry: _ScanCarry, _: None
-    ) -> tuple[_ScanCarry, RolloutScanOutputs]:
+    def scan_step(carry: _ScanCarry, _: None) -> tuple[_ScanCarry, RolloutScanOutputs]:
         env_obs = _single_drone_obs(race_core_obs(carry.env_data))
         actor_obs = obs_encoding.vmap_build_actor_obs(
-            env_obs,
-            carry.prev_action_env_4vec,
-            normalizer,
+            env_obs, carry.prev_action_env_4vec, normalizer
         )
         critic_obs = obs_encoding.vmap_build_critic_obs(
-            env_obs,
-            carry.prev_action_env_4vec,
-            normalizer,
+            env_obs, carry.prev_action_env_4vec, normalizer
         )
 
         rng_key, action_key = jax.random.split(carry.rng_key)
-        raw_action, logprob = sample_and_log_prob(
-            actor_params,
-            actor_obs,
-            action_key,
-        )
+        raw_action, logprob = sample_and_log_prob(actor_params, actor_obs, action_key)
         value = Critic().apply({"params": critic_params}, critic_obs)
-        env_action = raw_to_env_action(
-            raw_action,
-            static_cfg.thrust_min,
-            static_cfg.thrust_max,
-        )
+        env_action = raw_to_env_action(raw_action, static_cfg.thrust_min, static_cfg.thrust_max)
 
-        stepped_data, (next_obs_full, _, terminated_full, truncated_full, _) = (
-            env_step_fn(carry.env_data, env_action)
+        stepped_data, (next_obs_full, _, terminated_full, truncated_full, _) = env_step_fn(
+            carry.env_data, env_action
         )
         next_env_obs = _single_drone_obs(next_obs_full)
         terminated = terminated_full[:, SINGLE_DRONE_INDEX].astype(jnp.bool_)
@@ -315,9 +281,9 @@ def scan_rollout(
         previous_target = env_obs["target_gate"]
         finished = current_target < 0
         terminated = terminated | finished
-        gate_just_passed = (
-            (current_target > previous_target) & (previous_target >= 0)
-        ) | (finished & (previous_target >= 0))
+        gate_just_passed = ((current_target > previous_target) & (previous_target >= 0)) | (
+            finished & (previous_target >= 0)
+        )
 
         reward, components = step_reward(
             next_env_obs,
@@ -337,11 +303,7 @@ def scan_rollout(
         episode_lengths = carry.episode_lengths + 1.0
 
         n_gates = env_obs["gates_pos"].shape[1]
-        target_gate_progress = jnp.where(
-            finished,
-            n_gates,
-            current_target,
-        ).astype(jnp.float32)
+        target_gate_progress = jnp.where(finished, n_gates, current_target).astype(jnp.float32)
         episode_max_gate = jnp.maximum(carry.episode_max_gate, target_gate_progress)
 
         completed_return_sum = carry.completed_return_sum + jnp.sum(
@@ -356,17 +318,9 @@ def scan_rollout(
         completed_count = carry.completed_count + jnp.sum(done)
 
         reset_data, reset_rng_key = _reset_done_worlds(
-            stepped_data,
-            done_bool,
-            carry.reset_rng_key,
-            env_reset_fn,
-            static_cfg,
+            stepped_data, done_bool, carry.reset_rng_key, env_reset_fn, static_cfg
         )
-        next_prev_action = jnp.where(
-            done_bool[:, None],
-            jnp.zeros_like(env_action),
-            env_action,
-        )
+        next_prev_action = jnp.where(done_bool[:, None], jnp.zeros_like(env_action), env_action)
         next_episode_returns = jnp.where(done_bool, 0.0, episode_returns)
         next_episode_lengths = jnp.where(done_bool, 0.0, episode_lengths)
         next_episode_max_gate = jnp.where(done_bool, 0.0, episode_max_gate)
@@ -401,22 +355,13 @@ def scan_rollout(
         )
         return next_carry, transition
 
-    final_carry, outputs = jax.lax.scan(
-        scan_step,
-        initial_carry,
-        None,
-        length=static_cfg.n_steps,
-    )
+    final_carry, outputs = jax.lax.scan(scan_step, initial_carry, None, length=static_cfg.n_steps)
     next_env_obs = _single_drone_obs(race_core_obs(final_carry.env_data))
     next_actor_obs = obs_encoding.vmap_build_actor_obs(
-        next_env_obs,
-        final_carry.prev_action_env_4vec,
-        normalizer,
+        next_env_obs, final_carry.prev_action_env_4vec, normalizer
     )
     next_critic_obs = obs_encoding.vmap_build_critic_obs(
-        next_env_obs,
-        final_carry.prev_action_env_4vec,
-        normalizer,
+        next_env_obs, final_carry.prev_action_env_4vec, normalizer
     )
     metric_sums = RolloutMetricSums(
         completed_return_sum=final_carry.completed_return_sum,
@@ -433,10 +378,7 @@ def scan_rollout(
         episode_returns=final_carry.episode_returns,
         episode_lengths=final_carry.episode_lengths,
         next_env_obs=next_env_obs,
-        next_obs={
-            "actor_obs": next_actor_obs,
-            "critic_obs": next_critic_obs,
-        },
+        next_obs={"actor_obs": next_actor_obs, "critic_obs": next_critic_obs},
         outputs=outputs,
         metrics=metric_sums,
     )
@@ -476,35 +418,19 @@ def _reset_done_worlds(
 
     def reset_branch(data: EnvData) -> tuple[EnvData, Array]:
         reset_data, _ = env_reset_fn(data, None, done)
-        return _apply_reset_perturbation(
-            reset_data,
-            done,
-            reset_rng_key,
-            static_cfg,
-        )
+        return _apply_reset_perturbation(reset_data, done, reset_rng_key, static_cfg)
 
-    return jax.lax.cond(
-        jnp.any(done),
-        reset_branch,
-        lambda data: (data, reset_rng_key),
-        env_data,
-    )
+    return jax.lax.cond(jnp.any(done), reset_branch, lambda data: (data, reset_rng_key), env_data)
 
 
 def _apply_reset_perturbation(
-    env_data: EnvData,
-    mask: Array,
-    rng_key: Array,
-    static_cfg: RolloutStaticConfig,
+    env_data: EnvData, mask: Array, rng_key: Array, static_cfg: RolloutStaticConfig
 ) -> tuple[EnvData, Array]:
     """Apply the curriculum reset perturbation in pure JAX."""
     if not static_cfg.reset_perturbation_enabled:
         return env_data, rng_key
 
-    rng_key, pos_key, vel_key, yaw_key = jax.random.split(
-        rng_key,
-        RESET_RNG_SPLITS,
-    )
+    rng_key, pos_key, vel_key, yaw_key = jax.random.split(rng_key, RESET_RNG_SPLITS)
     states = env_data.sim_data.states
     pos_delta = jax.random.uniform(
         pos_key,
@@ -526,11 +452,7 @@ def _apply_reset_perturbation(
     )
 
     mask_broadcast = mask[:, None, None]
-    pos = jnp.clip(
-        states.pos + pos_delta,
-        env_data.pos_limit_low,
-        env_data.pos_limit_high,
-    )
+    pos = jnp.clip(states.pos + pos_delta, env_data.pos_limit_low, env_data.pos_limit_high)
     quat = _apply_yaw_delta(states.quat, yaw_delta, mask_broadcast)
     states = states.replace(
         pos=jnp.where(mask_broadcast, pos, states.pos),
@@ -559,15 +481,7 @@ def _yaw_quat_xyzw(yaw: Array) -> Array:
     """Return xyzw quaternions for pure-z yaw rotations."""
     half_yaw = YAW_TO_HALF_ANGLE * yaw
     zeros = jnp.zeros_like(yaw)
-    return jnp.stack(
-        [
-            zeros,
-            zeros,
-            jnp.sin(half_yaw),
-            jnp.cos(half_yaw),
-        ],
-        axis=-1,
-    )
+    return jnp.stack([zeros, zeros, jnp.sin(half_yaw), jnp.cos(half_yaw)], axis=-1)
 
 
 def _quat_multiply_xyzw(left: Array, right: Array) -> Array:
@@ -583,7 +497,4 @@ def _quat_multiply_xyzw(left: Array, right: Array) -> Array:
 
 def _single_drone_obs(env_obs: dict[str, Array]) -> dict[str, Array]:
     """Squeeze the single-drone axis from race-core observations."""
-    return {
-        key: value[:, SINGLE_DRONE_INDEX]
-        for key, value in env_obs.items()
-    }
+    return {key: value[:, SINGLE_DRONE_INDEX] for key, value in env_obs.items()}

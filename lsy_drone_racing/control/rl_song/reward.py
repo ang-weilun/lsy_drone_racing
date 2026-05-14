@@ -73,42 +73,26 @@ def step_reward(
     """
     _ = truncated
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
-    obstacles_pos = (
-        env_obs["obstacles_pos"]
-        if true_obstacles_pos is None
-        else true_obstacles_pos
-    )
+    obstacles_pos = env_obs["obstacles_pos"] if true_obstacles_pos is None else true_obstacles_pos
 
     prev_target = prev_env_obs["target_gate"]
     current_target = env_obs["target_gate"]
-    target_idx = jnp.where(
-        prev_target >= 0,
-        prev_target,
-        jnp.maximum(current_target, 0),
-    )
+    target_idx = jnp.where(prev_target >= 0, prev_target, jnp.maximum(current_target, 0))
     env_idx = jnp.arange(gates_pos.shape[0])
     gate_pos = gates_pos[env_idx, target_idx]
 
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
     r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-    r_prog = reward_cfg.progress_coef * (
-        r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
-    )
+    r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
-    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(
-        env_obs["ang_vel"], ord=1, axis=-1
-    )
+    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
 
     obstacle_delta = pos[:, None, :] - obstacles_pos
     obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta), axis=-1)
     obstacle_active = 1.0 - env_obs["obstacles_visited"].astype(jnp.float32)
-    obstacle_barrier = jnp.exp(
-        -obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma)
-    )
-    r_obs = -reward_cfg.obstacle_weight * jnp.sum(
-        obstacle_barrier * obstacle_active, axis=-1
-    )
+    obstacle_barrier = jnp.exp(-obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma))
+    r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier * obstacle_active, axis=-1)
 
     # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
     # pre-step target index because of the ``prev_target >= 0`` branch above,
@@ -129,16 +113,8 @@ def step_reward(
         jnp.zeros_like(r_prog),
     )
 
-    r_finish = jnp.where(
-        finished,
-        reward_cfg.finish_bonus,
-        jnp.zeros_like(r_prog),
-    )
-    r_crash = jnp.where(
-        terminated & ~finished,
-        -reward_cfg.crash_penalty,
-        jnp.zeros_like(r_prog),
-    )
+    r_finish = jnp.where(finished, reward_cfg.finish_bonus, jnp.zeros_like(r_prog))
+    r_crash = jnp.where(terminated & ~finished, -reward_cfg.crash_penalty, jnp.zeros_like(r_prog))
     r_terminal = r_finish + r_crash
 
     components = {
