@@ -42,7 +42,12 @@ from lsy_drone_racing.control.rl_song.policy import (
     Actor,
     Critic,
     log_prob_of,
-    sample_and_log_prob,
+)
+from lsy_drone_racing.control.rl_song.rollout import (
+    RolloutMetricSums,
+    RolloutScanOutputs,
+    RolloutStaticConfig,
+    scan_rollout,
 )
 
 CHECKPOINT_DIR: Path = Path(__file__).resolve().parent / "checkpoints"
@@ -192,7 +197,6 @@ def train(args: CLIArgs) -> None:
             actor_state,
             critic_state,
             rng_key,
-            next_obs,
             next_done,
             episode_returns,
             episode_lengths,
@@ -394,117 +398,98 @@ def _collect_rollout(
     actor_state: TrainState,
     critic_state: TrainState,
     rng_key: Array,
-    next_obs: dict[str, Array],
     next_done: Array,
     episode_returns: Array,
     episode_lengths: Array,
 ) -> dict[str, Any]:
-    """Collect one PPO rollout from the vectorized racing environment."""
-    actor_obs_buf = jnp.zeros(
-        (ppo_cfg.n_steps, ppo_cfg.n_envs, ACTOR_OBS_DIM), dtype=jnp.float32
+    """Collect one PPO rollout with the JAX-scanned race-core path."""
+    if env.env is None:
+        raise RuntimeError("Cannot collect a rollout before env construction.")
+
+    static_cfg = _rollout_static_config(env, ppo_cfg)
+    scan_result = scan_rollout(
+        env.env.data,
+        actor_state.params,
+        critic_state.params,
+        env.normalizer,
+        env.prev_action_env_4vec,
+        rng_key,
+        env.rng_key,
+        next_done,
+        episode_returns,
+        episode_lengths,
+        env.env._step,
+        env.env._reset,
+        static_cfg,
     )
-    critic_obs_buf = jnp.zeros_like(actor_obs_buf)
-    action_buf = jnp.zeros(
-        (ppo_cfg.n_steps, ppo_cfg.n_envs, RAW_ACTION_DIM), dtype=jnp.float32
-    )
-    logprob_buf = jnp.zeros((ppo_cfg.n_steps, ppo_cfg.n_envs), dtype=jnp.float32)
-    reward_buf = jnp.zeros_like(logprob_buf)
-    done_buf = jnp.zeros_like(logprob_buf)
-    value_buf = jnp.zeros_like(logprob_buf)
-    component_sums: dict[str, Array] = {}
-    target_gate_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    crash_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    finish_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    completed_return_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    completed_length_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    completed_count = jnp.asarray(0.0, dtype=jnp.float32)
 
-    for step_idx in range(ppo_cfg.n_steps):
-        actor_obs = next_obs["actor_obs"]
-        critic_obs = next_obs["critic_obs"]
-        rng_key, action_key = jax.random.split(rng_key)
-        raw_action, logprob, value = _sample_action_and_value(
-            actor_state.params,
-            critic_state.params,
-            actor_obs,
-            critic_obs,
-            action_key,
-        )
-
-        actor_obs_buf = actor_obs_buf.at[step_idx].set(actor_obs)
-        critic_obs_buf = critic_obs_buf.at[step_idx].set(critic_obs)
-        action_buf = action_buf.at[step_idx].set(raw_action)
-        logprob_buf = logprob_buf.at[step_idx].set(logprob)
-        done_buf = done_buf.at[step_idx].set(next_done)
-        value_buf = value_buf.at[step_idx].set(value)
-
-        next_obs, reward, terminated, truncated, info = env.step(raw_action)
-        done = (terminated | truncated).astype(jnp.float32)
-        reward_buf = reward_buf.at[step_idx].set(reward)
-
-        episode_returns = episode_returns + reward
-        episode_lengths = episode_lengths + 1.0
-        completed_return_sum += jnp.sum(jnp.where(done > 0.0, episode_returns, 0.0))
-        completed_length_sum += jnp.sum(jnp.where(done > 0.0, episode_lengths, 0.0))
-        completed_count += jnp.sum(done)
-        episode_returns = jnp.where(done > 0.0, 0.0, episode_returns)
-        episode_lengths = jnp.where(done > 0.0, 0.0, episode_lengths)
-        next_done = done
-
-        components = info["reward_components"]
-        for key, value_component in components.items():
-            component_sums[key] = component_sums.get(
-                key, jnp.asarray(0.0, dtype=jnp.float32)
-            ) + jnp.mean(value_component)
-        target_gate_sum += jnp.mean(info["target_gate_progress"])
-        crash_sum += jnp.mean(info["crash"].astype(jnp.float32))
-        finish_sum += jnp.mean(info["finished"].astype(jnp.float32))
-
-    denominator = jnp.asarray(ppo_cfg.n_steps, dtype=jnp.float32)
-    metrics = {
-        "ep_ret": float(
-            np.asarray(completed_return_sum / jnp.maximum(completed_count, 1.0))
-        ),
-        "ep_len": float(
-            np.asarray(completed_length_sum / jnp.maximum(completed_count, 1.0))
-        ),
-        "episodes": float(np.asarray(completed_count)),
-        "target_gate_mean": float(np.asarray(target_gate_sum / denominator)),
-        "crash_rate": float(np.asarray(crash_sum / denominator)),
-        "finish_rate": float(np.asarray(finish_sum / denominator)),
-    }
-    for key, value_component in component_sums.items():
-        metrics[key] = float(np.asarray(value_component / denominator))
+    env.env.data = scan_result.env_data
+    env.prev_action_env_4vec = scan_result.prev_action_env_4vec
+    env.rng_key = scan_result.reset_rng_key
+    env.current_env_obs = scan_result.next_env_obs
+    env.prev_env_obs = scan_result.next_env_obs
+    metrics = _rollout_metrics(scan_result.outputs, scan_result.metrics)
 
     return {
-        "actor_obs": actor_obs_buf,
-        "critic_obs": critic_obs_buf,
-        "raw_actions": action_buf,
-        "logprobs": logprob_buf,
-        "rewards": reward_buf,
-        "dones": done_buf,
-        "values": value_buf,
-        "next_obs": next_obs,
-        "next_done": next_done,
-        "episode_returns": episode_returns,
-        "episode_lengths": episode_lengths,
-        "rng_key": rng_key,
+        "actor_obs": scan_result.outputs.actor_obs,
+        "critic_obs": scan_result.outputs.critic_obs,
+        "raw_actions": scan_result.outputs.raw_actions,
+        "logprobs": scan_result.outputs.logprobs,
+        "rewards": scan_result.outputs.rewards,
+        "dones": scan_result.outputs.dones,
+        "values": scan_result.outputs.values,
+        "next_obs": scan_result.next_obs,
+        "next_done": scan_result.next_done,
+        "episode_returns": scan_result.episode_returns,
+        "episode_lengths": scan_result.episode_lengths,
+        "rng_key": scan_result.rng_key,
         "metrics": metrics,
     }
 
 
-@jax.jit
-def _sample_action_and_value(
-    actor_params: dict[str, Any],
-    critic_params: dict[str, Any],
-    actor_obs: Array,
-    critic_obs: Array,
-    key: Array,
-) -> tuple[Array, Array, Array]:
-    """Sample a raw action and compute its critic value."""
-    raw_action, logprob = sample_and_log_prob(actor_params, actor_obs, key)
-    value = Critic().apply({"params": critic_params}, critic_obs)
-    return raw_action, logprob, value
+def _rollout_static_config(
+    env: RLSongVecEnv,
+    ppo_cfg: PPOConfig,
+) -> RolloutStaticConfig:
+    """Build the static config for the compiled rollout path."""
+    thrust_min, thrust_max = env.get_thrust_bounds()
+    return RolloutStaticConfig(
+        n_steps=ppo_cfg.n_steps,
+        n_envs=ppo_cfg.n_envs,
+        thrust_min=thrust_min,
+        thrust_max=thrust_max,
+        max_episode_steps=env.max_episode_steps,
+        reward_cfg=env.reward_cfg,
+        reset_pos_perturb_m=env.stage.reset_pos_perturb_m,
+        reset_vel_perturb_mps=env.stage.reset_vel_perturb_mps,
+        reset_yaw_perturb_rad=env.stage.reset_yaw_perturb_rad,
+    )
+
+
+def _rollout_metrics(
+    outputs: RolloutScanOutputs,
+    metric_sums: RolloutMetricSums,
+) -> dict[str, float]:
+    """Convert scanned rollout tensors into Python logging metrics."""
+    completed_count = metric_sums.completed_count
+    completed_denominator = jnp.maximum(completed_count, 1.0)
+    metrics = {
+        "ep_ret": float(
+            np.asarray(metric_sums.completed_return_sum / completed_denominator)
+        ),
+        "ep_len": float(
+            np.asarray(metric_sums.completed_length_sum / completed_denominator)
+        ),
+        "episodes": float(np.asarray(completed_count)),
+        "target_gate_mean": float(np.asarray(jnp.mean(outputs.target_gate_progress))),
+        "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
+        "finish_rate": float(
+            np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))
+        ),
+    }
+    for key, value_component in outputs.reward_components.items():
+        metrics[key] = float(np.asarray(jnp.mean(value_component)))
+    return metrics
 
 
 @jax.jit

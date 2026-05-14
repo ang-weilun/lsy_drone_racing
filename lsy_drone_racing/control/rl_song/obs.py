@@ -261,7 +261,9 @@ def build_actor_obs(
 
     visited_chan = gates_visited[gate_indices].astype(jnp.float32)
 
-    prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(ENV_ACTION_DIM)
+    prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(
+        ENV_ACTION_DIM
+    )
 
     # Obstacle channel: body-frame relative position + visited flag, per obstacle.
     obstacles_rel_body = (obstacles_pos - pos) @ rot_bw.T  # (N_OBSTACLES, 3)
@@ -320,5 +322,29 @@ def vmap_build_actor_obs(
     """
     # Normalizer is shared across the batch (broadcasted), so ``in_axes=None``.
     return jax.vmap(build_actor_obs, in_axes=({k: 0 for k in env_obs}, 0, None))(
+        env_obs, prev_action, normalizer
+    )
+
+
+def vmap_build_critic_obs(
+    env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
+) -> Array:
+    """Batched variant of :func:`build_critic_obs` over the leading axis.
+
+    Parameters
+    ----------
+    env_obs : dict[str, Array]
+        Each value has a leading ``n_envs`` axis.
+    prev_action : Array, shape (n_envs, 4)
+    normalizer : NormalizerState
+        Broadcast over the batch.
+
+    Returns
+    -------
+    Array, shape (n_envs, ACTOR_OBS_DIM)
+        Normalized critic observations. Currently equal to actor observations;
+        kept separate for the stage-3 privileged critic seam.
+    """
+    return jax.vmap(build_critic_obs, in_axes=({k: 0 for k in env_obs}, 0, None))(
         env_obs, prev_action, normalizer
     )
