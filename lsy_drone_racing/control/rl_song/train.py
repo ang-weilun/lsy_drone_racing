@@ -66,6 +66,15 @@ class CLIArgs:
     wandb_entity: str | None = None
     run_name: str | None = None
     no_wandb: bool = False
+    # Path to another run's checkpoint directory (e.g.
+    # ``checkpoints/stage1_seed0_v7_pergate_jackpot``). When set AND no
+    # checkpoint exists for the current ``run_name``, the actor / critic
+    # parameters and observation normalizer are seeded from the latest
+    # checkpoint in this directory. The optimizer state, stage index, and
+    # global step are NOT loaded, so the new run starts at iteration 1 with a
+    # fresh LR / entropy schedule. Use to warm-start one curriculum stage
+    # from another (e.g. stage 3 from a stage 1 policy).
+    init_from: str | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -153,12 +162,20 @@ def train(args: CLIArgs) -> None:
         normalizer = _normalizer_from_checkpoint(restored["normalizer"])
         env_rng_key = restored["env_rng_key"]
         env_sim_rng_key = restored["env_sim_rng_key"]
+    elif args.init_from is not None:
+        init_data = _load_init_checkpoint(args.init_from)
+        actor_state = actor_state.replace(params=init_data["actor_params"])
+        critic_state = critic_state.replace(params=init_data["critic_params"])
+        normalizer = _normalizer_from_checkpoint(init_data["normalizer"])
 
     env = RLSongVecEnv(train_cfg, stage_idx=start_stage_idx, seed=train_cfg.seed, device="gpu")
 
     wandb_run = _init_wandb(args, train_cfg, run_name, restored is not None)
     if restored is None:
         next_obs, _ = env.reset(seed=train_cfg.seed + start_stage_idx)
+        if normalizer is not None:
+            env.set_normalizer(normalizer)
+            next_obs = env.build_observations()
     else:
         if normalizer is not None:
             env.set_normalizer(normalizer)
@@ -756,6 +773,38 @@ def _restore_if_available(run_dir: Path) -> dict[str, Any] | None:
         return None
     checkpointer = ocp.PyTreeCheckpointer()
     return checkpointer.restore(checkpoint_path)
+
+
+def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
+    """Load actor / critic params and normalizer from another run's checkpoint.
+
+    Parameters
+    ----------
+    init_from : str
+        Path to a run directory containing one or more
+        ``step_NNNNNNNNNNNN`` Orbax checkpoint subdirectories. The latest
+        checkpoint in the directory is loaded.
+
+    Returns
+    -------
+    dict[str, Any]
+        Restored checkpoint mapping (full pytree). Callers should pick out
+        ``actor_params``, ``critic_params``, and ``normalizer``; the rest of
+        the keys (opt state, stage index, RNG keys, step counters) are
+        ignored on purpose so warm-start runs begin with a fresh schedule.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``init_from`` does not exist or contains no checkpoints.
+    """
+    init_run_dir = Path(init_from).expanduser()
+    if not init_run_dir.exists():
+        raise FileNotFoundError(f"init_from path does not exist: {init_run_dir}")
+    checkpoint_path = _latest_checkpoint_path(init_run_dir)
+    if checkpoint_path is None:
+        raise FileNotFoundError(f"No Orbax checkpoint found under {init_run_dir}")
+    return ocp.PyTreeCheckpointer().restore(checkpoint_path)
 
 
 def _save_checkpoint(
