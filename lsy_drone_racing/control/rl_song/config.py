@@ -154,6 +154,23 @@ class RewardConfig:
     # strictly dominates. Philosophy-aligned with Song 2023's "minimize lap
     # time" objective without changing the reward terms they use.
     time_penalty: float = 0.05
+    # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
+    # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
+    # (the drone must point its FOV where it is going to perceive obstacles).
+    # We have state-based obs, so this term solves a problem we do not have;
+    # the code path is retained for ablation.
+    use_vel_shaping: bool = False
+    vel_lat_coef: float = -0.02
+    vel_back_coef: float = -0.05
+    # v10: asymmetric gate guidance field in target-gate local frame (Liu
+    # eq. 6-7). Front-side shaping attracts the policy to the aperture
+    # centerline, while back-side shaping penalizes off-axis wrong-side
+    # approaches that symmetric r_prog cannot distinguish.
+    use_guide: bool = True
+    guide_coef: float = 0.05
+    guide_k0: float = 1.5
+    guide_k1: float = 1.0
+    guide_k2: float = 0.3
 
 
 @dataclass(frozen=True)

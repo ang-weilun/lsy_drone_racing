@@ -20,6 +20,12 @@ import jax.numpy as jnp
 from jax import Array
 
 from lsy_drone_racing.control.rl_song.config import RewardConfig
+from lsy_drone_racing.control.rl_song.obs import GATE_HALF_SIZE_M, _quat_to_matrix
+
+# Squared-meter tolerance for detecting positions on the gate guidance axis.
+GUIDANCE_AXIS_EPS_M2: float = 1e-8
+# Dimensionless denominator floor for the aperture-normalized guidance radius.
+GUIDANCE_DENOM_EPS: float = 1e-8
 
 
 def step_reward(
@@ -32,6 +38,7 @@ def step_reward(
     reward_cfg: RewardConfig,
     *,
     true_gates_pos: Array | None = None,
+    true_gates_quat: Array | None = None,
     true_obstacles_pos: Array | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute one vectorized Song-style reward step.
@@ -58,6 +65,10 @@ def step_reward(
     true_gates_pos : Array, shape (n_envs, n_gates, 3), optional
         Unmasked true gate positions. The wrapper should pass this from
         ``env.data.gates_pos``.
+    true_gates_quat : Array, shape (n_envs, n_gates, 4), optional
+        Unmasked true gate xyzw quaternions. The wrapper should pass this
+        from ``env.data.gates_quat``. If omitted, ``env_obs["gates_quat"]``
+        is used.
     true_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
         Unmasked obstacle positions. If omitted, ``env_obs["obstacles_pos"]``
         is used.
@@ -68,11 +79,12 @@ def step_reward(
         Total replacement reward.
     components : dict[str, Array]
         Per-component rewards with keys ``r_prog``, ``r_omega``, ``r_obs``,
-        ``r_gate_bonus``, and ``r_terminal``. Every value has shape
-        ``(n_envs,)``.
+        ``r_gate_bonus``, ``r_terminal``, ``r_time``, ``r_vel``, and
+        ``r_guid``. Every value has shape ``(n_envs,)``.
     """
     _ = truncated
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
+    gates_quat = env_obs["gates_quat"] if true_gates_quat is None else true_gates_quat
     obstacles_pos = env_obs["obstacles_pos"] if true_obstacles_pos is None else true_obstacles_pos
 
     prev_target = prev_env_obs["target_gate"]
@@ -80,6 +92,7 @@ def step_reward(
     target_idx = jnp.where(prev_target >= 0, prev_target, jnp.maximum(current_target, 0))
     env_idx = jnp.arange(gates_pos.shape[0])
     gate_pos = gates_pos[env_idx, target_idx]
+    gate_quat = gates_quat[env_idx, target_idx]
 
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
@@ -87,6 +100,45 @@ def step_reward(
     r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
     r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
+
+    # v10: forward-flight bias (Liu eq. 8). Penalize lateral and backward
+    # body-frame velocity. Symmetric ``r_prog`` cannot distinguish a drone
+    # that slides sideways toward a gate from one that flies through nose-
+    # first; this term breaks that symmetry without touching ``r_prog``.
+    rot_wb = _quat_to_matrix(env_obs["quat"])
+    vel_body = jnp.einsum("nji,nj->ni", rot_wb, env_obs["vel"])
+    vel_lat = vel_body[..., 1]
+    vel_back = jnp.minimum(vel_body[..., 0], 0.0)
+    r_vel = jnp.where(
+        jnp.asarray(reward_cfg.use_vel_shaping, dtype=bool),
+        reward_cfg.vel_lat_coef * jnp.square(vel_lat)
+        + reward_cfg.vel_back_coef * jnp.square(vel_back),
+        jnp.zeros_like(r_prog),
+    )
+
+    # v10: Liu eqs. 6-7 gate guidance in the target gate's local frame.
+    rot_gw = _quat_to_matrix(gate_quat)
+    pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
+    x, y, z = pos_local[..., 0], pos_local[..., 1], pos_local[..., 2]
+    guide_window = jnp.maximum(1.0 - jnp.sign(x) * x / reward_cfg.guide_k0, 0.0)
+    h_wp, w_wp = GATE_HALF_SIZE_M
+    denom = jnp.square(z / h_wp) + jnp.square(y / w_wp)
+    yz_sq = jnp.square(y) + jnp.square(z)
+    guide_spread_axis = reward_cfg.guide_k2 * (1.0 + jnp.square(guide_window))
+    guide_spread = jnp.where(
+        yz_sq > GUIDANCE_AXIS_EPS_M2,
+        guide_spread_axis * jnp.sqrt(yz_sq / jnp.maximum(denom, GUIDANCE_DENOM_EPS)),
+        guide_spread_axis,
+    )
+    guide_front = reward_cfg.guide_k1 * jnp.exp(-yz_sq / (2.0 * guide_spread))
+    guide_back = 1.0 - jnp.exp(-yz_sq / (2.0 * guide_spread))
+    guide_field = jnp.where(x > 0.0, guide_front, guide_back)
+    r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
+    r_guid = jnp.where(
+        jnp.asarray(reward_cfg.use_guide, dtype=bool),
+        r_guid_raw,
+        jnp.zeros_like(r_prog),
+    )
 
     obstacle_delta = pos[:, None, :] - obstacles_pos
     obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta), axis=-1)
@@ -130,6 +182,10 @@ def step_reward(
         "r_gate_bonus": r_gate_bonus,
         "r_terminal": r_terminal,
         "r_time": r_time,
+        "r_vel": r_vel,
+        "r_guid": r_guid,
     }
-    reward = r_prog + r_omega + r_obs + r_gate_bonus + r_terminal + r_time
+    reward = (
+        r_prog + r_omega + r_obs + r_gate_bonus + r_terminal + r_time + r_vel + r_guid
+    )
     return reward, components

@@ -209,6 +209,7 @@ class RLSongVecEnv:
             gate_just_passed,
             self.reward_cfg,
             true_gates_pos=self.true_gates_pos(),
+            true_gates_quat=self.true_gates_quat(),
             true_obstacles_pos=self.true_obstacles_pos(),
         )
 
