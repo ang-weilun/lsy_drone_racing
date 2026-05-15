@@ -174,7 +174,16 @@ class RewardConfig:
     # which give the hover policy a strictly negative Q. Time penalty also
     # had a known downside: it priced "crash trying" cheaper than "hover
     # safely" (-5 vs -25), inflating crash rate on early-stage runs.
-    time_penalty: float = 0.0
+    # v14: re-enable at 0.02 (40% of v8's 0.05). Sim eval of v11 on level 0
+    # showed 0/100 finish — the drone slips above gate 1 and parks beyond
+    # the r_guid window (|x_gate| > guide_k0 = 1.5 m) where every per-step
+    # reward term is identically zero. The v11 reasoning that "hover Q is
+    # subsumed by foregone discounted finish_bonus" assumed r_guid covers
+    # the whole flight space; it doesn't (finite support, see guide_k0).
+    # 0.02 × 1500-step truncation = -30, which strictly dominates the
+    # crash_penalty of -5, restoring the property that any committed
+    # attempt beats indefinite hovering.
+    time_penalty: float = 0.02
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -196,8 +205,18 @@ class RewardConfig:
     # (use_guide_delta_phi=False) is no longer well-tuned at this scale —
     # at 2.0 the per-step penalty would dominate r_prog and freeze the
     # policy.
-    guide_coef: float = 2.0
-    guide_k0: float = 1.5
+    # v14: reverted to 0.15 in tandem with use_guide_delta_phi=False (see
+    # the ``time_penalty`` block above for the level-0 failure diagnostic
+    # that motivates the v14 revert + retune).
+    guide_coef: float = 0.15
+    # v14: widened 1.5 -> 3.0. The level-0 spawn at world (-1.5, 0.75, 0.01)
+    # is ~2.1 m from gate 1 in gate-frame x, so at k0=1.5 the policy gets
+    # zero r_guid signal until it has already walked itself most of the
+    # way to gate 1. Widening to 3.0 puts the spawn inside the window with
+    # ``guide_window**2`` ≈ 0.09 — small but non-zero gradient from step 1.
+    # Combined with time_penalty=0.02 this should remove the neutral-zone
+    # parking attractor that v11 found.
+    guide_k0: float = 3.0
     guide_k1: float = 1.0
     guide_k2: float = 0.3
     # v13B: Δ-potential gate guidance. When True, r_guid is computed as
@@ -209,7 +228,11 @@ class RewardConfig:
     # hover-on-approach attractor that v12's positive static field
     # created. Both endpoints use the pre-step target gate frame, so the
     # gate-transition step pays positive ΔΦ without a mask.
-    use_guide_delta_phi: bool = True
+    # v14: disabled. v13B converged to 0% finish because pure ΔΦ has no
+    # anti-loiter mechanism. Reverting to the static field with
+    # time_penalty + widened guide_k0 as a less pure but functional
+    # alternative.
+    use_guide_delta_phi: bool = False
     guide_kx: float = 0.5
 
 
