@@ -182,13 +182,33 @@ class RewardConfig:
     # v11: disable. Neither Song 2023 nor Liu use a per-gate event bonus.
     # The dense progress reward + finish_bonus under high gamma should
     # cover gate transitions without an explicit discrete payoff.
-    gate_pass_bonus: float = 0.0
-    use_gate_pass_bonus: bool = False
+    # v18: re-enable at 20 with per-gate scaling (1x, 2x, 3x, 4x → 20,
+    # 40, 60, 80). This is v7a's exact positive-event recipe. v15-v17 all
+    # collapsed under PPO because cold-start exploration from spawn never
+    # finds the +100 finish event, so crash signal dominates the gradient
+    # and the policy converges to do-nothing. A per-gate event gives the
+    # policy a positive gradient as it learns gate-1, gate-2, ... rather
+    # than requiring it to learn the entire track at once. v7a (with this
+    # exact recipe + no r_guid + no seg-init) solved level-1 to 100%
+    # finish from cold start in 100M steps.
+    gate_pass_bonus: float = 20.0
+    use_gate_pass_bonus: bool = True
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
     # jackpot. The dense progress reward already pulls the policy through
     # later gates without needing an escalating discrete payoff.
-    scale_gate_bonus_by_index: bool = False
+    # v18: re-enable. The v9 motivation assumed a working policy that
+    # already passes early gates; v15-v17 collapsed because PPO couldn't
+    # find ANY gate-passes from cold start under finish-only + small
+    # negative signal. With the jackpot 20/40/60/80, the gradient toward
+    # "pass gate 1" is +20 — an order of magnitude bigger than the per-
+    # crash penalty -5, so the policy can learn gate-1 traversal first and
+    # extend to later gates as it gets better. v7a (this exact recipe)
+    # solved level 1 to 100% finish in 100M steps; v8's "rush past 1 to
+    # bank gate-2's bigger jackpot" failure mode only matters if the
+    # policy can already pass gates 1 and 2, which is exactly the regime
+    # we are not yet in.
+    scale_gate_bonus_by_index: bool = True
     # v8: per-step time penalty. With randomized gates the random-init policy
     # has zero progress in expectation, while a stationary "hover" policy
     # collects zero shaping reward and just times out — making hover the Q≈0
