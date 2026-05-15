@@ -143,6 +143,19 @@ class RewardConfig:
     # and 20x the v17 crash_penalty (5), restoring the positive/negative
     # balance v11 trained under.
     progress_coef: float = 10.0
+    # v20: switch r_prog from the legacy distance-delta formulation
+    # (||g - p_prev|| - ||g - p||) to the Song-2023 / Kaufmann-2023
+    # velocity-projection variant: project the world-frame displacement
+    # onto the gate's forward-normal axis (x_local of the target gate)
+    # and scale by progress_coef. The reward direction is then fixed in
+    # gate frame, so lateral drift away from the traversal axis costs
+    # progress while equivalent-magnitude motion along the axis pays.
+    # The legacy term oscillated ~+0.034/step on v19's stationary policy
+    # (~+17 over 500 steps) because rotation in place still reduces
+    # ||g - p|| momentarily; the velocity-projection variant integrates
+    # to zero under such rotation and is harder to "harvest" without
+    # actually flying through the gate.
+    use_velocity_progress: bool = True
     # v15: down to 0.01 to match Song 2023's exact body-rate coefficient.
     # The 0.02 value here was justified earlier as the 50 Hz analogue of
     # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
@@ -200,7 +213,7 @@ class RewardConfig:
     # than requiring it to learn the entire track at once. v7a (with this
     # exact recipe + no r_guid + no seg-init) solved level-1 to 100%
     # finish from cold start in 100M steps.
-    gate_pass_bonus: float = 20.0
+    gate_pass_bonus: float = 40.0
     use_gate_pass_bonus: bool = True
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
@@ -217,6 +230,11 @@ class RewardConfig:
     # bank gate-2's bigger jackpot" failure mode only matters if the
     # policy can already pass gates 1 and 2, which is exactly the regime
     # we are not yet in.
+    # v20: double the per-gate jackpot base 20 -> 40 so the scaled
+    # bonuses become 40/80/120/160. v18/v19 showed gate_pass_bonus=20
+    # scaled is irrelevant when the discrete event is never triggered
+    # from cold start; doubling it is cheap once gate 1 is found and
+    # gives a louder gradient at the moment of first discovery.
     scale_gate_bonus_by_index: bool = True
     # v8: per-step time penalty. With randomized gates the random-init policy
     # has zero progress in expectation, while a stationary "hover" policy
@@ -285,7 +303,19 @@ class RewardConfig:
     # Our v10-v14 application has not been load-bearing for the level-0
     # cold-start task — see the 2026-05-15 v15 handoff. Reverting to the
     # Song/Kaufmann minimum.
-    use_guide: bool = False
+    # v20: re-enable. v15-v19 all collapsed under cold-start with r_guid
+    # off. Diagnosis: r_prog and gate_pass_bonus are both zero in
+    # expectation under a random Gaussian policy (motion- and event-
+    # based signals are zero-mean under random actions), while r_guid
+    # is a *position-based* signal that depends on where the drone
+    # drifts to, not how it moves. The random-walk distribution does
+    # cover non-trivial neighborhoods of the gate axis, so r_guid is
+    # the only term with a non-zero expectation under random rollout
+    # — i.e. the only term that supplies a discoverable gradient out
+    # of the cold-start basin. Re-enabling with the static Liu eq. 6-7
+    # field (use_guide_delta_phi=False) and a bumped coefficient (see
+    # ``guide_coef`` below).
+    use_guide: bool = True
     # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
     # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
     # r_guid over a perfectly centered pass is approximately guide_coef,
@@ -297,7 +327,16 @@ class RewardConfig:
     # v14: reverted to 0.15 in tandem with use_guide_delta_phi=False (see
     # the ``time_penalty`` block above for the level-0 failure diagnostic
     # that motivates the v14 revert + retune).
-    guide_coef: float = 0.15
+    # v20: 0.15 -> 0.5. With r_guid as the load-bearing cold-start signal
+    # (see ``use_guide`` above), v11's coef=0.15 produced an attractor
+    # weak enough that the policy could happily ignore it (v11 finish
+    # was driven by seg-init scaffolding, not by r_guid magnitude).
+    # Bumping ~3.3x scales the front-side aperture-alignment bonus up
+    # without going as far as v13B's 2.0 (which was paired with the
+    # different ΔΦ shaping that lacks the v11/v14 back-side loiter
+    # penalty). The back-side penalty also scales, so any policy that
+    # tries to harvest progress by orbiting behind the gate pays more.
+    guide_coef: float = 0.5
     # v14: widened 1.5 -> 3.0. The level-0 spawn at world (-1.5, 0.75, 0.01)
     # is ~2.1 m from gate 1 in gate-frame x, so at k0=1.5 the policy gets
     # zero r_guid signal until it has already walked itself most of the

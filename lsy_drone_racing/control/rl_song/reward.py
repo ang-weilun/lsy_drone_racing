@@ -146,8 +146,27 @@ def step_reward(
 
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
-    r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-    r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
+    # v20: Song-2023 / Kaufmann-2023 velocity-projection progress, gated
+    # by ``use_velocity_progress``. The drone enters each gate's local
+    # frame from x_local < 0, passes the aperture at x_local ≈ 0, and
+    # exits at x_local > 0, so the gate-frame x-component of the world-
+    # frame displacement is the signed progress along the gate normal.
+    # Reward direction is fixed in gate frame (the gate's traversal
+    # axis), rather than rotating with the line from drone to gate as
+    # in the legacy distance-delta formulation. The two are equal in
+    # the limit of small displacements along that line; they diverge
+    # when motion has a lateral component, where velocity-projection
+    # only credits the traversal-aligned part — encouraging cleaner
+    # nose-first passes.
+    if reward_cfg.use_velocity_progress:
+        rot_gw = _quat_to_matrix(gate_quat)
+        delta_local = jnp.einsum("nji,nj->ni", rot_gw, pos - prev_pos)
+        r_prog = reward_cfg.progress_coef * delta_local[..., 0]
+    else:
+        r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
+        r_prog = reward_cfg.progress_coef * (
+            r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
+        )
 
     r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
 
