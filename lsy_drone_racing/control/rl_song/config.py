@@ -155,7 +155,19 @@ class RewardConfig:
     # ||g - p|| momentarily; the velocity-projection variant integrates
     # to zero under such rotation and is harder to "harvest" without
     # actually flying through the gate.
-    use_velocity_progress: bool = True
+    # v21: back to False. The video of v20 showed the policy tilting
+    # toward the gate horizontally while still on the ground, sliding,
+    # and tipping over without ever lifting off. Velocity-projection
+    # r_prog projects onto the gate's horizontal forward-normal axis,
+    # so pure vertical motion (the load-bearing takeoff subtask) pays
+    # zero r_prog gain — while horizontal tilt earns ~1.33/step. PPO
+    # took the bigger per-step gradient and learned tilt-and-slide
+    # instead of thrust-up-then-approach. The legacy distance-delta
+    # formulation credits any motion that closes ||g - p||, including
+    # vertical when the gate is above the spawn (gate 1 is at z=0.7,
+    # spawn at z=0.01), which is the geometry v7a learned cold-start
+    # takeoff under.
+    use_velocity_progress: bool = False
     # v15: down to 0.01 to match Song 2023's exact body-rate coefficient.
     # The 0.02 value here was justified earlier as the 50 Hz analogue of
     # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
