@@ -132,39 +132,44 @@ class RewardConfig:
     # another coefficient bump.
     # v15: down to 1.0 to match Song 2023 Sci. Robotics §V exactly. Their
     # progress term has unit coefficient; integrated over a ~10 m level-0
-    # track that lands at ~+10, comparable to a +10 finish bonus. Our v9-v14
-    # progress_coef of 10 with finish_bonus 100 was internally consistent at
-    # the same ratio, but the 10x absolute magnitude pushed PPO advantage
-    # variance into ranges where the clip range becomes non-binding —
-    # rescaling back to Song's absolute scale keeps the optimizer in the
-    # regime the paper validated.
-    progress_coef: float = 1.0
+    # track that lands at ~+10, comparable to a +10 finish bonus.
+    # v17: back to 10.0. Wandb history of v16a showed early exploration
+    # (max_gate ~ 0.003, crash_rate ~ 0.5%) collapse to "do nothing" by
+    # step 18M when at this scale (progress_coef=1, crash_penalty=10,
+    # finish_bonus=10). The crash signal (-10/episode) dominated the
+    # progress signal too strongly for PPO to find the rare +10 finishes.
+    # Restoring v9-v14's progress_coef = 10 gives integrated r_prog ≈ +100
+    # over a successful trajectory — matched by finish_bonus = 100 below
+    # and 20x the v17 crash_penalty (5), restoring the positive/negative
+    # balance v11 trained under.
+    progress_coef: float = 10.0
     # v15: down to 0.01 to match Song 2023's exact body-rate coefficient.
     # The 0.02 value here was justified earlier as the 50 Hz analogue of
     # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
     # control frequency and the 100 Hz figure was a misreading. Reverting
     # to the verbatim paper value.
     omega_coef: float = 0.01
-    # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0. The earlier
-    # reduction to 5.0 was motivated by "policy collapsed to safe hover under
-    # -10 crash vs ~+0.003 per-step progress"; that ratio assumed
-    # progress_coef = 1 with old scale, but our v9-v14 had progress_coef = 10
-    # which made the relative crash penalty 5x smaller than Song's intent.
-    # With v15's progress_coef back to 1.0, restoring crash to -10 gives
-    # the same balance Song used.
-    crash_penalty: float = 10.0
+    # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0.
+    # v17: back to 5.0. The v15 raise to 10.0 (combined with progress_coef
+    # = 1) made the per-episode crash penalty dominate the per-episode
+    # integrated r_prog by 5–10x, pushing PPO toward the "do nothing"
+    # local optimum. v11/v14 used 5.0 with progress_coef = 10, which is
+    # the balance that produced 21% biased finish in v11. Reverting.
+    crash_penalty: float = 5.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
     # Putting the load-bearing reward on race completion makes finishing
     # dominant by an order of magnitude under any realistic episode horizon.
-    # v15: 100 -> 10 to match Song 2023 r_finish = +10. The v9 motivation
-    # (finish must dominate the gate-jackpot) is moot now that
-    # gate_pass_bonus = 0. Song's r_finish ≈ integrated r_prog over a
-    # successful lap, which is a deliberate design — the policy should
-    # treat each per-step progress contribution as carrying equal weight
-    # to the finish event.
-    finish_bonus: float = 10.0
+    # v15: 100 -> 10 to match Song 2023 r_finish = +10.
+    # v17: back to 100. At progress_coef = 10 (restored) and ~10 m track,
+    # integrated r_prog over a finish is ~100. Matching finish_bonus = 100
+    # keeps the discrete reward at the gate-pass / finish event on the
+    # same order as the dense shaping, which is the v11/v14 scale that
+    # produced learnable signal. With finish_bonus = 10 + progress_coef
+    # = 1 (v15 scale) the value function targets were too small for PPO
+    # to make meaningful updates (value_loss collapsed to 0.012).
+    finish_bonus: float = 100.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     obstacle_weight: float = 0.5
     obstacle_sigma: float = 0.2  # m
