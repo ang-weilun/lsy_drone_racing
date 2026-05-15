@@ -122,7 +122,13 @@ class RewardConfig:
     # ran at 5.0 and produced a policy that parked next to gate 1 without
     # crossing (~0.2m off the opening center, ep_ret +7.5). v3 doubles to 10.0
     # to accelerate the approach phase and the post-crossing dash to gate 2.
-    progress_coef: float = 10.0
+    # v12: 10.0 -> 20.0. v11 (no time penalty, no gate bonus) regressed on
+    # max_gate (1.63 -> 1.16) and r_prog (0.041 -> 0.019), implying average
+    # radial velocity around 0.1 m/s. Doubling the coefficient doubles the
+    # dense reward for closing distance: at v_radial = 1 m/s the per-step
+    # reward goes 0.2 -> 0.4, restoring the "fly fast" pressure that the
+    # time_penalty used to supply.
+    progress_coef: float = 20.0
     omega_coef: float = 0.02
     # Crash penalty was 10.0; reduced because the original ratio of -10 crash
     # to ~+0.003 per-step progress collapsed the policy to a safe hover.

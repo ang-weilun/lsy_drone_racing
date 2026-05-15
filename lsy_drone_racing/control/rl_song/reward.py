@@ -116,7 +116,17 @@ def step_reward(
         jnp.zeros_like(r_prog),
     )
 
-    # v10: Liu eqs. 6-7 gate guidance in the target gate's local frame.
+    # v12: Liu eqs. 6-7 gate guidance in the target gate's local frame.
+    # Sign convention (corrected from v10/v11):
+    #   front (x>0): ATTRACTIVE — positive reward peaks on-axis (y=z=0) at the
+    #     gate plane and decays with the Gaussian aperture envelope. Pulls the
+    #     policy onto the centerline approach. Reinforces, rather than fights,
+    #     r_prog (which is also maximized on the radial approach line).
+    #   back  (x<0): REPULSIVE — negative reward peaks off-axis, penalizing
+    #     wrong-side flyarounds that symmetric r_prog cannot distinguish. On-axis
+    #     on the back side (immediately post-pass) is neutral.
+    # The v10 implementation flipped the front sign, accidentally creating a
+    # repulsive on-axis potential that fought r_prog at low approach speeds.
     rot_gw = _quat_to_matrix(gate_quat)
     pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
     x, y, z = pos_local[..., 0], pos_local[..., 1], pos_local[..., 2]
@@ -132,8 +142,8 @@ def step_reward(
     )
     guide_front = reward_cfg.guide_k1 * jnp.exp(-yz_sq / (2.0 * guide_spread))
     guide_back = 1.0 - jnp.exp(-yz_sq / (2.0 * guide_spread))
-    guide_field = jnp.where(x > 0.0, guide_front, guide_back)
-    r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
+    guide_signed = jnp.where(x > 0.0, guide_front, -guide_back)
+    r_guid_raw = reward_cfg.guide_coef * jnp.square(guide_window) * guide_signed
     r_guid = jnp.where(
         jnp.asarray(reward_cfg.use_guide, dtype=bool),
         r_guid_raw,
