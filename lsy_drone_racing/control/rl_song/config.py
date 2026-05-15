@@ -367,6 +367,18 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
+                # Misnomer kept for run-name compatibility with v11-v15
+                # wandb runs. v16a actually disables seg-init entirely
+                # (segment_init_prob=0.0) — every episode starts at the
+                # toml drone-start position, on the ground, with vel=0.
+                # The v15 sim eval showed the same hover-above-gate-1
+                # failure mode v11/v14 had, with the additional regression
+                # of negative ep_ret. Diagnosis is that the 50% seg-init
+                # mid-track-flying episodes were teaching the policy a
+                # mid-track skill that never connects back to "thread
+                # gate 0 from cold start". Switching to pure cold-start
+                # forces the policy to actually solve the takeoff +
+                # gate-0 subtask that v7a solved in stage 1.
                 name="level2_seginit",
                 level=2,
                 use_domain_randomization=False,
@@ -374,7 +386,7 @@ def default_curriculum() -> CurriculumConfig:
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.5,
+                segment_init_prob=0.0,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
