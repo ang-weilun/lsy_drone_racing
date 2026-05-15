@@ -186,12 +186,20 @@ class RewardConfig:
     # centerline, while back-side shaping penalizes off-axis wrong-side
     # approaches that symmetric r_prog cannot distinguish.
     use_guide: bool = True
-    guide_coef: float = 0.15
+    # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
+    # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
+    # r_guid over a perfectly centered pass is approximately guide_coef,
+    # so 2.0 gives ~10% of per-gate r_prog (≈20 at progress_coef=20) as an
+    # aperture-alignment bonus. The legacy static-field branch
+    # (use_guide_delta_phi=False) is no longer well-tuned at this scale —
+    # at 2.0 the per-step penalty would dominate r_prog and freeze the
+    # policy.
+    guide_coef: float = 2.0
     guide_k0: float = 1.5
     guide_k1: float = 1.0
     guide_k2: float = 0.3
-    # v13B: opt-in Δ-potential gate guidance. When True, r_guid is
-    # computed as guide_coef · (Φ_t − Φ_{t-1}) with
+    # v13B: Δ-potential gate guidance. When True, r_guid is computed as
+    # guide_coef · (Φ_t − Φ_{t-1}) with
     # Φ = aperture_score(y,z) · sigmoid(-x / guide_kx). The potential is
     # monotonic front-to-back along the gate normal, so the integrated
     # reward over a perfectly centered pass is approximately guide_coef
@@ -199,7 +207,7 @@ class RewardConfig:
     # hover-on-approach attractor that v12's positive static field
     # created. Both endpoints use the pre-step target gate frame, so the
     # gate-transition step pays positive ΔΦ without a mask.
-    use_guide_delta_phi: bool = False
+    use_guide_delta_phi: bool = True
     guide_kx: float = 0.5
 
 
