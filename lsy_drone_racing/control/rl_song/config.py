@@ -454,38 +454,33 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v11: stripped to a single stage — ``level2_seginit`` — while we ablate
-    the v10 reward (Liu guidance, no time penalty, no gate jackpot, gamma
-    0.997) directly on a fixed nominal level-2 layout with ±0.15 m wobble
-    and Song §III-B Phase 1 seg-init. Promotion is disabled
-    (``promote_target_gate_mean=inf``) so this is effectively a no-op
-    curriculum. The legacy stage1/2/3a/b/c/4 progression is preserved in
-    :func:`_full_curriculum` and can be reinstated by swapping the body
-    of this function back.
+    v22: single level-3 stage with ``gate_rand_scale=0.0`` (no extra
+    wobble layered on top of the framework's per-episode track regen).
+    Used to warm-start from the v21 level-2 300M checkpoint and isolate
+    the level-2 → level-3 layout-transfer question from the wobble-on-
+    top-of-regen noise. If finish rate holds reasonably (>10%) under
+    pure regen, a follow-up stage bumps ``gate_rand_scale`` back to 1.0
+    so the policy sees the full level-3 distribution. The v11–v21
+    ``level2_seginit`` single-stage curriculum is preserved in git
+    history (commit 9ad7fa0). The legacy stage1/2/3a/b/c/4 progression
+    remains in :func:`_full_curriculum`.
     """
     pi_over_4 = 0.7853981633974483
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                # Misnomer kept for run-name compatibility with v11-v15
-                # wandb runs. v16a actually disables seg-init entirely
-                # (segment_init_prob=0.0) — every episode starts at the
-                # toml drone-start position, on the ground, with vel=0.
-                # The v15 sim eval showed the same hover-above-gate-1
-                # failure mode v11/v14 had, with the additional regression
-                # of negative ep_ret. Diagnosis is that the 50% seg-init
-                # mid-track-flying episodes were teaching the policy a
-                # mid-track skill that never connects back to "thread
-                # gate 0 from cold start". Switching to pure cold-start
-                # forces the policy to actually solve the takeoff +
-                # gate-0 subtask that v7a solved in stage 1.
-                name="level2_seginit",
-                level=2,
+                # Level-3 with the framework's full track-regen
+                # (``track.randomize=true`` in ``level3.toml``) but no
+                # additional wobble — the wrapper's ±max gate/obstacle
+                # perturbation scales to 0 at ``gate_rand_scale=0.0``.
+                # Pure layout-transfer test for the v21 warm-start.
+                name="level3_rand0",
+                level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
-                gate_rand_scale=1.00,
+                gate_rand_scale=0.00,
                 segment_init_prob=0.0,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
