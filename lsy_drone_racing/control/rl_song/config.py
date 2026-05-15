@@ -190,6 +190,17 @@ class RewardConfig:
     guide_k0: float = 1.5
     guide_k1: float = 1.0
     guide_k2: float = 0.3
+    # v13B: opt-in Δ-potential gate guidance. When True, r_guid is
+    # computed as guide_coef · (Φ_t − Φ_{t-1}) with
+    # Φ = aperture_score(y,z) · sigmoid(-x / guide_kx). The potential is
+    # monotonic front-to-back along the gate normal, so the integrated
+    # reward over a perfectly centered pass is approximately guide_coef
+    # (Φ goes ~0 → ~1). Hovering produces zero r_guid, removing the
+    # hover-on-approach attractor that v12's positive static field
+    # created. Both endpoints use the pre-step target gate frame, so the
+    # gate-transition step pays positive ΔΦ without a mask.
+    use_guide_delta_phi: bool = False
+    guide_kx: float = 0.5
 
 
 @dataclass(frozen=True)

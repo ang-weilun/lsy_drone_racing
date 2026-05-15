@@ -16,6 +16,7 @@ to ``env_obs["gates_pos"]`` for callers that intentionally use masked poses.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
@@ -26,6 +27,55 @@ from lsy_drone_racing.control.rl_song.obs import GATE_HALF_SIZE_M, _quat_to_matr
 GUIDANCE_AXIS_EPS_M2: float = 1e-8
 # Dimensionless denominator floor for the aperture-normalized guidance radius.
 GUIDANCE_DENOM_EPS: float = 1e-8
+
+
+def _gate_phi(
+    pos: Array,
+    gate_pos: Array,
+    gate_quat: Array,
+    reward_cfg: RewardConfig,
+) -> Array:
+    """Compute the Δ-potential gate guidance scalar Φ(pos | gate).
+
+    Φ = aperture_score(y,z) · sigmoid(-x / guide_kx)
+    in the target gate's local frame (x = forward through gate, y/z =
+    aperture coordinates). Monotonic front-to-back along the gate normal,
+    so ΔΦ over a perfectly centered pass integrates to ~1 and hovering
+    integrates to ~0.
+
+    Parameters
+    ----------
+    pos : Array, shape (n_envs, 3)
+        World-frame position.
+    gate_pos : Array, shape (n_envs, 3)
+        World-frame target-gate position.
+    gate_quat : Array, shape (n_envs, 4)
+        Target-gate xyzw quaternion.
+    reward_cfg : RewardConfig
+        Source of ``guide_k2`` (aperture spread base) and ``guide_kx``
+        (traversal sigmoid scale).
+
+    Returns
+    -------
+    phi : Array, shape (n_envs,)
+        Scalar potential in ``[0, 1]``.
+    """
+    rot_gw = _quat_to_matrix(gate_quat)
+    pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
+    x = pos_local[..., 0]
+    y = pos_local[..., 1]
+    z = pos_local[..., 2]
+    yz_sq = jnp.square(y) + jnp.square(z)
+    h_wp, w_wp = GATE_HALF_SIZE_M
+    denom = jnp.square(z / h_wp) + jnp.square(y / w_wp)
+    spread = jnp.where(
+        yz_sq > GUIDANCE_AXIS_EPS_M2,
+        reward_cfg.guide_k2 * jnp.sqrt(yz_sq / jnp.maximum(denom, GUIDANCE_DENOM_EPS)),
+        reward_cfg.guide_k2,
+    )
+    aperture = jnp.exp(-yz_sq / (2.0 * spread))
+    traversal = jax.nn.sigmoid(-x / reward_cfg.guide_kx)
+    return aperture * traversal
 
 
 def step_reward(
@@ -116,34 +166,39 @@ def step_reward(
         jnp.zeros_like(r_prog),
     )
 
-    # v13A: revert to v10/v11 sign convention. Both fields are applied as
-    # *penalties* (r_guid is non-positive). On-axis on the front is the
-    # most-penalized state, which is now understood not as "attractive
-    # centerline" (the v10 comment claim) but as a localized loiter
-    # penalty: sitting on the approach line bleeds reward, so the policy
-    # is forced to either pass through fast or move away. v12's flipped
-    # sign turned the field into a harvestable static reward and produced
-    # a hover-on-approach attractor (max_gate dropped from 1.16 to 0.88,
-    # entropy rose from 2.75 to 3.78). Δ-potential shaping is the next
-    # iteration (v13B / v14); this v13A run isolates the sign decision
-    # from the progress_coef=20 bump.
-    rot_gw = _quat_to_matrix(gate_quat)
-    pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
-    x, y, z = pos_local[..., 0], pos_local[..., 1], pos_local[..., 2]
-    guide_window = jnp.maximum(1.0 - jnp.sign(x) * x / reward_cfg.guide_k0, 0.0)
-    h_wp, w_wp = GATE_HALF_SIZE_M
-    denom = jnp.square(z / h_wp) + jnp.square(y / w_wp)
-    yz_sq = jnp.square(y) + jnp.square(z)
-    guide_spread_axis = reward_cfg.guide_k2 * (1.0 + jnp.square(guide_window))
-    guide_spread = jnp.where(
-        yz_sq > GUIDANCE_AXIS_EPS_M2,
-        guide_spread_axis * jnp.sqrt(yz_sq / jnp.maximum(denom, GUIDANCE_DENOM_EPS)),
-        guide_spread_axis,
-    )
-    guide_front = reward_cfg.guide_k1 * jnp.exp(-yz_sq / (2.0 * guide_spread))
-    guide_back = 1.0 - jnp.exp(-yz_sq / (2.0 * guide_spread))
-    guide_field = jnp.where(x > 0.0, guide_front, guide_back)
-    r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
+    # Gate guidance. Two formulations live behind this branch:
+    #
+    # v10/v11/v13A — static Liu eqs. 6-7 field, ``r_guid <= 0``. The
+    # original comment described front-side shaping as "attractive
+    # toward the centerline", but as written the on-axis penalty peaks
+    # on the approach line; mechanically the term is a *localized loiter
+    # penalty* that pushes the policy to pass through fast or step away.
+    # v13B — Δ-potential shaping, ``r_guid = guide_coef · (Φ_t − Φ_{t-1})``
+    # with Φ monotonic front-to-back. Pays only on transitions that move
+    # the drone toward aperture-centered traversal; hovering produces
+    # zero r_guid. Selected by ``reward_cfg.use_guide_delta_phi``.
+    if reward_cfg.use_guide_delta_phi:
+        phi_curr = _gate_phi(pos, gate_pos, gate_quat, reward_cfg)
+        phi_prev = _gate_phi(prev_pos, gate_pos, gate_quat, reward_cfg)
+        r_guid_raw = reward_cfg.guide_coef * (phi_curr - phi_prev)
+    else:
+        rot_gw = _quat_to_matrix(gate_quat)
+        pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
+        x, y, z = pos_local[..., 0], pos_local[..., 1], pos_local[..., 2]
+        guide_window = jnp.maximum(1.0 - jnp.sign(x) * x / reward_cfg.guide_k0, 0.0)
+        h_wp, w_wp = GATE_HALF_SIZE_M
+        denom = jnp.square(z / h_wp) + jnp.square(y / w_wp)
+        yz_sq = jnp.square(y) + jnp.square(z)
+        guide_spread_axis = reward_cfg.guide_k2 * (1.0 + jnp.square(guide_window))
+        guide_spread = jnp.where(
+            yz_sq > GUIDANCE_AXIS_EPS_M2,
+            guide_spread_axis * jnp.sqrt(yz_sq / jnp.maximum(denom, GUIDANCE_DENOM_EPS)),
+            guide_spread_axis,
+        )
+        guide_front = reward_cfg.guide_k1 * jnp.exp(-yz_sq / (2.0 * guide_spread))
+        guide_back = 1.0 - jnp.exp(-yz_sq / (2.0 * guide_spread))
+        guide_field = jnp.where(x > 0.0, guide_front, guide_back)
+        r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
     r_guid = jnp.where(
         jnp.asarray(reward_cfg.use_guide, dtype=bool),
         r_guid_raw,
