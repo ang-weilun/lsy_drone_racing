@@ -182,9 +182,26 @@ def _latest_checkpoint_path(run_dir: Path) -> Path | None:
 
 
 def _restore_checkpoint(path: Path) -> dict[str, Any]:
-    """Restore an Orbax checkpoint directory."""
+    """Restore an Orbax checkpoint directory.
+
+    Notes
+    -----
+    Orbax >=0.7 refuses to deserialize ``jax.Array`` leaves without an
+    explicit sharding spec, and the checkpoint was saved on a single CUDA
+    device, so the implicit topology no longer matches at restore time
+    (e.g. when loading on CPU for sim). We read the saved item metadata
+    and request every leaf as a plain ``np.ndarray`` via
+    ``ArrayRestoreArgs``; the policy code converts to ``jax.Array`` as
+    needed via ``jnp.asarray``.
+    """
     checkpointer = ocp.PyTreeCheckpointer()
-    return checkpointer.restore(path)
+    item_metadata = checkpointer.metadata(path).item_metadata
+    restore_args = jax.tree_util.tree_map(
+        lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), item_metadata
+    )
+    return checkpointer.restore(
+        path, args=ocp.args.PyTreeRestore(restore_args=restore_args)
+    )
 
 
 def _normalizer_from_checkpoint(data: dict[str, Array]) -> NormalizerState:
