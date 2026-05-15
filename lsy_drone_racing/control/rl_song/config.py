@@ -130,17 +130,41 @@ class RewardConfig:
     # near gate 0 rather than commit to a pass. Reverted to 10.0; next
     # ablation (v14) is progress clipping or progress-once accounting, not
     # another coefficient bump.
-    progress_coef: float = 10.0
-    omega_coef: float = 0.02
-    # Crash penalty was 10.0; reduced because the original ratio of -10 crash
-    # to ~+0.003 per-step progress collapsed the policy to a safe hover.
-    crash_penalty: float = 5.0
+    # v15: down to 1.0 to match Song 2023 Sci. Robotics §V exactly. Their
+    # progress term has unit coefficient; integrated over a ~10 m level-0
+    # track that lands at ~+10, comparable to a +10 finish bonus. Our v9-v14
+    # progress_coef of 10 with finish_bonus 100 was internally consistent at
+    # the same ratio, but the 10x absolute magnitude pushed PPO advantage
+    # variance into ranges where the clip range becomes non-binding —
+    # rescaling back to Song's absolute scale keeps the optimizer in the
+    # regime the paper validated.
+    progress_coef: float = 1.0
+    # v15: down to 0.01 to match Song 2023's exact body-rate coefficient.
+    # The 0.02 value here was justified earlier as the 50 Hz analogue of
+    # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
+    # control frequency and the 100 Hz figure was a misreading. Reverting
+    # to the verbatim paper value.
+    omega_coef: float = 0.01
+    # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0. The earlier
+    # reduction to 5.0 was motivated by "policy collapsed to safe hover under
+    # -10 crash vs ~+0.003 per-step progress"; that ratio assumed
+    # progress_coef = 1 with old scale, but our v9-v14 had progress_coef = 10
+    # which made the relative crash penalty 5x smaller than Song's intent.
+    # With v15's progress_coef back to 1.0, restoring crash to -10 gives
+    # the same balance Song used.
+    crash_penalty: float = 10.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
     # Putting the load-bearing reward on race completion makes finishing
     # dominant by an order of magnitude under any realistic episode horizon.
-    finish_bonus: float = 100.0
+    # v15: 100 -> 10 to match Song 2023 r_finish = +10. The v9 motivation
+    # (finish must dominate the gate-jackpot) is moot now that
+    # gate_pass_bonus = 0. Song's r_finish ≈ integrated r_prog over a
+    # successful lap, which is a deliberate design — the policy should
+    # treat each per-step progress contribution as carrying equal weight
+    # to the finish event.
+    finish_bonus: float = 10.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     obstacle_weight: float = 0.5
     obstacle_sigma: float = 0.2  # m
@@ -183,7 +207,12 @@ class RewardConfig:
     # 0.02 × 1500-step truncation = -30, which strictly dominates the
     # crash_penalty of -5, restoring the property that any committed
     # attempt beats indefinite hovering.
-    time_penalty: float = 0.02
+    # v15: back to 0.0. Sim eval of v14 on level 0 showed the per-step time
+    # penalty made the policy retreat *further* from the gate (escape the
+    # r_guid field faster) rather than commit. With r_guid also disabled
+    # in v15 there is no negative-shaping zone to escape, so the time
+    # penalty's role disappears. Song 2023 has no per-step time penalty.
+    time_penalty: float = 0.0
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -196,7 +225,18 @@ class RewardConfig:
     # eq. 6-7). Front-side shaping attracts the policy to the aperture
     # centerline, while back-side shaping penalizes off-axis wrong-side
     # approaches that symmetric r_prog cannot distinguish.
-    use_guide: bool = True
+    # v15: disabled. Kaufmann 2023 Nature ("Swift") has no guidance reward
+    # term — their working recipe is r_prog + r_perception + r_command -
+    # r_crash. Song 2023 Sci. Robotics also drops it (their reward is just
+    # gate progress, body-rate penalty, sparse crash and finish). Song 2021
+    # IROS introduced the safety reward as an *optional* component "designed
+    # to reduce the risk of crashing in training settings that feature large
+    # track changes" and explicitly does not need it for basic racing. Liu
+    # 2024 extends it for rectangular gates and adds the wrong-side penalty.
+    # Our v10-v14 application has not been load-bearing for the level-0
+    # cold-start task — see the 2026-05-15 v15 handoff. Reverting to the
+    # Song/Kaufmann minimum.
+    use_guide: bool = False
     # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
     # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
     # r_guid over a perfectly centered pass is approximately guide_coef,
