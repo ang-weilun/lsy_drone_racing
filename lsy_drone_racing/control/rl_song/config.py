@@ -84,7 +84,25 @@ class PPOConfig:
     # to forward motion. Halving keeps exploration active early but lets the
     # progress signal dominate once gates are crossed.
     ent_coef: float = 0.005
-    ent_coef_final: float = 0.0
+    # v22 (level-3 ablation): 0.0 -> 0.001. v21cold on level 3 (300M)
+    # plateaued at ``max_gate ≈ 0.8`` from step 200M onward while
+    # ``finish_rate`` kept climbing — divergence diagnostic for a
+    # narrow "lucky-zone" policy: the policy refined a single approach
+    # that wins when gate 1 lands in a small region of the safety-
+    # limits sample space but cannot generalize across the full
+    # randomized layout. The level-3 task fundamentally requires
+    # reading the gate-position obs and routing accordingly; a fully-
+    # committed policy (entropy → 0) cannot keep searching for that.
+    # A small non-zero floor preserves exploration noise across the
+    # whole run so the policy keeps probing alternative trajectories.
+    # v5 (an old experiment) tried 0.001 with the v3 entropy schedule
+    # and stayed at entropy +15.9 — but that was paired with
+    # ent_coef=0.01 (initial), so the floor's static contribution was
+    # 10× higher. At our ent_coef=0.005 initial the 0.001 floor is
+    # 20% of the starting bonus instead of v5's 10%, but the new role
+    # is to prevent late-stage over-commitment rather than to drive
+    # early exploration.
+    ent_coef_final: float = 0.001
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
