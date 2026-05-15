@@ -116,17 +116,17 @@ def step_reward(
         jnp.zeros_like(r_prog),
     )
 
-    # v12: Liu eqs. 6-7 gate guidance in the target gate's local frame.
-    # Sign convention (corrected from v10/v11):
-    #   front (x>0): ATTRACTIVE — positive reward peaks on-axis (y=z=0) at the
-    #     gate plane and decays with the Gaussian aperture envelope. Pulls the
-    #     policy onto the centerline approach. Reinforces, rather than fights,
-    #     r_prog (which is also maximized on the radial approach line).
-    #   back  (x<0): REPULSIVE — negative reward peaks off-axis, penalizing
-    #     wrong-side flyarounds that symmetric r_prog cannot distinguish. On-axis
-    #     on the back side (immediately post-pass) is neutral.
-    # The v10 implementation flipped the front sign, accidentally creating a
-    # repulsive on-axis potential that fought r_prog at low approach speeds.
+    # v13A: revert to v10/v11 sign convention. Both fields are applied as
+    # *penalties* (r_guid is non-positive). On-axis on the front is the
+    # most-penalized state, which is now understood not as "attractive
+    # centerline" (the v10 comment claim) but as a localized loiter
+    # penalty: sitting on the approach line bleeds reward, so the policy
+    # is forced to either pass through fast or move away. v12's flipped
+    # sign turned the field into a harvestable static reward and produced
+    # a hover-on-approach attractor (max_gate dropped from 1.16 to 0.88,
+    # entropy rose from 2.75 to 3.78). Δ-potential shaping is the next
+    # iteration (v13B / v14); this v13A run isolates the sign decision
+    # from the progress_coef=20 bump.
     rot_gw = _quat_to_matrix(gate_quat)
     pos_local = jnp.einsum("nji,nj->ni", rot_gw, pos - gate_pos)
     x, y, z = pos_local[..., 0], pos_local[..., 1], pos_local[..., 2]
@@ -142,8 +142,8 @@ def step_reward(
     )
     guide_front = reward_cfg.guide_k1 * jnp.exp(-yz_sq / (2.0 * guide_spread))
     guide_back = 1.0 - jnp.exp(-yz_sq / (2.0 * guide_spread))
-    guide_signed = jnp.where(x > 0.0, guide_front, -guide_back)
-    r_guid_raw = reward_cfg.guide_coef * jnp.square(guide_window) * guide_signed
+    guide_field = jnp.where(x > 0.0, guide_front, guide_back)
+    r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
     r_guid = jnp.where(
         jnp.asarray(reward_cfg.use_guide, dtype=bool),
         r_guid_raw,
