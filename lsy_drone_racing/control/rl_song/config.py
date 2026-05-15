@@ -155,7 +155,16 @@ class RewardConfig:
     # integrated r_prog by 5–10x, pushing PPO toward the "do nothing"
     # local optimum. v11/v14 used 5.0 with progress_coef = 10, which is
     # the balance that produced 21% biased finish in v11. Reverting.
-    crash_penalty: float = 5.0
+    # v19: 5.0 -> 15.0. Pairs with the v19 reintroduction of
+    # time_penalty=0.05 (see block below). With time_penalty=0.05 the
+    # 500-step do-nothing baseline is r_prog - time = +18 - 25 = -7
+    # per episode, which makes any crash that pays less than -7 prefer-
+    # able to surviving — i.e. the policy can escape do-nothing by
+    # suicide instead of by exploring. Raising crash_penalty to 15
+    # makes any crash strictly worse than do-nothing (-15 < -7) so the
+    # only direction of escape from the attractor is forward through a
+    # gate (+20 jackpot dominates by 30+).
+    crash_penalty: float = 15.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
@@ -237,7 +246,22 @@ class RewardConfig:
     # r_guid field faster) rather than commit. With r_guid also disabled
     # in v15 there is no negative-shaping zone to escape, so the time
     # penalty's role disappears. Song 2023 has no per-step time penalty.
-    time_penalty: float = 0.0
+    # v19: 0.0 -> 0.05. v18 with per-gate jackpot still collapsed to
+    # do-nothing (finish_rate=0, max_gate=0, r_gate_bonus=0 over 842
+    # episodes at 100M) because the cold-start ep_ret was +14.13 — a
+    # net-positive attractor with no escape pressure. r_prog contributed
+    # ~+0.036/step ≈ +18 per 500-step episode, so any time_penalty must
+    # exceed 0.036/step to make do-nothing net negative. 0.05/step
+    # crosses that threshold cleanly: per-episode budget is -25, which
+    # combined with +18 r_prog gives a -7 do-nothing baseline. Paired
+    # with crash_penalty=15 (above) and gate_pass_bonus=20 scaled, the
+    # full incentive table is: crash any time <= -15; do nothing -7;
+    # pass gate 1 at step 100 +33; finish +293. v14's regression was
+    # caused by time_penalty interacting with the static r_guid field
+    # (policy escaped the r_guid window faster); with use_guide=False
+    # in v17/v18/v19 there is no field to escape, so this failure mode
+    # does not apply.
+    time_penalty: float = 0.05
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
