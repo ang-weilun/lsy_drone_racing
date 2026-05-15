@@ -41,9 +41,13 @@ assert ACTOR_OBS_DIM == 59, "Actor obs layout drifted from design doc §6"
 class PPOConfig:
     """PPO hyperparameters.
 
-    Defaults follow Song 2023 with corrections for the 50 Hz control rate (see
-    design doc §8). The ``gamma=0.98`` value gives a ~1 s effective horizon at
-    50 Hz, matching Song's ``gamma=0.99`` at 100 Hz.
+    Defaults follow Song 2023 with corrections for the 50 Hz control rate
+    (see design doc §8). ``gamma=0.997`` gives a ~6.9 s effective horizon at
+    50 Hz so that the load-bearing terminal reward (``finish_bonus=100``,
+    paid at the end of multi-second episodes) actually back-propagates
+    through the trajectory; ``gamma=0.98`` (Song's per-step rate match)
+    underweights the finish signal severely and was a v9 regression that
+    silently snuck into the v10 ablations via the committed default.
     """
 
     n_envs: int = 4096
@@ -60,7 +64,7 @@ class PPOConfig:
     n_minibatches: int = 50  # batch_size / minibatch_size = 409600 / 8192
     minibatch_size: int = 8192
     update_epochs: int = 5
-    gamma: float = 0.98
+    gamma: float = 0.997
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
     # Initial entropy bonus. The v3 1e8-step run with constant ent_coef=0.01
@@ -138,8 +142,11 @@ class RewardConfig:
     # progress as the primary signal with only a small per-gate event marker;
     # external review of the v8 results flagged the 20-80 jackpot as the
     # proximate cause of the "rush through gate 2 then crash" local optimum.
-    gate_pass_bonus: float = 2.0
-    use_gate_pass_bonus: bool = True
+    # v11: disable. Neither Song 2023 nor Liu use a per-gate event bonus.
+    # The dense progress reward + finish_bonus under high gamma should
+    # cover gate transitions without an explicit discrete payoff.
+    gate_pass_bonus: float = 0.0
+    use_gate_pass_bonus: bool = False
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
     # jackpot. The dense progress reward already pulls the policy through
@@ -153,7 +160,13 @@ class RewardConfig:
     # 0.05 × 500 = -25, so any episode that reaches even one gate (+20 jackpot)
     # strictly dominates. Philosophy-aligned with Song 2023's "minimize lap
     # time" objective without changing the reward terms they use.
-    time_penalty: float = 0.05
+    # v11: disable. Neither Song 2023 nor Liu use a per-step time penalty.
+    # The v8 motivation (escape hover Q=0 attractor on randomized stages)
+    # is now subsumed by gamma=0.997 + seg-init + Liu guidance, all of
+    # which give the hover policy a strictly negative Q. Time penalty also
+    # had a known downside: it priced "crash trying" cheaper than "hover
+    # safely" (-5 vs -25), inflating crash rate on early-stage runs.
+    time_penalty: float = 0.0
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -249,33 +262,46 @@ class CurriculumConfig:
 
 
 def default_curriculum() -> CurriculumConfig:
-    """Return the curriculum.
+    """Return the active curriculum.
+
+    v11: stripped to a single stage — ``level2_seginit`` — while we ablate
+    the v10 reward (Liu guidance, no time penalty, no gate jackpot, gamma
+    0.997) directly on a fixed nominal level-2 layout with ±0.15 m wobble
+    and Song §III-B Phase 1 seg-init. Promotion is disabled
+    (``promote_target_gate_mean=inf``) so this is effectively a no-op
+    curriculum. The legacy stage1/2/3a/b/c/4 progression is preserved in
+    :func:`_full_curriculum` and can be reinstated by swapping the body
+    of this function back.
+    """
+    pi_over_4 = 0.7853981633974483
+    return CurriculumConfig(
+        stages=(
+            CurriculumStage(
+                name="level2_seginit",
+                level=2,
+                use_domain_randomization=False,
+                reset_pos_perturb_m=0.2,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=1.00,
+                segment_init_prob=0.5,
+                promote_target_gate_mean=float("inf"),
+                promote_crash_rate_max=0.3,
+            ),
+        )
+    )
+
+
+def _full_curriculum() -> CurriculumConfig:
+    """Legacy seven-stage curriculum (v9/v10) preserved for reinstatement.
 
     Layout
     ------
-    Stages 1-2 are legacy fixed-track stages, kept for reproducibility but
-    no longer used as the canonical entry point. The level-3 (track
-    randomization) work is split across three v8 sub-stages with progressively
-    larger gate/obstacle randomization scale, replacing the single
-    ``stage3_level3_no_dr`` that route-memorizing warm-starts kept failing on:
-
-    * ``stage3a`` (idx 2, ``gate_rand_scale=0.20``): nearly-fixed track
-      (≈±0.03 m on gate_pos), where a randomly-initialized policy can
-      reliably stumble onto gate 1 within feasible compute and the
-      gate-pass reward starts driving credit assignment.
-    * ``stage3b`` (idx 3, ``gate_rand_scale=0.50``): half-randomization,
-      teaches generalization away from the nominal position before the
-      full level-3 budget.
-    * ``stage3c`` (idx 4, ``gate_rand_scale=1.00``): full level-3
-      randomization (±0.15 m). This is the actual deployment-matching
-      stage; everything before is just curriculum.
-
-    The terminal ``stage4_level3_dr`` (idx 5, full DR) is unchanged.
-
-    Returns
-    -------
-    CurriculumConfig
-        Six-stage curriculum (legacy 1-2, new 3a/b/c, terminal 4).
+    Stages 1-2 are fixed-track level-1 stages. Stage3a/b/c sub-stages of
+    level-3 with progressively larger gate/obstacle randomization scale.
+    The terminal ``stage4_level3_dr`` adds full DR. ``level2_seginit``
+    is the v11 single-stage experiment, kept here so the indices match
+    what was used in committed runs.
     """
     pi_over_4 = 0.7853981633974483
     return CurriculumConfig(
@@ -307,13 +333,6 @@ def default_curriculum() -> CurriculumConfig:
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=0.20,
                 segment_init_prob=0.5,
-                # Lowered from 2.5 → 1.8 after the v8 layer-2-fix from-scratch
-                # run plateaued at target_gate ~0.95 / max_gate ~1.45 (reaches
-                # gate 2 on ~45% of episodes) without promoting. 2.5 was the
-                # original 3-gates-passed target; with the policy already
-                # consistently clearing gate 1 and reaching gate 2, promoting
-                # to the harder stage 3b (scale 0.50) should force more
-                # cautious flying and break the fast-but-crashy local optimum.
                 promote_target_gate_mean=1.8,
                 promote_crash_rate_max=0.3,
             ),
@@ -338,8 +357,6 @@ def default_curriculum() -> CurriculumConfig:
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
                 segment_init_prob=0.5,
-                # Stage 3 deployment target — do not auto-promote into stage 4
-                # (DR) during this experiment.
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
@@ -351,11 +368,8 @@ def default_curriculum() -> CurriculumConfig:
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
-                promote_target_gate_mean=float("inf"),  # terminal stage
+                promote_target_gate_mean=float("inf"),
             ),
-            # v10 experiment: fixed nominal layout + level-2 wobble + seg-init.
-            # Stepping stone between level-1 stages and stage3a; isolates
-            # gate-position robustness from the level-3 layout-regen variance.
             CurriculumStage(
                 name="level2_seginit",
                 level=2,
@@ -365,7 +379,7 @@ def default_curriculum() -> CurriculumConfig:
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
                 segment_init_prob=0.5,
-                promote_target_gate_mean=float("inf"),  # single-stage experiment
+                promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
         )
