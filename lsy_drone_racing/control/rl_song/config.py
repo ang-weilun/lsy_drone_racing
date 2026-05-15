@@ -167,7 +167,7 @@ class RewardConfig:
     # centerline, while back-side shaping penalizes off-axis wrong-side
     # approaches that symmetric r_prog cannot distinguish.
     use_guide: bool = True
-    guide_coef: float = 0.05
+    guide_coef: float = 0.15
     guide_k0: float = 1.5
     guide_k1: float = 1.0
     guide_k2: float = 0.3
