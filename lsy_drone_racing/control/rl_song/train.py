@@ -453,7 +453,7 @@ def _rollout_static_config(env: RLSongVecEnv, ppo_cfg: PPOConfig) -> RolloutStat
         reset_pos_perturb_m=env.stage.reset_pos_perturb_m,
         reset_vel_perturb_mps=env.stage.reset_vel_perturb_mps,
         reset_yaw_perturb_rad=env.stage.reset_yaw_perturb_rad,
-        track_perturbation_enabled=(env.stage.level == 3),
+        track_perturbation_enabled=(env.stage.level in (2, 3)),
         gate_pos_perturb_max=gate_pos_max,
         obstacle_pos_perturb_max=obstacle_pos_max,
         segment_init_prob=env.stage.segment_init_prob,

@@ -261,10 +261,10 @@ class RLSongVecEnv:
 
         Mirrors ``rollout._patch_env_obs_with_placed`` for the eager path.
         See that helper for the motivation; this version short-circuits when
-        ``stage.level != 3`` (i.e., when ``track_perturbation_enabled``
-        is False and the framework's nominal fields are already informative).
+        the stage applies no wrapper-side wobble (level 1) and the framework's
+        nominal fields are already informative.
         """
-        if self.stage.level != 3:
+        if self.stage.level not in (2, 3):
             return env_obs
         if (
             self.placed_gates_pos is None
@@ -414,10 +414,11 @@ class RLSongVecEnv:
     ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
         """Return per-axis gate-pos and obstacle-pos perturbation half-widths.
 
-        Returns ``((0, 0, 0), (0, 0, 0))`` outside level 3. Otherwise returns
-        the level-3 toml bounds scaled by ``stage.gate_rand_scale``.
+        Returns ``((0, 0, 0), (0, 0, 0))`` on level 1. Otherwise returns the
+        level-2/3 toml bounds (identical: ``[0.15, 0.15, 0.10]`` for gates,
+        ``[0.15, 0.15, 0.05]`` for obstacles) scaled by ``stage.gate_rand_scale``.
         """
-        if stage.level != 3:
+        if stage.level not in (2, 3):
             zero: tuple[float, float, float] = (0.0, 0.0, 0.0)
             return zero, zero
         scale = float(stage.gate_rand_scale)
@@ -586,7 +587,7 @@ class RLSongVecEnv:
         """
         if self.env is None:
             raise RuntimeError("Env is not constructed.")
-        if self.stage.level != 3:
+        if self.stage.level not in (2, 3):
             return
         mask = jnp.asarray(mask, dtype=bool)
         if not bool(np.asarray(jnp.any(mask))):

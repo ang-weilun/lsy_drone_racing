@@ -353,6 +353,21 @@ def default_curriculum() -> CurriculumConfig:
                 gate_rand_scale=1.00,
                 promote_target_gate_mean=float("inf"),  # terminal stage
             ),
+            # v10 experiment: fixed nominal layout + level-2 wobble + seg-init.
+            # Stepping stone between level-1 stages and stage3a; isolates
+            # gate-position robustness from the level-3 layout-regen variance.
+            CurriculumStage(
+                name="level2_seginit",
+                level=2,
+                use_domain_randomization=False,
+                reset_pos_perturb_m=0.2,
+                reset_vel_perturb_mps=0.0,
+                reset_yaw_perturb_rad=pi_over_4,
+                gate_rand_scale=1.00,
+                segment_init_prob=0.5,
+                promote_target_gate_mean=float("inf"),  # single-stage experiment
+                promote_crash_rate_max=0.3,
+            ),
         )
     )
 
