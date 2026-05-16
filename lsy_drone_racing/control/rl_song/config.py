@@ -366,7 +366,19 @@ class RewardConfig:
     # different ΔΦ shaping that lacks the v11/v14 back-side loiter
     # penalty). The back-side penalty also scales, so any policy that
     # tries to harvest progress by orbiting behind the gate pays more.
-    guide_coef: float = 0.5
+    # v23: 0.5 -> 1.5. v22's ent_coef_final floor result ruled out
+    # over-commitment as the level-3 plateau cause (max_gate=0.80 with
+    # ent_floor=0.001 was identical to v21cold's max_gate=0.80 with no
+    # floor). Going by per-step magnitude at the level-3 worst-case
+    # spawn-to-gate distance (~2.24 m), v22's r_guid was -0.05/step on-
+    # axis at ground height — ~5% of r_prog at speed, effectively
+    # invisible. Bumping 3x lifts that to -0.16/step (~15% of r_prog),
+    # comparable to where it sat on level 2 at typical approach
+    # distances. The exit-side loiter penalty also scales 3x, which is
+    # the v11-era pathology risk to watch in this run; we'll see it in
+    # ep_len if the policy starts fleeing the gate plane laterally on
+    # exit.
+    guide_coef: float = 1.5
     # v14: widened 1.5 -> 3.0. The level-0 spawn at world (-1.5, 0.75, 0.01)
     # is ~2.1 m from gate 1 in gate-frame x, so at k0=1.5 the policy gets
     # zero r_guid signal until it has already walked itself most of the
@@ -374,7 +386,16 @@ class RewardConfig:
     # ``guide_window**2`` ≈ 0.09 — small but non-zero gradient from step 1.
     # Combined with time_penalty=0.02 this should remove the neutral-zone
     # parking attractor that v11 found.
-    guide_k0: float = 3.0
+    # v23: widened 3.0 -> 5.0. Level-3 with full track-regen places gate 0
+    # anywhere in a 4x2 m grid (config/level3.toml + envs/randomize.py
+    # build_random_track_fn, border_margin=0.5). Worst-case drone-to-
+    # gate distance in gate-frame x is ~2.24 m — already inside the
+    # k0=3.0 window, but only with guide_window**2 ≈ 0.06, so the
+    # gradient is technically present but weak even on-axis. Widening
+    # to 5.0 lifts guide_window**2 to ~0.32 at the same point, ~5x more
+    # gradient through the spawn region, without changing the field at
+    # the gate plane itself.
+    guide_k0: float = 5.0
     guide_k1: float = 1.0
     guide_k2: float = 0.3
     # v13B: Δ-potential gate guidance. When True, r_guid is computed as
