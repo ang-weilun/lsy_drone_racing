@@ -201,17 +201,64 @@ class Phase2Buffer(NamedTuple):
     fill: Array
 
 
-# State-tuple layout for ``Phase2Buffer.data`` entries. The layout is
-# (pos_local, vel_local, quat_local, ang_vel, prev_action, obstacles_visited),
-# so ``state_dim = 17 + n_obstacles``. Used by both the write path
-# (concatenate into event tensor) and the read path (slice into named
-# components).
-PHASE2_STATE_FIXED_DIM: int = 3 + 3 + 4 + 3 + 4  # = 17
+# State-tuple layout for ``Phase2Buffer.data`` entries (v31 layout-restoring).
+# Each entry packs the absolute drone state plus the full layout the
+# state came from, so replay can override BOTH the drone state and the
+# env's layout fields to make the respawn geometrically self-consistent
+# with what the drone observes (the v30 gate-frame transform was warped
+# by independently-randomized next-gate positions; v31 sidesteps that
+# by replaying into the *same* layout that generated the entry).
+#
+# Slice layout (with n_g = n_gates, n_o = n_obstacles), see helper
+# :func:`_phase2_offsets`:
+#
+#   [0:3]                  pos_world (absolute)
+#   [3:6]                  vel_world
+#   [6:10]                 quat_world (xyzw)
+#   [10:13]                ang_vel (body frame)
+#   [13:17]                prev_action (env-action 4-vec)
+#   [17 : 17+n_o]          obstacles_visited (bool stored as float)
+#   gates_pos        (Layer-2 post-wobble),  3 * n_g floats
+#   gates_quat       (no wobble; shared),    4 * n_g floats
+#   obstacles_pos    (Layer-2 post-wobble),  3 * n_o floats
+#   placed_gates_pos (Layer-1 pre-wobble),   3 * n_g floats
+#   placed_obstacles_pos (Layer-1),          3 * n_o floats
+#
+# Total = PHASE2_DRONE_DIM + 7 * n_obstacles + 10 * n_gates.
+PHASE2_DRONE_DIM: int = 3 + 3 + 4 + 3 + 4  # pos, vel, quat, ang_vel, prev_action = 17
 
 
-def phase2_state_dim(n_obstacles: int) -> int:
-    """Return the per-entry state dim of a Phase 2 buffer at this n_obs."""
-    return PHASE2_STATE_FIXED_DIM + n_obstacles
+def phase2_state_dim(n_obstacles: int, n_gates: int) -> int:
+    """Return the per-entry state dim of a v31 layout-restoring Phase 2 buffer."""
+    return (
+        PHASE2_DRONE_DIM
+        + n_obstacles  # obstacles_visited
+        + 3 * n_gates  # gates_pos (Layer-2)
+        + 4 * n_gates  # gates_quat (no wobble; shared with placed)
+        + 3 * n_obstacles  # obstacles_pos (Layer-2)
+        + 3 * n_gates  # placed_gates_pos (Layer-1)
+        + 3 * n_obstacles  # placed_obstacles_pos (Layer-1)
+    )
+
+
+def _phase2_offsets(n_obstacles: int, n_gates: int) -> dict[str, int]:
+    """Return start offsets per field for the Phase 2 entry layout."""
+    offs = {"pos": 0, "vel": 3, "quat": 6, "ang_vel": 10, "prev_action": 13}
+    cursor = PHASE2_DRONE_DIM
+    offs["obstacles_visited"] = cursor
+    cursor += n_obstacles
+    offs["gates_pos"] = cursor
+    cursor += 3 * n_gates
+    offs["gates_quat"] = cursor
+    cursor += 4 * n_gates
+    offs["obstacles_pos"] = cursor
+    cursor += 3 * n_obstacles
+    offs["placed_gates_pos"] = cursor
+    cursor += 3 * n_gates
+    offs["placed_obstacles_pos"] = cursor
+    cursor += 3 * n_obstacles
+    offs["_end"] = cursor
+    return offs
 
 
 def empty_phase2_buffer(n_gates: int, capacity: int, state_dim: int) -> Phase2Buffer:
@@ -688,6 +735,8 @@ def scan_rollout(
             stepped_data=stepped_data,
             next_env_obs=next_env_obs,
             env_action=env_action,
+            placed_gates_pos=carry.placed_gates_pos,
+            placed_obstacles_pos=carry.placed_obstacles_pos,
             current_target=current_target,
             gate_just_passed=gate_just_passed,
             done_bool=done_bool,
@@ -975,9 +1024,26 @@ def _apply_reset_perturbation(
     # be a strict subset of ``do_phase2_desired`` if the buffer has no
     # non-empty slots yet (the envs that wanted replay fall back to
     # true-start, not to Phase 1, to keep the categorical interpretable).
+    # v31: replay also restores the layout the entry came from, returning
+    # updated placed_* snapshots that the caller threads back into the
+    # carry.
     if static_cfg.phase2_prob > 0.0:
-        env_data, rng_key, do_phase2, replay_prev_action = _apply_phase2_replay(
-            env_data, do_phase2_desired, rng_key, phase2_buffer
+        (
+            env_data,
+            rng_key,
+            do_phase2,
+            replay_prev_action,
+            placed_gates_pos,
+            placed_gates_quat,
+            placed_obstacles_pos,
+        ) = _apply_phase2_replay(
+            env_data,
+            do_phase2_desired,
+            rng_key,
+            phase2_buffer,
+            placed_gates_pos,
+            placed_gates_quat,
+            placed_obstacles_pos,
         )
     else:
         do_phase2 = jnp.zeros_like(mask, dtype=jnp.bool_)
@@ -1004,41 +1070,53 @@ def _apply_reset_perturbation(
 
 
 def _apply_phase2_replay(
-    env_data: EnvData, do_phase2_desired: Array, rng_key: Array, buffer: Phase2Buffer
-) -> tuple[EnvData, Array, Array, Array]:
+    env_data: EnvData,
+    do_phase2_desired: Array,
+    rng_key: Array,
+    buffer: Phase2Buffer,
+    placed_gates_pos: Array,
+    placed_gates_quat: Array,
+    placed_obstacles_pos: Array,
+) -> tuple[EnvData, Array, Array, Array, Array, Array, Array]:
     """Re-spawn selected envs from the Phase 2 successful-state buffer.
 
-    Samples one buffer entry per env in ``do_phase2_desired``:
+    v31 layout-restoring design: each buffer entry packs the absolute
+    drone state AND the full layout (Layer-1 placed + Layer-2 wobbled)
+    the state came from. On replay we override BOTH the drone state and
+    the env layout so the respawn is geometrically self-consistent with
+    everything the actor observes.
 
-    1. Pick a slot ``g`` uniformly over non-empty slots (excluding the
-       unused slot 0). If every slot is empty, the effective mask
-       collapses to all-False and no override happens — the caller's
-       categorical leaves these envs at true-start.
-    2. Pick an entry index uniformly in ``[0, fill[g])``.
-    3. Read the stored gate-frame state and reconstruct world-frame
-       quantities against the current layout's gate ``g - 1`` pose.
-    4. Override ``sim_data.states.pos / vel / quat / ang_vel`` and
-       ``target_gate`` for the selected envs; refresh aux fields via
+    Steps per replayed env:
+    1. Sample a slot ``g`` uniformly over non-empty slots (slot 0 is
+       unused). If every slot is empty, the effective mask is all-False
+       and the caller's categorical leaves these envs at true-start.
+    2. Sample an entry index uniformly in ``[0, fill[g])``.
+    3. Unpack the absolute drone state and stored layout from the entry.
+    4. Override ``sim_data.states.pos / vel / quat / ang_vel``,
+       ``target_gate``, and ``env_data.gates_pos / gates_quat /
+       obstacles_pos`` for the selected envs; refresh aux fields via
        :func:`_refresh_aux_fields_after_respawn`.
 
     Returns
     -------
     env_data : EnvData
-        Env state with the Phase 2 overrides applied.
+        Env state with the Phase 2 overrides (drone state + layout) applied.
     rng_key : Array
         Advanced PRNG key.
     do_phase2_effective : Array, shape (n_envs,), bool
-        Mask of envs whose state was actually replaced (== desired mask
-        when at least one slot is non-empty; all-False otherwise).
+        Mask of envs whose state was actually replaced.
     replay_prev_action : Array, shape (n_envs, ENV_ACTION_DIM), float32
-        Per-env env-action 4-vec from the replayed buffer entry. Used
-        by the caller to override ``prev_action_env_4vec`` for the
-        replayed envs so the policy's autoregressive input matches the
-        replayed state.
+        Per-env env-action 4-vec from the replayed entry. Caller uses
+        it to override ``prev_action_env_4vec`` so the policy's
+        autoregressive input matches the replayed state.
+    placed_gates_pos, placed_gates_quat, placed_obstacles_pos : Array
+        Updated Layer-1 placement snapshots (replayed envs get the
+        stored Layer-1; non-replayed envs keep what was passed in).
     """
     n_envs = env_data.gates_pos.shape[0]
     n_gates = env_data.gates_pos.shape[1]
     n_obstacles = env_data.obstacles_pos.shape[1]
+    offs = _phase2_offsets(n_obstacles, n_gates)
 
     rng_key, slot_key, idx_key = jax.random.split(rng_key, 3)
 
@@ -1062,34 +1140,41 @@ def _apply_phase2_replay(
     )
     entry = buffer.data[g_safe, entry_idx]  # (n_envs, state_dim)
 
-    # Unpack the gate-frame state (matches _compute_phase2_event's layout).
-    pos_local = entry[..., 0:3]
-    vel_local = entry[..., 3:6]
-    quat_local = entry[..., 6:10]
-    ang_vel = entry[..., 10:13]
-    prev_action = entry[..., 13:17]
-    obstacles_visited_f = entry[..., 17 : 17 + n_obstacles]
-
-    # Reconstruct world-frame using current-layout previous gate.
-    env_arange = jnp.arange(n_envs)
-    prev_gate_idx = g_safe - 1
-    prev_gate_pos = env_data.gates_pos[env_arange, prev_gate_idx]
-    prev_gate_quat = env_data.gates_quat[env_arange, prev_gate_idx]
-    rot_prev = _quat_to_rotmat(prev_gate_quat)
-
-    pos_world = prev_gate_pos + jnp.einsum("nij,nj->ni", rot_prev, pos_local)
-    pos_world = jnp.clip(pos_world, env_data.pos_limit_low, env_data.pos_limit_high)
-    vel_world = jnp.einsum("nij,nj->ni", rot_prev, vel_local)
-    quat_world = _quat_multiply_xyzw(prev_gate_quat, quat_local)
+    # Unpack the absolute drone state + stored layout (matches
+    # ``_compute_phase2_event``'s concatenation order).
+    pos_world = entry[..., offs["pos"] : offs["pos"] + 3]
+    vel_world = entry[..., offs["vel"] : offs["vel"] + 3]
+    quat_world = entry[..., offs["quat"] : offs["quat"] + 4]
+    ang_vel = entry[..., offs["ang_vel"] : offs["ang_vel"] + 3]
+    prev_action = entry[..., offs["prev_action"] : offs["prev_action"] + 4]
+    obstacles_visited_f = entry[
+        ..., offs["obstacles_visited"] : offs["obstacles_visited"] + n_obstacles
+    ]
+    stored_gates_pos = entry[..., offs["gates_pos"] : offs["gates_pos"] + 3 * n_gates].reshape(
+        n_envs, n_gates, 3
+    )
+    stored_gates_quat = entry[..., offs["gates_quat"] : offs["gates_quat"] + 4 * n_gates].reshape(
+        n_envs, n_gates, 4
+    )
+    stored_obstacles_pos = entry[
+        ..., offs["obstacles_pos"] : offs["obstacles_pos"] + 3 * n_obstacles
+    ].reshape(n_envs, n_obstacles, 3)
+    stored_placed_gates_pos = entry[
+        ..., offs["placed_gates_pos"] : offs["placed_gates_pos"] + 3 * n_gates
+    ].reshape(n_envs, n_gates, 3)
+    stored_placed_obstacles_pos = entry[
+        ..., offs["placed_obstacles_pos"] : offs["placed_obstacles_pos"] + 3 * n_obstacles
+    ].reshape(n_envs, n_obstacles, 3)
 
     # Effective mask: desired AND buffer has at least one usable entry.
     do_phase2_effective = do_phase2_desired & any_sampleable
 
-    # Override env state for selected envs.
+    # Override env state (absolute coords — no rotmat math).
     mask_b3 = do_phase2_effective[:, None, None]
     states = env_data.sim_data.states
+    pos_world_clipped = jnp.clip(pos_world, env_data.pos_limit_low, env_data.pos_limit_high)
     new_states = states.replace(
-        pos=jnp.where(mask_b3, pos_world[:, None, :], states.pos),
+        pos=jnp.where(mask_b3, pos_world_clipped[:, None, :], states.pos),
         vel=jnp.where(mask_b3, vel_world[:, None, :], states.vel),
         quat=jnp.where(mask_b3, quat_world[:, None, :], states.quat),
         ang_vel=jnp.where(mask_b3, ang_vel[:, None, :], states.ang_vel),
@@ -1099,14 +1184,29 @@ def _apply_phase2_replay(
         g_safe[:, None].astype(env_data.target_gate.dtype),
         env_data.target_gate,
     )
-    sim_data = env_data.sim_data.replace(states=new_states)
-    env_data = env_data.replace(sim_data=sim_data, target_gate=new_target)
-    env_data = _refresh_aux_fields_after_respawn(env_data, do_phase2_effective, pos_world, g_safe)
 
-    # Override obstacles_visited with the stored entry (overrides the
-    # default-True fallback set by ``_refresh_aux_fields_after_respawn``
-    # — Phase 2 replay knows exactly which obstacles the original
-    # trajectory had observed, so use that rather than defaulting all).
+    # Override env layout for replayed envs. Both Layer-2 wobbled fields
+    # (env_data.{gates_pos,gates_quat,obstacles_pos}) and the carry's
+    # Layer-1 placed_* snapshots are restored so the actor obs (which
+    # mixes both layers via ``_patch_env_obs_with_placed``) sees the
+    # exact layout the entry came from.
+    new_gates_pos = jnp.where(mask_b3, stored_gates_pos, env_data.gates_pos)
+    new_gates_quat = jnp.where(mask_b3, stored_gates_quat, env_data.gates_quat)
+    new_obstacles_pos = jnp.where(mask_b3, stored_obstacles_pos, env_data.obstacles_pos)
+    sim_data = env_data.sim_data.replace(states=new_states)
+    env_data = env_data.replace(
+        sim_data=sim_data,
+        target_gate=new_target,
+        gates_pos=new_gates_pos,
+        gates_quat=new_gates_quat,
+        obstacles_pos=new_obstacles_pos,
+    )
+    env_data = _refresh_aux_fields_after_respawn(
+        env_data, do_phase2_effective, pos_world_clipped, g_safe
+    )
+
+    # Override obstacles_visited with the stored entry (the helper
+    # defaulted to all-True; v31 has the original visited mask available).
     replayed_obs_visited = obstacles_visited_f > 0.5
     new_obstacles_visited = jnp.where(
         do_phase2_effective[:, None, None],
@@ -1115,12 +1215,24 @@ def _apply_phase2_replay(
     )
     env_data = env_data.replace(obstacles_visited=new_obstacles_visited)
 
-    # Mask prev_action to zero for envs that did NOT replay (otherwise
-    # the gather above produced arbitrary bytes that we'd accidentally
-    # overwrite the caller's action with).
+    # Update Layer-1 placed_* snapshots so the carry stays consistent.
+    new_placed_gates_pos = jnp.where(mask_b3, stored_placed_gates_pos, placed_gates_pos)
+    new_placed_gates_quat = jnp.where(mask_b3, stored_gates_quat, placed_gates_quat)
+    new_placed_obstacles_pos = jnp.where(mask_b3, stored_placed_obstacles_pos, placed_obstacles_pos)
+
+    # Mask prev_action to zero for envs that did NOT replay (the gather
+    # produced arbitrary bytes for those lanes).
     replay_prev_action = jnp.where(do_phase2_effective[:, None], prev_action, 0.0)
 
-    return env_data, rng_key, do_phase2_effective, replay_prev_action
+    return (
+        env_data,
+        rng_key,
+        do_phase2_effective,
+        replay_prev_action,
+        new_placed_gates_pos,
+        new_placed_gates_quat,
+        new_placed_obstacles_pos,
+    )
 
 
 def _apply_segment_init(
@@ -1282,43 +1394,12 @@ def _refresh_aux_fields_after_respawn(
     )
 
 
-def _quat_conjugate(quat: Array) -> Array:
-    """Return the conjugate of an xyzw quaternion (== inverse for unit quats)."""
-    return quat * jnp.asarray([-1.0, -1.0, -1.0, 1.0], dtype=quat.dtype)
-
-
-def _quat_to_rotmat(quat: Array) -> Array:
-    """Return the active rotation matrix for an xyzw quaternion.
-
-    For a unit quaternion ``q`` and a vector ``v_local`` in the body
-    frame, the rotated vector in the world frame is ``R(q) @ v_local``.
-
-    Parameters
-    ----------
-    quat : Array, shape (..., 4)
-        xyzw quaternions (last axis = components). Need not be unit.
-
-    Returns
-    -------
-    Array, shape (..., 3, 3)
-    """
-    x = quat[..., 0]
-    y = quat[..., 1]
-    z = quat[..., 2]
-    w = quat[..., 3]
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-    row0 = jnp.stack([1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)], axis=-1)
-    row1 = jnp.stack([2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)], axis=-1)
-    row2 = jnp.stack([2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)], axis=-1)
-    return jnp.stack([row0, row1, row2], axis=-2)
-
-
 def _compute_phase2_event(
     stepped_data: EnvData,
     next_env_obs: dict[str, Array],
     env_action: Array,
+    placed_gates_pos: Array,
+    placed_obstacles_pos: Array,
     current_target: Array,
     gate_just_passed: Array,
     done_bool: Array,
@@ -1326,10 +1407,14 @@ def _compute_phase2_event(
 ) -> tuple[Array, Array, Array]:
     """Build per-env Phase 2 event tensors for one scan step.
 
-    For every env that just passed a gate (and meets the storage
-    filters), packs the post-step drone state into the per-gate buffer
-    state layout, expressed in the **previous gate's local frame** so
-    the entry is valid against later layouts (level-3 randomization).
+    For every env that just passed a gate (and meets the storage filters),
+    packs the post-step drone state (absolute world coords) and the
+    full layout the state came from (Layer-1 ``placed_*`` and Layer-2
+    wobbled ``env_data.*``) into the per-gate buffer state layout. The
+    layout-restoring design (v31) replaces v30's gate-frame transform:
+    on replay we restore the exact layout the entry came from, so the
+    drone state stays geometrically consistent with everything it
+    observes.
 
     Filters (codex): valid iff
     * ``gate_just_passed`` this step,
@@ -1349,29 +1434,36 @@ def _compute_phase2_event(
     """
     n_envs = stepped_data.gates_pos.shape[0]
     n_gates = stepped_data.gates_pos.shape[1]
-    env_arange = jnp.arange(n_envs)
-    # ``current_target`` is the gate now being approached, so the gate
-    # that was just passed is ``current_target - 1``. Clip the index so
-    # the gather is safe for envs where the filter mask will reject the
-    # event anyway (slot 0 or finished).
-    prev_idx = jnp.clip(current_target - 1, 0, n_gates - 1)
-    prev_gate_pos = stepped_data.gates_pos[env_arange, prev_idx]
-    prev_gate_quat = stepped_data.gates_quat[env_arange, prev_idx]
-    rot_prev_t = jnp.swapaxes(_quat_to_rotmat(prev_gate_quat), -1, -2)
 
     drone_pos = stepped_data.sim_data.states.pos[:, SINGLE_DRONE_INDEX]
     drone_vel = stepped_data.sim_data.states.vel[:, SINGLE_DRONE_INDEX]
     drone_quat = stepped_data.sim_data.states.quat[:, SINGLE_DRONE_INDEX]
     drone_ang_vel = stepped_data.sim_data.states.ang_vel[:, SINGLE_DRONE_INDEX]
 
-    pos_local = jnp.einsum("nij,nj->ni", rot_prev_t, drone_pos - prev_gate_pos)
-    vel_local = jnp.einsum("nij,nj->ni", rot_prev_t, drone_vel)
-    quat_local = _quat_multiply_xyzw(_quat_conjugate(prev_gate_quat), drone_quat)
-
     obstacles_visited = next_env_obs["obstacles_visited"].astype(jnp.float32)
+    # Flatten per-env layout arrays into 1-D state slots. The unflatten
+    # at replay (in ``_apply_phase2_replay``) reshapes them back.
+    gates_pos_flat = stepped_data.gates_pos.reshape(n_envs, -1)
+    gates_quat_flat = stepped_data.gates_quat.reshape(n_envs, -1)
+    obstacles_pos_flat = stepped_data.obstacles_pos.reshape(n_envs, -1)
+    placed_gates_pos_flat = placed_gates_pos.reshape(n_envs, -1)
+    placed_obstacles_pos_flat = placed_obstacles_pos.reshape(n_envs, -1)
 
     event_data = jnp.concatenate(
-        [pos_local, vel_local, quat_local, drone_ang_vel, env_action, obstacles_visited], axis=-1
+        [
+            drone_pos,
+            drone_vel,
+            drone_quat,
+            drone_ang_vel,
+            env_action,
+            obstacles_visited,
+            gates_pos_flat,
+            gates_quat_flat,
+            obstacles_pos_flat,
+            placed_gates_pos_flat,
+            placed_obstacles_pos_flat,
+        ],
+        axis=-1,
     )
     event_valid = (
         gate_just_passed

@@ -486,7 +486,7 @@ def _build_phase2_buffer(env: RLSongVecEnv, stage: Any) -> Phase2Buffer:
         raise RuntimeError("Cannot build Phase 2 buffer before env construction.")
     n_gates = int(env.env.data.gates_pos.shape[1])
     n_obstacles = int(env.env.data.obstacles_pos.shape[1])
-    state_dim = phase2_state_dim(n_obstacles)
+    state_dim = phase2_state_dim(n_obstacles, n_gates)
     return empty_phase2_buffer(n_gates, stage.phase2_capacity_per_gate, state_dim)
 
 

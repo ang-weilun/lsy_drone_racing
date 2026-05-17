@@ -571,20 +571,23 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v30: single level-3 stage with Phase 1 seg-init at
-    ``segment_init_prob=0.30`` (velocity-aware, 2.5 m/s) **plus** Song
-    §III-B Phase 2 successful-state replay at ``phase2_prob=0.30``
-    (warm-up ``phase2_warmup_steps=50e6`` lets the buffer populate
-    before any replay happens). Total per-reset partition: 40 % true
-    start, 30 % Phase 1, 30 % Phase 2 — keeps the true-start floor that
-    v29 lost when it pushed seg-init alone too hard.
+    v31: same mix as v30 (Phase 1 seg-init at ``segment_init_prob=0.30``
+    velocity-aware 2.5 m/s, **plus** Song §III-B Phase 2 successful-state
+    replay at ``phase2_prob=0.30``, warm-up ``phase2_warmup_steps=50e6``,
+    40 / 30 / 30 % per-reset partition), but with the **layout-restoring
+    Phase 2 buffer**: each entry stores the absolute drone state AND
+    the full layout (Layer-1 placed + Layer-2 wobbled) it came from. On
+    replay we override both the drone state and the env's layout so the
+    respawn is geometrically self-consistent with everything the actor
+    observes. Fixes v30's regression which used a per-gate-frame
+    transform that warped against the new layout's independently-
+    randomized next gate (drones learned to crash into gates and fly
+    slow). See ``project_v30_phase2_failed.md`` for the post-mortem.
 
-    Designed to **warm-start from v26**
-    (``level3_warmstart_seed0_v26_v25cont_300M``, the current best
-    level-3 controller with 1.625 gates/ep eval) so the takeoff skill
-    survives the curriculum change. Use ``--init-from`` to load v26's
-    actor / critic / normalizer; the optimizer schedule restarts
-    fresh.
+    Warm-start from v26
+    (``level3_warmstart_seed0_v26_v25cont_300M``, current best level-3
+    controller with 1.625 gates/ep eval) via ``--init-from``; actor /
+    critic / normalizer are loaded, optimizer schedule restarts fresh.
 
     v29 (history note): single level-3 stage with full distribution
     (``gate_rand_scale=1.0``), Song §III-B seg-init at
@@ -639,7 +642,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v30_phase2",
+                name="level3_v31_layout_replay",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
