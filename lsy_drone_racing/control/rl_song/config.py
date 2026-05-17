@@ -113,7 +113,19 @@ class PPOConfig:
     # schedule annealed it down further. Keeping ent_coef constant
     # at 0.005 throughout v25 keeps that level of exploration alive
     # the whole way, blocking the lucky-zone collapse path.
-    ent_coef_final: float = 0.005
+    # v29: 0.005 -> 0.001 (revert to v22-era floor). v28 with the
+    # constant 0.005 schedule produced a runaway entropy (+13.34 final),
+    # which dissolved commitment pressure on the new r_exit_vel reward
+    # — the term stayed at -0.0044 throughout training instead of
+    # being driven toward zero/positive. v29 reintroduces seg-init
+    # with velocity (so lucky-zone collapse via "spawned hovering"
+    # is structurally blocked) and pairs it with the lower entropy
+    # floor so the policy actually commits to using the seg-init
+    # exposure and the exit_vel signal. The finish_rate_true_start
+    # metric (added in the same commit as velocity seg-init) is the
+    # unbiased indicator that exposes a lucky-zone collapse if it
+    # still happens.
+    ent_coef_final: float = 0.001
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
@@ -544,51 +556,52 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v25: single level-3 stage with the full level-3 distribution
-    (``gate_rand_scale=1.0``) and **no segment-init**. Designed to be
-    paired with ``--init-from`` the v21 level-2 300M checkpoint
-    (``level2_seginit_seed0_v21_300M``).
+    v29: single level-3 stage with full distribution
+    (``gate_rand_scale=1.0``), Song §III-B seg-init at
+    ``segment_init_prob=0.5``, and **velocity-aware seg-init**
+    (``segment_init_vel_mps=2.5``). Designed to cold-train from scratch
+    with an annealing entropy schedule
+    (``PPOConfig.ent_coef_final=0.001``) so the policy commits to using
+    the seg-init exposure.
 
     Why this combination
     --------------------
-    v24 added warm-start + seg-init (``segment_init_prob=0.5``) on top of
-    the same level-3 layout. The seg-init scaffolding lets half of just-
-    reset envs spawn near a downstream gate. Together with the v24
-    ``ent_coef_final=0.001`` floor and a constant ent_coef schedule
-    (``--ent-coef-start 0.001``), the policy collapsed to entropy = -7.2
-    and ep_len = 64 by 300M: it locked onto a single approach that wins
-    on those favourable seg-init starts and crashes on every true ground
-    spawn. Eval via :mod:`lsy_drone_racing.control.rl_song.eval_sim`
-    (with the ``TruePoseObsWrapper`` patch) on level 3 with the v24
-    checkpoint produced 0/8 finishes and 0/8 gates passed. The training
-    ``finish_rate = 0.0002/step`` (~1.3% per episode) was 100% seg-init
-    bias. See :doc:`/memory/project-v24-warmstart-seginit-failed`
-    (memory) for the patched-render evidence.
+    User-observed eval problem from v25/v26/v28 patched renders: the
+    drone reliably navigates gates 0 and 1 from a ground spawn but then
+    **hovers indefinitely at gate 2** without crossing. Diagnosis: with
+    seg-init disabled, ~86% of training samples have ``target_gate=0``
+    and the policy never trained on the "approach gate 2 from past
+    gate 1" obs distribution. When eval succeeds at the first two
+    gates, the post-gate-1 state is OOD and the policy defaults to a
+    hover-survive attractor (no crash penalty, just ``r_time`` ticks).
 
-    v25 removes seg-init so the policy cannot lucky-zone-collapse onto a
-    narrow start distribution. Combined with the
-    :class:`PPOConfig.ent_coef_final` bump 0.001 → 0.005 (see the v25
-    note in :class:`PPOConfig`), the schedule now keeps a constant
-    moderate entropy bonus end-to-end, which v21 successfully trained
-    under for its first ~100M steps. Note progressive randomisation via
-    ``gate_rand_scale < 1.0`` is *not* a useful scaffold here: level-3's
-    ``track.randomize = true`` regenerates the full XY layout per
-    episode regardless, so ``gate_rand_scale`` only controls additional
-    wobble *on top of* an already-fully-randomised layout.
+    The fix needs *training exposure* to mid-track states, since reward
+    shaping only works for states the policy actually visits. Seg-init
+    is the existing mechanism for that. But v24 enabled it at p=0.5
+    with zero-velocity spawns and collapsed onto a lucky-zone strategy:
+    eval was 0/8 finishes, 0/8 gates from a true ground spawn despite
+    training metrics looking strong. The lucky-zone vulnerability was
+    "spawned hovering at convenient midpoint → accelerate" — a state
+    distribution the policy could over-fit because real flight never
+    produces hovering at those midpoints.
 
-    With seg-init = 0 every completed episode is a true ground-spawn
-    finish, so the existing ``rollout/finish_rate`` metric is unbiased
-    (no need to plumb ``finish_rate_true_start`` through the rollout
-    scan for this run).
+    Velocity-aware seg-init removes that vulnerability: the re-spawn
+    velocity is ``segment_init_vel_mps * unit(next_gate - prev_anchor)``,
+    so the seg-init state distribution becomes "drone in transit
+    between gates" rather than "drone hovering at a lucky pose".
+    Paired with the lower entropy floor and the now-tracked
+    ``finish_rate_true_start`` metric (which exposes lucky-zone
+    collapse if it happens despite the velocity), v29 directly attacks
+    the third-gate hover problem.
 
     History
     -------
-    * v24's ``level3_warmstart_seginit`` (segment_init_prob=0.5) is
-      preserved in git history (commit ``d4c4fbd``).
-    * v22's ``level3_rand0`` (gate_rand_scale=0.0, no seg-init) is at
-      commit ``63e0f0c``.
-    * The v11–v21 ``level2_seginit`` single-stage curriculum is at
-      commit ``9ad7fa0``.
+    * v25's ``level3_warmstart`` (seg-init disabled) is at commit
+      ``9514e7e``.
+    * v24's ``level3_warmstart_seginit`` (segment_init_prob=0.5, zero
+      velocity) at commit ``d4c4fbd``.
+    * v22's ``level3_rand0`` at commit ``63e0f0c``.
+    * The v11–v21 ``level2_seginit`` curriculum at commit ``9ad7fa0``.
     * The legacy stage1/2/3a/b/c/4 progression remains in
       :func:`_full_curriculum`.
     """
@@ -596,14 +609,15 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_warmstart",
+                name="level3_v29_segvel",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.0,
+                segment_init_prob=0.5,
+                segment_init_vel_mps=2.5,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
