@@ -102,7 +102,18 @@ class PPOConfig:
     # 20% of the starting bonus instead of v5's 10%, but the new role
     # is to prevent late-stage over-commitment rather than to drive
     # early exploration.
-    ent_coef_final: float = 0.001
+    # v25: 0.001 -> 0.005 (constant ent_coef throughout, matches the
+    # start value). v24 (warm-start + seg-init) collapsed to entropy
+    # = -7.2 at 300M with floor=0.001 and start=0.001 (constant 0.001
+    # schedule), confirming 0.001 is too low to prevent over-commitment
+    # on the randomized layout. Bumping the floor 5× to match the
+    # start value gives a flat schedule at the same magnitude v21
+    # successfully trained under for the first ~100M steps; v21
+    # plateaued its entropy near -2 with this magnitude before the
+    # schedule annealed it down further. Keeping ent_coef constant
+    # at 0.005 throughout v25 keeps that level of exploration alive
+    # the whole way, blocking the lucky-zone collapse path.
+    ent_coef_final: float = 0.005
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
@@ -502,43 +513,51 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v24: single level-3 stage with the full level-3 distribution
-    (``gate_rand_scale=1.0``) and Song §III-B Phase 1 segment-init
-    (``segment_init_prob=0.5``). Designed to be paired with
-    ``--init-from`` the v21 level-2 300M checkpoint
+    v25: single level-3 stage with the full level-3 distribution
+    (``gate_rand_scale=1.0``) and **no segment-init**. Designed to be
+    paired with ``--init-from`` the v21 level-2 300M checkpoint
     (``level2_seginit_seed0_v21_300M``).
 
     Why this combination
     --------------------
-    v21cold / v22 / v23 all attempted level-3 cold-start without seg-init
-    and all plateaued at ``target_gate ≈ 0.5`` (about half of gate 0)
-    with finish_rate = 0. The plateau started around step 150M and was
-    flat for the last 150M of each 300M run — i.e. it is an algorithmic
-    ceiling, not a "needs more steps" problem. Diagnosis: PPO cannot
-    discover a clean gate-0 traversal from random ground-spawn rollouts
-    on the randomized level-3 layout.
+    v24 added warm-start + seg-init (``segment_init_prob=0.5``) on top of
+    the same level-3 layout. The seg-init scaffolding lets half of just-
+    reset envs spawn near a downstream gate. Together with the v24
+    ``ent_coef_final=0.001`` floor and a constant ent_coef schedule
+    (``--ent-coef-start 0.001``), the policy collapsed to entropy = -7.2
+    and ep_len = 64 by 300M: it locked onto a single approach that wins
+    on those favourable seg-init starts and crashes on every true ground
+    spawn. Eval via :mod:`lsy_drone_racing.control.rl_song.eval_sim`
+    (with the ``TruePoseObsWrapper`` patch) on level 3 with the v24
+    checkpoint produced 0/8 finishes and 0/8 gates passed. The training
+    ``finish_rate = 0.0002/step`` (~1.3% per episode) was 100% seg-init
+    bias. See :doc:`/memory/project-v24-warmstart-seginit-failed`
+    (memory) for the patched-render evidence.
 
-    Two scaffolds attack that ceiling directly:
+    v25 removes seg-init so the policy cannot lucky-zone-collapse onto a
+    narrow start distribution. Combined with the
+    :class:`PPOConfig.ent_coef_final` bump 0.001 → 0.005 (see the v25
+    note in :class:`PPOConfig`), the schedule now keeps a constant
+    moderate entropy bonus end-to-end, which v21 successfully trained
+    under for its first ~100M steps. Note progressive randomisation via
+    ``gate_rand_scale < 1.0`` is *not* a useful scaffold here: level-3's
+    ``track.randomize = true`` regenerates the full XY layout per
+    episode regardless, so ``gate_rand_scale`` only controls additional
+    wobble *on top of* an already-fully-randomised layout.
 
-    * Warm-start (``--init-from level2_seginit_seed0_v21_300M``) supplies
-      a policy that already knows the gate-passing skill (~38% per-episode
-      finish on level 2, max_gate 3.13). The randomization is then the
-      only new thing it has to adapt to.
-    * Seg-init (``segment_init_prob=0.5``) re-spawns half of just-reset
-      envs at the midpoint of a uniformly-random path segment so every
-      segment's local credit-assignment problem gets equal training
-      signal. This is the recipe that produced the level-2 v21 win.
-
-    Note this biases ``finish_rate`` upward (≈3×) because half the
-    episodes start near a later gate — log ``finish_rate_true_start``
-    separately for the unbiased comparison.
+    With seg-init = 0 every completed episode is a true ground-spawn
+    finish, so the existing ``rollout/finish_rate`` metric is unbiased
+    (no need to plumb ``finish_rate_true_start`` through the rollout
+    scan for this run).
 
     History
     -------
-    * v22's single ``level3_rand0`` (gate_rand_scale=0.0, no seg-init)
-      stage is preserved in git history (commit 63e0f0c).
-    * The v11–v21 ``level2_seginit`` single-stage curriculum is preserved
-      in git history (commit 9ad7fa0).
+    * v24's ``level3_warmstart_seginit`` (segment_init_prob=0.5) is
+      preserved in git history (commit ``d4c4fbd``).
+    * v22's ``level3_rand0`` (gate_rand_scale=0.0, no seg-init) is at
+      commit ``63e0f0c``.
+    * The v11–v21 ``level2_seginit`` single-stage curriculum is at
+      commit ``9ad7fa0``.
     * The legacy stage1/2/3a/b/c/4 progression remains in
       :func:`_full_curriculum`.
     """
@@ -546,14 +565,14 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_warmstart_seginit",
+                name="level3_warmstart",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.5,
+                segment_init_prob=0.0,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
