@@ -378,7 +378,14 @@ class RewardConfig:
     # the v11-era pathology risk to watch in this run; we'll see it in
     # ep_len if the policy starts fleeing the gate plane laterally on
     # exit.
-    guide_coef: float = 1.5
+    # v24: 1.5 -> 0.5 (revert). v23 collapsed: entropy held +2.5 the whole
+    # run, ep_len 31, r_prog flipped negative, max_gate stalled at 0.27.
+    # The 3x loiter penalty made any off-axis exploration so costly that
+    # PPO converged on flailing instead of committing to a trajectory.
+    # v24 strategy shifts from "boost r_guid to crack cold-start" to
+    # "warm-start from level-2 v21 + seg-init on level 3", which expects
+    # the v21 reward landscape (guide_coef=0.5).
+    guide_coef: float = 0.5
     # v14: widened 1.5 -> 3.0. The level-0 spawn at world (-1.5, 0.75, 0.01)
     # is ~2.1 m from gate 1 in gate-frame x, so at k0=1.5 the policy gets
     # zero r_guid signal until it has already walked itself most of the
@@ -395,7 +402,9 @@ class RewardConfig:
     # to 5.0 lifts guide_window**2 to ~0.32 at the same point, ~5x more
     # gradient through the spawn region, without changing the field at
     # the gate plane itself.
-    guide_k0: float = 5.0
+    # v24: 5.0 -> 3.0 (revert in tandem with the guide_coef revert; see
+    # the v24 note above).
+    guide_k0: float = 3.0
     guide_k1: float = 1.0
     guide_k2: float = 0.3
     # v13B: Δ-potential gate guidance. When True, r_guid is computed as
@@ -493,34 +502,58 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v22: single level-3 stage with ``gate_rand_scale=0.0`` (no extra
-    wobble layered on top of the framework's per-episode track regen).
-    Used to warm-start from the v21 level-2 300M checkpoint and isolate
-    the level-2 → level-3 layout-transfer question from the wobble-on-
-    top-of-regen noise. If finish rate holds reasonably (>10%) under
-    pure regen, a follow-up stage bumps ``gate_rand_scale`` back to 1.0
-    so the policy sees the full level-3 distribution. The v11–v21
-    ``level2_seginit`` single-stage curriculum is preserved in git
-    history (commit 9ad7fa0). The legacy stage1/2/3a/b/c/4 progression
-    remains in :func:`_full_curriculum`.
+    v24: single level-3 stage with the full level-3 distribution
+    (``gate_rand_scale=1.0``) and Song §III-B Phase 1 segment-init
+    (``segment_init_prob=0.5``). Designed to be paired with
+    ``--init-from`` the v21 level-2 300M checkpoint
+    (``level2_seginit_seed0_v21_300M``).
+
+    Why this combination
+    --------------------
+    v21cold / v22 / v23 all attempted level-3 cold-start without seg-init
+    and all plateaued at ``target_gate ≈ 0.5`` (about half of gate 0)
+    with finish_rate = 0. The plateau started around step 150M and was
+    flat for the last 150M of each 300M run — i.e. it is an algorithmic
+    ceiling, not a "needs more steps" problem. Diagnosis: PPO cannot
+    discover a clean gate-0 traversal from random ground-spawn rollouts
+    on the randomized level-3 layout.
+
+    Two scaffolds attack that ceiling directly:
+
+    * Warm-start (``--init-from level2_seginit_seed0_v21_300M``) supplies
+      a policy that already knows the gate-passing skill (~38% per-episode
+      finish on level 2, max_gate 3.13). The randomization is then the
+      only new thing it has to adapt to.
+    * Seg-init (``segment_init_prob=0.5``) re-spawns half of just-reset
+      envs at the midpoint of a uniformly-random path segment so every
+      segment's local credit-assignment problem gets equal training
+      signal. This is the recipe that produced the level-2 v21 win.
+
+    Note this biases ``finish_rate`` upward (≈3×) because half the
+    episodes start near a later gate — log ``finish_rate_true_start``
+    separately for the unbiased comparison.
+
+    History
+    -------
+    * v22's single ``level3_rand0`` (gate_rand_scale=0.0, no seg-init)
+      stage is preserved in git history (commit 63e0f0c).
+    * The v11–v21 ``level2_seginit`` single-stage curriculum is preserved
+      in git history (commit 9ad7fa0).
+    * The legacy stage1/2/3a/b/c/4 progression remains in
+      :func:`_full_curriculum`.
     """
     pi_over_4 = 0.7853981633974483
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                # Level-3 with the framework's full track-regen
-                # (``track.randomize=true`` in ``level3.toml``) but no
-                # additional wobble — the wrapper's ±max gate/obstacle
-                # perturbation scales to 0 at ``gate_rand_scale=0.0``.
-                # Pure layout-transfer test for the v21 warm-start.
-                name="level3_rand0",
+                name="level3_warmstart_seginit",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
-                gate_rand_scale=0.00,
-                segment_init_prob=0.0,
+                gate_rand_scale=1.00,
+                segment_init_prob=0.5,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),
