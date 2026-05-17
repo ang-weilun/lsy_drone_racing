@@ -63,6 +63,35 @@ DEFAULT_RECORD_WIDTH = 1280
 DEFAULT_RECORD_HEIGHT = 720
 DEFAULT_CONTROLLER = "rl_song/controller.py"
 
+# Per-gate colours applied to the frame, ropes, and stand geoms by
+# :func:`_color_code_gates` so that gate 0 ... gate N-1 are visually distinct
+# in renders. The textured front / back aperture panels are intentionally left
+# alone so each gate still reads as a gate. Heat-progression palette
+# (red → orange → yellow → green) mirrors gate-index progress through the
+# course; longer-than-4-gate courses repeat from the start.
+GATE_COLORS = np.array(
+    [
+        [1.00, 0.20, 0.20, 1.0],  # gate 0 — red
+        [1.00, 0.60, 0.00, 1.0],  # gate 1 — orange
+        [1.00, 1.00, 0.20, 1.0],  # gate 2 — yellow
+        [0.20, 0.90, 0.30, 1.0],  # gate 3 — green
+    ],
+    dtype=np.float32,
+)
+# Geom *base* names (pre-suffix) inside a gate body that get the per-gate
+# colour override. Matches the names in ``envs/assets/gate.xml``.
+GATE_ACCENT_GEOMS = (
+    "frame_top",
+    "frame_bottom",
+    "frame_left",
+    "frame_right",
+    "rope_top_left",
+    "rope_top_right",
+    "rope_bottom_left",
+    "rope_bottom_right",
+    "gate_stand",
+)
+
 
 class TruePoseObsWrapper(gymnasium.ObservationWrapper):
     """Patch the un-visited branch of the per-step obs with the placed truth.
@@ -183,6 +212,7 @@ def simulate(
         randomizations=cfg.env.get("randomizations"),
         seed=cfg.env.seed,
     )
+    _color_code_gates(env)
     env = JaxToNumpy(env)
     env = TruePoseObsWrapper(env)
 
@@ -250,6 +280,45 @@ def _run_episode(
     _log_episode_stats(obs, cfg, curr_time)
     controller.episode_reset()
     return curr_time if obs["target_gate"] == -1 else None
+
+
+def _color_code_gates(env: gymnasium.Env) -> None:
+    """Override per-gate accent geoms with a distinct colour for each gate.
+
+    Walks the MuJoCo model for geoms named ``<base>:<i>`` for each
+    ``<base>`` in :data:`GATE_ACCENT_GEOMS` and each gate index ``i``,
+    sets ``geom_matid = -1`` (disable the shared ``frame_mat`` /
+    ``rope_mat`` / ``stand_mat`` materials), and writes the per-gate
+    colour from :data:`GATE_COLORS` into ``geom_rgba``. The textured
+    front and back panels (``front_*:i`` / ``back_*:i``) are left alone
+    so the gate aperture is still legible.
+
+    Naming convention comes from
+    :meth:`lsy_drone_racing.envs.race_core.RaceCoreEnv._load_track_into_sim`,
+    which attaches each gate body with suffix ``:<i>`` and propagates
+    that suffix to all child geom names.
+
+    Notes
+    -----
+    Modifies ``env.unwrapped.sim.mj_model`` in place. MuJoCo's offscreen
+    renderer reads ``mj_model.geom_rgba``, so the change is reflected in
+    every subsequent render call. The MJX physics path is unaffected
+    because it does not consume geom colour.
+    """
+    sim = env.unwrapped.sim
+    mj_model = sim.mj_model
+    for gate_idx in range(GATE_COLORS.shape[0]):
+        color = GATE_COLORS[gate_idx]
+        for base_name in GATE_ACCENT_GEOMS:
+            geom_name = f"{base_name}:{gate_idx}"
+            try:
+                geom = mj_model.geom(geom_name)
+            except (KeyError, ValueError):
+                continue  # gate <gate_idx> does not exist on this track
+            if geom is None:
+                continue
+            mj_model.geom_matid[geom.id] = -1
+            mj_model.geom_rgba[geom.id] = color
 
 
 def _grab_offscreen_frame(
