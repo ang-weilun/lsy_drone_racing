@@ -130,6 +130,10 @@ class RolloutStaticConfig:
     # advanced to match. Disabled (0.0) for stages where it is unused.
     segment_init_prob: float = 0.0
     segment_init_perturb_m: float = 0.10
+    # v29: speed in m/s applied to seg-init re-spawns. When >0, the drone
+    # is given velocity ``segment_init_vel_mps * unit(next_gate - prev_anchor)``
+    # at re-spawn instead of zero. See ``CurriculumStage.segment_init_vel_mps``.
+    segment_init_vel_mps: float = 0.0
 
     @property
     def reset_perturbation_enabled(self) -> bool:
@@ -185,12 +189,23 @@ class RolloutMetricSums(NamedTuple):
         the average best-gate-reached per finished episode and is robust to
         the episode-length bias that distorts ``target_gate_mean`` for fast
         policies.
+    true_start_completed_count, true_start_finished_count : Array
+        Scalar counters restricted to episodes that did *not* start with
+        Song §III-B seg-init (i.e. true ground-spawn starts). Their ratio
+        is the unbiased ``finish_rate_true_start`` metric — it reports the
+        per-episode finish rate the controller would see when deployed on
+        a real ground spawn, regardless of how aggressively seg-init is
+        applied during training. When seg-init is disabled
+        (``segment_init_prob = 0``) both counters equal their unrestricted
+        counterparts ``completed_count`` and the finished-subset thereof.
     """
 
     completed_return_sum: Array
     completed_length_sum: Array
     completed_count: Array
     completed_max_gate_sum: Array
+    true_start_completed_count: Array
+    true_start_finished_count: Array
 
 
 class RolloutScanResult(NamedTuple):
@@ -249,6 +264,18 @@ class _ScanCarry(NamedTuple):
     completed_length_sum: Array
     completed_count: Array
     completed_max_gate_sum: Array
+    # Per-env flag: True if the currently-running episode started via Song
+    # §III-B seg-init (re-spawned at a segment midpoint), False if it
+    # started from the true reset state (toml start position + reset
+    # perturbation). Updated on each ``done`` event using the ``do_seg``
+    # mask returned by ``_reset_done_worlds``. Drives the
+    # ``finish_rate_true_start`` metric: the dying episode's stats are
+    # tallied into ``true_start_*`` counters *only* if this flag was
+    # False, so the metric reports performance on the deployment
+    # state distribution regardless of seg-init aggressiveness.
+    is_seg_init: Array
+    true_start_completed_count: Array
+    true_start_finished_count: Array
     # Per-env Layer-1 placement (pre-wobble), used to patch ``env_obs`` for
     # non-visited gates / obstacles so the actor sees the placement instead
     # of the framework's broken ``(0, 0, z)`` toml nominal. See
@@ -324,6 +351,12 @@ def scan_rollout(
     )
     zero_scalar = jnp.asarray(0.0, dtype=jnp.float32)
     episode_max_gate = jnp.zeros_like(episode_returns)
+    # Initialize is_seg_init to all False (assume the first episode in each
+    # env is a true-start). The eager wrapper's initial reset may apply
+    # seg-init, so the very first batch of completed episodes can be
+    # mis-classified — but this washes out after one episode-length per env
+    # (~3-10 s of training), negligible against the 60+ min runs we do.
+    initial_is_seg_init = jnp.zeros_like(next_done, dtype=jnp.bool_)
     initial_carry = _ScanCarry(
         env_data=env_data,
         prev_action_env_4vec=prev_action_env_4vec,
@@ -337,6 +370,9 @@ def scan_rollout(
         completed_length_sum=zero_scalar,
         completed_count=zero_scalar,
         completed_max_gate_sum=zero_scalar,
+        is_seg_init=initial_is_seg_init,
+        true_start_completed_count=zero_scalar,
+        true_start_finished_count=zero_scalar,
         placed_gates_pos=placed_gates_pos,
         placed_gates_quat=placed_gates_quat,
         placed_obstacles_pos=placed_obstacles_pos,
@@ -414,12 +450,25 @@ def scan_rollout(
         )
         completed_count = carry.completed_count + jnp.sum(done)
 
+        # finish_rate_true_start tally: a dying episode counts here iff it
+        # started from a true reset (carry.is_seg_init is False). Use the
+        # current is_seg_init *before* updating it for the just-reset envs
+        # below — the flag belongs to the episode that just ended.
+        true_start_done = done_bool & ~carry.is_seg_init
+        true_start_completed_count = carry.true_start_completed_count + jnp.sum(
+            true_start_done.astype(jnp.float32)
+        )
+        true_start_finished_count = carry.true_start_finished_count + jnp.sum(
+            (true_start_done & finished).astype(jnp.float32)
+        )
+
         (
             reset_data,
             reset_rng_key,
             next_placed_gates_pos,
             next_placed_gates_quat,
             next_placed_obstacles_pos,
+            do_seg,
         ) = _reset_done_worlds(
             stepped_data,
             done_bool,
@@ -430,6 +479,10 @@ def scan_rollout(
             env_reset_fn,
             static_cfg,
         )
+        # On done events, the new episode's is_seg_init is set from the
+        # do_seg mask returned by the reset path. Non-reset envs carry
+        # their existing flag forward.
+        next_is_seg_init = jnp.where(done_bool, do_seg, carry.is_seg_init)
         next_prev_action = jnp.where(done_bool[:, None], jnp.zeros_like(env_action), env_action)
         next_episode_returns = jnp.where(done_bool, 0.0, episode_returns)
         next_episode_lengths = jnp.where(done_bool, 0.0, episode_lengths)
@@ -449,6 +502,9 @@ def scan_rollout(
             completed_length_sum=completed_length_sum,
             completed_count=completed_count,
             completed_max_gate_sum=completed_max_gate_sum,
+            is_seg_init=next_is_seg_init,
+            true_start_completed_count=true_start_completed_count,
+            true_start_finished_count=true_start_finished_count,
             placed_gates_pos=next_placed_gates_pos,
             placed_gates_quat=next_placed_gates_quat,
             placed_obstacles_pos=next_placed_obstacles_pos,
@@ -492,6 +548,8 @@ def scan_rollout(
         completed_length_sum=final_carry.completed_length_sum,
         completed_count=final_carry.completed_count,
         completed_max_gate_sum=final_carry.completed_max_gate_sum,
+        true_start_completed_count=final_carry.true_start_completed_count,
+        true_start_finished_count=final_carry.true_start_finished_count,
     )
     return RolloutScanResult(
         env_data=final_carry.env_data,
@@ -543,16 +601,18 @@ def _reset_done_worlds(
     placed_obstacles_pos: Array,
     env_reset_fn: EnvResetFn,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array]:
+) -> tuple[EnvData, Array, Array, Array, Array, Array]:
     """Reset completed worlds and apply curriculum perturbations.
 
     Returns ``(env_data, rng_key, placed_gates_pos, placed_gates_quat,
-    placed_obstacles_pos)``. The placed snapshots reflect the Layer-1
-    placement (pre-wobble) for envs that were just reset and the previous
-    values for envs that were not.
+    placed_obstacles_pos, do_seg)``. The placed snapshots reflect the
+    Layer-1 placement (pre-wobble) for envs that were just reset and the
+    previous values for envs that were not. ``do_seg`` is a per-env bool
+    mask indicating which envs had their state replaced by seg-init this
+    call; envs not reset have ``do_seg = False``.
     """
 
-    def reset_branch(data: EnvData) -> tuple[EnvData, Array, Array, Array, Array]:
+    def reset_branch(data: EnvData) -> tuple[EnvData, Array, Array, Array, Array, Array]:
         reset_data, _ = env_reset_fn(data, None, done)
         return _apply_reset_perturbation(
             reset_data,
@@ -573,6 +633,7 @@ def _reset_done_worlds(
             placed_gates_pos,
             placed_gates_quat,
             placed_obstacles_pos,
+            jnp.zeros_like(done, dtype=jnp.bool_),
         ),
         env_data,
     )
@@ -586,15 +647,18 @@ def _apply_reset_perturbation(
     placed_gates_quat: Array,
     placed_obstacles_pos: Array,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array]:
+) -> tuple[EnvData, Array, Array, Array, Array, Array]:
     """Apply curriculum drone-state and track perturbations in pure JAX.
 
-    Returns the updated env data, RNG key, and the per-env ``placed_*``
-    snapshots (Layer-1 layout, *before* the Layer-2 wobble is added). Callers
-    plumb the placed snapshots through their carry / instance state and use
-    them to patch ``env_obs[\"gates_pos\"]`` etc. for non-visited entries —
-    the framework's ``nominal_*`` fields can't be repurposed safely because
-    ``race_core.obs`` assumes they have shape ``(n_gates, 3)``.
+    Returns the updated env data, RNG key, per-env ``placed_*`` snapshots
+    (Layer-1 layout, *before* the Layer-2 wobble is added), and the
+    ``do_seg`` mask identifying which envs had their state replaced by
+    seg-init this call. Callers plumb ``placed_*`` through their carry /
+    instance state to patch ``env_obs["gates_pos"]`` for non-visited
+    entries (the framework's ``nominal_*`` fields can't be repurposed
+    because ``race_core.obs`` assumes they have shape ``(n_gates, 3)``)
+    and use ``do_seg`` to update the per-env ``is_seg_init`` flag that
+    drives the ``finish_rate_true_start`` metric.
 
     Order of operations:
 
@@ -669,10 +733,12 @@ def _apply_reset_perturbation(
 
     env_data = _reset_env_data(env_data, mask)
     if static_cfg.segment_init_prob > 0.0:
-        env_data, rng_key = _apply_segment_init(
+        env_data, rng_key, do_seg = _apply_segment_init(
             env_data, mask, rng_key, placed_gates_pos, start_pos, static_cfg
         )
-    return env_data, rng_key, placed_gates_pos, placed_gates_quat, placed_obstacles_pos
+    else:
+        do_seg = jnp.zeros_like(mask, dtype=jnp.bool_)
+    return env_data, rng_key, placed_gates_pos, placed_gates_quat, placed_obstacles_pos, do_seg
 
 
 def _apply_segment_init(
@@ -682,13 +748,20 @@ def _apply_segment_init(
     placed_gates_pos: Array,
     start_pos: Array,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array]:
+) -> tuple[EnvData, Array, Array]:
     """Re-spawn a Bernoulli-selected subset of envs at random segment centers.
 
     Pure-JAX counterpart of ``RLSongVecEnv._apply_segment_init`` used inside
     the scanned rollout path. Both branches must produce the same
     state-distribution semantics for the policy. Implements Song 2023
     §III-B Phase 1 (state-coverage initial-state distribution).
+
+    v29: when ``static_cfg.segment_init_vel_mps > 0`` the seg-init re-spawn
+    velocity is set to ``segment_init_vel_mps * unit(next_gate -
+    prev_anchor)`` instead of zero. Removes the trivially-exploitable
+    "spawned hovering at a convenient midpoint" state distribution that
+    caused v24's lucky-zone collapse, while still putting the policy at
+    later-gate approach poses.
 
     Parameters
     ----------
@@ -704,7 +777,8 @@ def _apply_segment_init(
     start_pos : Array, shape (n_envs, n_drones, 3)
         Pre-perturbation drone position used as the segment-0 anchor.
     static_cfg : RolloutStaticConfig
-        Provides ``segment_init_prob`` and ``segment_init_perturb_m``.
+        Provides ``segment_init_prob``, ``segment_init_perturb_m`` and
+        ``segment_init_vel_mps``.
 
     Returns
     -------
@@ -713,6 +787,11 @@ def _apply_segment_init(
         overridden for the selected envs.
     rng_key : Array
         Advanced PRNG key.
+    do_seg : Array, shape (n_envs,)
+        Boolean mask of envs whose state was overridden by seg-init this
+        call. Plumbed back to ``scan_rollout`` so the per-env
+        ``is_seg_init`` flag (used by the ``finish_rate_true_start``
+        metric) can be updated.
     """
     rng_key, bern_key, seg_key, jit_key = jax.random.split(rng_key, 4)
     n_envs = env_data.gates_pos.shape[0]
@@ -733,14 +812,22 @@ def _apply_segment_init(
     )
     new_pos = jnp.clip(midpoint + jitter, env_data.pos_limit_low, env_data.pos_limit_high)
 
+    # v29: velocity-aware seg-init. Compute unit direction from prev anchor
+    # to next gate; scale by segment_init_vel_mps. Falls back to zero
+    # velocity when the speed is 0 (original Song §III-B behavior).
+    direction = next_gate - prev_anchor
+    direction_norm = jnp.linalg.norm(direction, axis=-1, keepdims=True)
+    unit_direction = direction / jnp.maximum(direction_norm, 1e-6)
+    seg_vel = static_cfg.segment_init_vel_mps * unit_direction  # (n_envs, 3)
+
     states = env_data.sim_data.states
     mask_b3 = do_seg[:, None, None]
     new_pos_b = new_pos[:, None, :]
-    zeros_vel = jnp.zeros_like(states.vel)
+    new_vel_b = seg_vel[:, None, :]
     identity_quat = jnp.zeros_like(states.quat).at[..., 3].set(1.0)
     new_states = states.replace(
         pos=jnp.where(mask_b3, new_pos_b, states.pos),
-        vel=jnp.where(mask_b3, zeros_vel, states.vel),
+        vel=jnp.where(mask_b3, new_vel_b, states.vel),
         quat=jnp.where(mask_b3, identity_quat, states.quat),
     )
 
@@ -752,7 +839,7 @@ def _apply_segment_init(
 
     sim_data = env_data.sim_data.replace(states=new_states)
     env_data = env_data.replace(sim_data=sim_data, target_gate=new_target)
-    return env_data, rng_key
+    return env_data, rng_key, do_seg
 
 
 def _apply_yaw_delta(quat: Array, yaw_delta: Array, mask: Array) -> Array:

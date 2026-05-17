@@ -458,6 +458,7 @@ def _rollout_static_config(env: RLSongVecEnv, ppo_cfg: PPOConfig) -> RolloutStat
         obstacle_pos_perturb_max=obstacle_pos_max,
         segment_init_prob=env.stage.segment_init_prob,
         segment_init_perturb_m=env.stage.segment_init_perturb_m,
+        segment_init_vel_mps=env.stage.segment_init_vel_mps,
     )
 
 
@@ -467,6 +468,13 @@ def _rollout_metrics(
     """Convert scanned rollout tensors into Python logging metrics."""
     completed_count = metric_sums.completed_count
     completed_denominator = jnp.maximum(completed_count, 1.0)
+    # finish_rate_true_start: per-episode finish rate restricted to episodes
+    # that did NOT start with seg-init (i.e. true ground-spawn starts). Equal
+    # to ``finish_rate * ep_len`` only when ``segment_init_prob = 0``;
+    # otherwise this is the unbiased deployment metric and the unrestricted
+    # ``finish_rate`` (per-step) is inflated by the seg-init bias.
+    true_start_completed = metric_sums.true_start_completed_count
+    true_start_denominator = jnp.maximum(true_start_completed, 1.0)
     metrics = {
         "ep_ret": float(np.asarray(metric_sums.completed_return_sum / completed_denominator)),
         "ep_len": float(np.asarray(metric_sums.completed_length_sum / completed_denominator)),
@@ -477,6 +485,10 @@ def _rollout_metrics(
         ),
         "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
         "finish_rate": float(np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))),
+        "true_start_episodes": float(np.asarray(true_start_completed)),
+        "finish_rate_true_start": float(
+            np.asarray(metric_sums.true_start_finished_count / true_start_denominator)
+        ),
     }
     for key, value_component in outputs.reward_components.items():
         metrics[key] = float(np.asarray(jnp.mean(value_component)))
@@ -768,6 +780,8 @@ def _log_iteration(
         "rollout/max_gate": rollout_metrics["max_gate_mean"],
         "rollout/crash_rate": rollout_metrics["crash_rate"],
         "rollout/finish_rate": rollout_metrics["finish_rate"],
+        "rollout/finish_rate_true_start": rollout_metrics["finish_rate_true_start"],
+        "rollout/true_start_episodes": rollout_metrics["true_start_episodes"],
     }
     for key, value in rollout_metrics.items():
         if key.startswith("r_"):

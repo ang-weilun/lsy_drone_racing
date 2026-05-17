@@ -517,6 +517,19 @@ class CurriculumStage:
     # so the policy sees a distribution of states around each segment center
     # rather than a single point.
     segment_init_perturb_m: float = 0.10
+    # v29: velocity-aware seg-init speed. When >0, a seg-init re-spawn gives
+    # the drone velocity ``segment_init_vel_mps`` * unit(next_gate - prev_anchor)
+    # instead of the zero-velocity hover the original Song §III-B recipe used.
+    # Motivation: v25-v28 level-3 eval renders showed the policy hover-and-
+    # survives when it reaches target_gate >= 2 because that obs region was
+    # OOD during training (no seg-init exposure to mid-track states). Re-
+    # enabling seg-init at p=0.5 with zero velocity caused v24's lucky-zone
+    # collapse — the policy over-fit to "spawned hovering at a convenient
+    # midpoint then accelerate". Giving the seg-init spawn a non-zero
+    # velocity in the direction of the next gate removes the trivially-
+    # exploitable "spawned hovering" state distribution while still putting
+    # the policy at later-gate approach poses for training.
+    segment_init_vel_mps: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -550,13 +550,20 @@ class RLSongVecEnv:
         )
         new_pos = jnp.clip(midpoint + jitter, data.pos_limit_low, data.pos_limit_high)
 
+        # v29: velocity-aware seg-init. Matches ``rollout._apply_segment_init``;
+        # see ``CurriculumStage.segment_init_vel_mps`` for motivation.
+        direction = next_gate - prev_anchor
+        direction_norm = jnp.linalg.norm(direction, axis=-1, keepdims=True)
+        unit_direction = direction / jnp.maximum(direction_norm, 1e-6)
+        seg_vel = self.stage.segment_init_vel_mps * unit_direction  # (n_envs, 3)
+
         mask_b3 = do_seg[:, None, None]
         new_pos_b = new_pos[:, None, :]
-        zeros_vel = jnp.zeros_like(states.vel)
+        new_vel_b = seg_vel[:, None, :]
         identity_quat = jnp.zeros_like(states.quat).at[..., 3].set(1.0)
         new_states = states.replace(
             pos=jnp.where(mask_b3, new_pos_b, states.pos),
-            vel=jnp.where(mask_b3, zeros_vel, states.vel),
+            vel=jnp.where(mask_b3, new_vel_b, states.vel),
             quat=jnp.where(mask_b3, identity_quat, states.quat),
         )
 
