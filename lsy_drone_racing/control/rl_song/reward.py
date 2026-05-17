@@ -27,6 +27,71 @@ from lsy_drone_racing.control.rl_song.obs import GATE_HALF_SIZE_M, _quat_to_matr
 GUIDANCE_AXIS_EPS_M2: float = 1e-8
 # Dimensionless denominator floor for the aperture-normalized guidance radius.
 GUIDANCE_DENOM_EPS: float = 1e-8
+# Squared-length floor for the parametric projection in
+# :func:`_gate_frame_edge_dist_sq` (guards against degenerate zero-length
+# edges; gate corners are well-separated so this only fires on numerical noise).
+SEGMENT_AB_SQ_EPS: float = 1e-12
+
+# Gate opening corners in gate-local coords (x_through = 0, ±h_y, ±h_z).
+# Same ordering as ``obs._GATE_CORNERS_LOCAL`` so downstream edge pairs
+# stay consistent. Corner indices:
+#   0: (+h_y, +h_z) — top-right     1: (+h_y, -h_z) — bottom-right
+#   2: (-h_y, +h_z) — top-left      3: (-h_y, -h_z) — bottom-left
+_GATE_HALF_Y, _GATE_HALF_Z = GATE_HALF_SIZE_M
+_GATE_FRAME_CORNERS_LOCAL: Array = jnp.asarray(
+    [
+        [0.0, +_GATE_HALF_Y, +_GATE_HALF_Z],
+        [0.0, +_GATE_HALF_Y, -_GATE_HALF_Z],
+        [0.0, -_GATE_HALF_Y, +_GATE_HALF_Z],
+        [0.0, -_GATE_HALF_Y, -_GATE_HALF_Z],
+    ],
+    dtype=jnp.float32,
+)
+# Edge endpoint index pairs (4 sides of the square opening): right
+# vertical (0-1), left vertical (2-3), top horizontal (0-2), bottom
+# horizontal (1-3).
+_GATE_FRAME_EDGE_INDICES: Array = jnp.asarray([[0, 1], [2, 3], [0, 2], [1, 3]], dtype=jnp.int32)
+
+
+def _gate_frame_edge_dist_sq(pos: Array, gates_pos: Array, gates_quat: Array) -> Array:
+    """Return squared distance from drone position to each gate frame edge.
+
+    For each (env, gate) pair, computes the four opening corners in the
+    world frame using the gate's xyzw quaternion, builds the four edge
+    line segments, and returns the per-edge min squared distance from
+    the drone position to that segment (point-to-segment projection,
+    clamped to the segment endpoints).
+
+    Parameters
+    ----------
+    pos : Array, shape (n_envs, 3)
+        World-frame drone position.
+    gates_pos : Array, shape (n_envs, n_gates, 3)
+    gates_quat : Array, shape (n_envs, n_gates, 4)
+        xyzw quaternions.
+
+    Returns
+    -------
+    Array, shape (n_envs, n_gates, 4)
+        Squared distance per edge.
+    """
+    # Rotate the four canonical corners into each gate's world frame:
+    # corners_world[e, g, c] = R(quat[e, g]) @ corner_local[c] + gate_pos[e, g].
+    rot = jax.vmap(jax.vmap(_quat_to_matrix))(gates_quat)  # (n_envs, n_gates, 3, 3)
+    corners_world = jnp.einsum("egij,cj->egci", rot, _GATE_FRAME_CORNERS_LOCAL)
+    corners_world = corners_world + gates_pos[..., None, :]  # (n_envs, n_gates, 4, 3)
+
+    # Edge endpoints: a = corners[indices[:, 0]], b = corners[indices[:, 1]].
+    a = corners_world[:, :, _GATE_FRAME_EDGE_INDICES[:, 0], :]  # (n_envs, n_gates, 4, 3)
+    b = corners_world[:, :, _GATE_FRAME_EDGE_INDICES[:, 1], :]
+    ab = b - a
+    ap = pos[:, None, None, :] - a  # (n_envs, n_gates, 4, 3)
+    ab_sq = jnp.sum(ab * ab, axis=-1)  # (n_envs, n_gates, 4)
+    t = jnp.sum(ap * ab, axis=-1) / jnp.maximum(ab_sq, SEGMENT_AB_SQ_EPS)
+    t_clamped = jnp.clip(t, 0.0, 1.0)
+    closest = a + t_clamped[..., None] * ab
+    diff = pos[:, None, None, :] - closest
+    return jnp.sum(diff * diff, axis=-1)  # (n_envs, n_gates, 4)
 
 
 def _gate_phi(pos: Array, gate_pos: Array, gate_quat: Array, reward_cfg: RewardConfig) -> Array:
@@ -217,9 +282,31 @@ def step_reward(
 
     obstacle_delta = pos[:, None, :] - obstacles_pos
     obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta), axis=-1)
-    obstacle_active = 1.0 - env_obs["obstacles_visited"].astype(jnp.float32)
+    # v32: drop the ``obstacle_active = 1 - obstacles_visited`` mask. The
+    # old mask zeroed the penalty exactly when ``obstacles_visited``
+    # flipped True (i.e. when the drone entered sensor range and was
+    # finally close enough for the small-sigma barrier to matter). The
+    # net effect was that ``r_obs`` was always ~0 and the policy got no
+    # gradient toward obstacle avoidance. v32 evaluates the barrier
+    # unconditionally so the drone is rewarded for keeping its distance
+    # whether or not the obstacle has been "discovered" by the sensor.
     obstacle_barrier = jnp.exp(-obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma))
-    r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier * obstacle_active, axis=-1)
+    r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier, axis=-1)
+
+    # v32: Gate-frame soft barrier. Each gate's 4 opening corners (from
+    # ``obs.GATE_HALF_SIZE_M``) form 4 line-segment edges in world frame.
+    # We compute the per-edge min squared distance from the drone to the
+    # segment, apply a Gaussian barrier, and sum over edges and gates.
+    # Applied to all gates equally — the drone should fly through the
+    # passage *center* of every gate, not graze any frame. With
+    # ``gate_frame_sigma=0.08 m`` and passage half-width 0.20 m the
+    # barrier at center is exp(-(0.20/0.08)^2) ≈ 0.002 (negligible),
+    # while at 0.10 m from the rim it's exp(-(0.10/0.08)^2) ≈ 0.21
+    # (steep avoidance gradient). Replaces the missing collision signal
+    # that v30 / v31 evals showed as "crashes into gate frames".
+    edge_dist_sq = _gate_frame_edge_dist_sq(pos, gates_pos, gates_quat)  # (n_envs, n_gates, 4)
+    gate_frame_barrier = jnp.exp(-edge_dist_sq / jnp.square(reward_cfg.gate_frame_sigma))
+    r_gate_frame = -reward_cfg.gate_frame_weight * jnp.sum(gate_frame_barrier, axis=(-1, -2))
 
     # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
     # pre-step target index because of the ``prev_target >= 0`` branch above,
@@ -277,6 +364,7 @@ def step_reward(
         "r_prog": r_prog,
         "r_omega": r_omega,
         "r_obs": r_obs,
+        "r_gate_frame": r_gate_frame,
         "r_gate_bonus": r_gate_bonus,
         "r_exit_vel": r_exit_vel,
         "r_terminal": r_terminal,
@@ -285,6 +373,15 @@ def step_reward(
         "r_guid": r_guid,
     }
     reward = (
-        r_prog + r_omega + r_obs + r_gate_bonus + r_exit_vel + r_terminal + r_time + r_vel + r_guid
+        r_prog
+        + r_omega
+        + r_obs
+        + r_gate_frame
+        + r_gate_bonus
+        + r_exit_vel
+        + r_terminal
+        + r_time
+        + r_vel
+        + r_guid
     )
     return reward, components

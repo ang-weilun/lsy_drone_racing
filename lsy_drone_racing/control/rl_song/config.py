@@ -246,8 +246,24 @@ class RewardConfig:
     # to make meaningful updates (value_loss collapsed to 0.012).
     finish_bonus: float = 100.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
-    obstacle_weight: float = 0.5
-    obstacle_sigma: float = 0.2  # m
+    # v32: bump sigma from 0.2 → 0.3 m so the penalty has a meaningful
+    # avoidance gradient at safe-but-close distances (old 0.2 m gave
+    # ~exp(-6.25) = 0.002 at 0.5 m, no learning signal until contact).
+    # weight stays at 0.2: per-step worst case ~4 obstacles × 1.0 × 0.2
+    # = -0.8/step, manageable cumulative over a 100-step episode.
+    obstacle_weight: float = 0.2
+    obstacle_sigma: float = 0.3  # m
+    # v32: Gate-frame soft barrier. Penalize proximity to gate frame
+    # edges (4 line segments per gate, connecting the opening corners
+    # from ``obs.GATE_HALF_SIZE_M``). The barrier extends ~sigma into
+    # the passage; with passage half-width 0.20 m and sigma=0.08 m,
+    # passage center gives exp(-(0.20/0.08)^2) ≈ 0.0019 (negligible),
+    # while approaching the rim at d=0.10 m gives exp(-(0.10/0.08)^2)
+    # ≈ 0.21 (strong gradient). Applied to all gates equally — the
+    # drone wants to fly through the passage center, not graze any
+    # frame.
+    gate_frame_weight: float = 0.2
+    gate_frame_sigma: float = 0.08  # m
     # v9: shrink gate jackpot from 20 to 2. The v7/v8 jackpot of 20×(idx+1)
     # paid 20/40/60/80 per gate, dominating r_prog (~+0.17/step ≈ +8.5 per
     # 50-step rollout) by 2-10×. Song 2023 and Kaufmann 2023 use dense
@@ -571,23 +587,27 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v31: same mix as v30 (Phase 1 seg-init at ``segment_init_prob=0.30``
-    velocity-aware 2.5 m/s, **plus** Song §III-B Phase 2 successful-state
-    replay at ``phase2_prob=0.30``, warm-up ``phase2_warmup_steps=50e6``,
-    40 / 30 / 30 % per-reset partition), but with the **layout-restoring
-    Phase 2 buffer**: each entry stores the absolute drone state AND
-    the full layout (Layer-1 placed + Layer-2 wobbled) it came from. On
-    replay we override both the drone state and the env's layout so the
-    respawn is geometrically self-consistent with everything the actor
-    observes. Fixes v30's regression which used a per-gate-frame
-    transform that warped against the new layout's independently-
-    randomized next gate (drones learned to crash into gates and fly
-    slow). See ``project_v30_phase2_failed.md`` for the post-mortem.
+    v32: reward fixes for the obstacle / gate-frame collision problem
+    v30 / v31 evals exposed. Same Phase 2 mix as v31
+    (``segment_init_prob=0.30`` velocity-aware 2.5 m/s, ``phase2_prob=0.30``,
+    warmup 50M, 40 / 30 / 30 % per-reset partition) and the same
+    layout-restoring buffer, but with two reward changes:
 
-    Warm-start from v26
-    (``level3_warmstart_seed0_v26_v25cont_300M``, current best level-3
-    controller with 1.625 gates/ep eval) via ``--init-from``; actor /
-    critic / normalizer are loaded, optimizer schedule restarts fresh.
+    * ``r_obs``: drop the ``obstacle_active = 1 - obstacles_visited``
+      mask (was zeroing the penalty exactly when the small-sigma
+      barrier became non-negligible) and bump ``obstacle_sigma`` from
+      0.2 → 0.3 m so the avoidance gradient extends to safe-but-close
+      distances.
+    * ``r_gate_frame`` (new): Gaussian barrier on point-to-segment
+      distance to each gate's 4 frame edges. Replaces the missing
+      collision signal — v30 / v31 drones crashed into gate bezels
+      because there was no per-step penalty for it.
+
+    **Cold-train 500M** rather than warm-starting from v26: v26's
+    policy ignores both new reward terms (since they were near-zero
+    during its training), and the un-learning cost outweighs the
+    transferable gate-passage knowledge. v7-style fresh init with
+    annealing entropy.
 
     v29 (history note): single level-3 stage with full distribution
     (``gate_rand_scale=1.0``), Song §III-B seg-init at
@@ -642,7 +662,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v31_layout_replay",
+                name="level3_v32_reward_fix",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
