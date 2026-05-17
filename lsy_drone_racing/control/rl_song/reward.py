@@ -29,12 +29,7 @@ GUIDANCE_AXIS_EPS_M2: float = 1e-8
 GUIDANCE_DENOM_EPS: float = 1e-8
 
 
-def _gate_phi(
-    pos: Array,
-    gate_pos: Array,
-    gate_quat: Array,
-    reward_cfg: RewardConfig,
-) -> Array:
+def _gate_phi(pos: Array, gate_pos: Array, gate_quat: Array, reward_cfg: RewardConfig) -> Array:
     """Compute the Δ-potential gate guidance scalar Φ(pos | gate).
 
     Φ = aperture_score(y,z) · sigmoid(-x / guide_kx)
@@ -129,8 +124,8 @@ def step_reward(
         Total replacement reward.
     components : dict[str, Array]
         Per-component rewards with keys ``r_prog``, ``r_omega``, ``r_obs``,
-        ``r_gate_bonus``, ``r_terminal``, ``r_time``, ``r_vel``, and
-        ``r_guid``. Every value has shape ``(n_envs,)``.
+        ``r_gate_bonus``, ``r_exit_vel``, ``r_terminal``, ``r_time``,
+        ``r_vel``, and ``r_guid``. Every value has shape ``(n_envs,)``.
     """
     _ = truncated
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
@@ -164,9 +159,7 @@ def step_reward(
         r_prog = reward_cfg.progress_coef * delta_local[..., 0]
     else:
         r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-        r_prog = reward_cfg.progress_coef * (
-            r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1)
-        )
+        r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
     r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
 
@@ -219,9 +212,7 @@ def step_reward(
         guide_field = jnp.where(x > 0.0, guide_front, guide_back)
         r_guid_raw = -reward_cfg.guide_coef * jnp.square(guide_window) * guide_field
     r_guid = jnp.where(
-        jnp.asarray(reward_cfg.use_guide, dtype=bool),
-        r_guid_raw,
-        jnp.zeros_like(r_prog),
+        jnp.asarray(reward_cfg.use_guide, dtype=bool), r_guid_raw, jnp.zeros_like(r_prog)
     )
 
     obstacle_delta = pos[:, None, :] - obstacles_pos
@@ -249,6 +240,29 @@ def step_reward(
         jnp.zeros_like(r_prog),
     )
 
+    # v28: exit-velocity bonus at gate-pass. See
+    # ``RewardConfig.use_exit_vel_bonus`` for motivation. Computes the
+    # signed projection of world-frame velocity onto the unit vector from
+    # the drone's current position to the new target gate (i.e. the gate
+    # that comes *after* the one just passed). Disabled on the finish step
+    # (``current_target == -1``) where there is no "next" gate.
+    new_target = current_target
+    n_gates = gates_pos.shape[1]
+    new_target_clamped = jnp.clip(new_target, 0, n_gates - 1)
+    next_gate_pos_for_exit = gates_pos[env_idx, new_target_clamped]
+    diff_to_next = next_gate_pos_for_exit - pos
+    norm_to_next = jnp.linalg.norm(diff_to_next, axis=-1, keepdims=True)
+    direction_to_next = diff_to_next / jnp.maximum(norm_to_next, 1e-6)
+    v_to_next = jnp.sum(env_obs["vel"] * direction_to_next, axis=-1)
+    exit_vel_active = (
+        jnp.asarray(reward_cfg.use_exit_vel_bonus, dtype=bool)
+        & gate_just_passed
+        & (new_target >= 0)
+    )
+    r_exit_vel = jnp.where(
+        exit_vel_active, reward_cfg.exit_vel_coef * v_to_next, jnp.zeros_like(r_prog)
+    )
+
     r_finish = jnp.where(finished, reward_cfg.finish_bonus, jnp.zeros_like(r_prog))
     r_crash = jnp.where(terminated & ~finished, -reward_cfg.crash_penalty, jnp.zeros_like(r_prog))
     r_terminal = r_finish + r_crash
@@ -264,12 +278,13 @@ def step_reward(
         "r_omega": r_omega,
         "r_obs": r_obs,
         "r_gate_bonus": r_gate_bonus,
+        "r_exit_vel": r_exit_vel,
         "r_terminal": r_terminal,
         "r_time": r_time,
         "r_vel": r_vel,
         "r_guid": r_guid,
     }
     reward = (
-        r_prog + r_omega + r_obs + r_gate_bonus + r_terminal + r_time + r_vel + r_guid
+        r_prog + r_omega + r_obs + r_gate_bonus + r_exit_vel + r_terminal + r_time + r_vel + r_guid
     )
     return reward, components

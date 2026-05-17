@@ -277,6 +277,24 @@ class RewardConfig:
     # from cold start; doubling it is cheap once gate 1 is found and
     # gives a louder gradient at the moment of first discovery.
     scale_gate_bonus_by_index: bool = True
+    # v28: exit-velocity bonus at gate-pass. v25/v26 level-3 evals (8-episode
+    # patched renders) showed a hover-then-shoot trajectory pattern: the
+    # policy brakes to ~zero velocity at every gate, then accelerates from
+    # rest to the next gate. Greedy ``r_prog`` rewards distance reduction to
+    # the *current* target only, so there is no signal that "arrive at gate
+    # N with velocity aimed at gate N+1" is preferred to "arrive at zero
+    # velocity". This term supplies that signal sparsely: at the moment a
+    # gate is passed, reward ``exit_vel_coef * (v · unit(next_gate_pos -
+    # pos))``. Signed, so it also punishes crossing a gate while moving
+    # backward (toward gate N-1). Disabled on the finish step (target_gate
+    # = -1, no "next" gate). Same triggering cadence as ``r_gate_bonus`` to
+    # avoid interfering with the dense r_prog gradient. The term is
+    # subordinate by design: at 3 m/s aligned velocity per pass, contributes
+    # +6 vs gate_pass_bonus's +40-160. Does *not* penalize any maneuver —
+    # extreme attitudes (e.g. v7's reverse-into-gate-4 trick) that preserve
+    # exit-velocity-toward-next-gate get a larger bonus, not a smaller one.
+    use_exit_vel_bonus: bool = True
+    exit_vel_coef: float = 2.0
     # v8: per-step time penalty. With randomized gates the random-init policy
     # has zero progress in expectation, while a stationary "hover" policy
     # collects zero shaping reward and just times out — making hover the Q≈0
