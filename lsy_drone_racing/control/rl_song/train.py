@@ -40,9 +40,12 @@ from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
 from lsy_drone_racing.control.rl_song.obs import NormalizerState
 from lsy_drone_racing.control.rl_song.policy import Actor, Critic, log_prob_of
 from lsy_drone_racing.control.rl_song.rollout import (
+    Phase2Buffer,
     RolloutMetricSums,
     RolloutScanOutputs,
     RolloutStaticConfig,
+    empty_phase2_buffer,
+    phase2_state_dim,
     scan_rollout,
 )
 
@@ -197,6 +200,19 @@ def train(args: CLIArgs) -> None:
     episode_returns = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
     episode_lengths = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
     next_done = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
+    # Per-env episode-source code (int8, see ``rollout.SRC_*``), persisted
+    # across rollout boundaries so per-source ``finish_rate_*`` metrics
+    # correctly classify episodes that span multiple ``n_steps`` chunks.
+    # Initialized to all-``SRC_TRUE_START``; the eager wrapper's initial
+    # reset may apply Phase 1 seg-init without tagging it, but that
+    # classification noise washes out within one episode length.
+    source = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.int8)
+    # Phase 2 successful-state buffer. Allocated empty and populated by
+    # successful gate-pass events during rollouts (B2 — not yet wired);
+    # sampled at reset for re-spawn (B3 — not yet wired). Capacity and
+    # n_obstacles come from the current stage / env so per-stage shape
+    # is fixed at construction.
+    phase2_buffer = _build_phase2_buffer(env, env.stage)
     target_gate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
     crash_rate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
     start_time = time.time()
@@ -212,12 +228,17 @@ def train(args: CLIArgs) -> None:
             next_done,
             episode_returns,
             episode_lengths,
+            source,
+            phase2_buffer,
+            global_step,
         )
         rng_key = rollout["rng_key"]
         next_obs = rollout["next_obs"]
         next_done = rollout["next_done"]
         episode_returns = rollout["episode_returns"]
         episode_lengths = rollout["episode_lengths"]
+        source = rollout["source"]
+        phase2_buffer = rollout["phase2_buffer"]
         global_step += ppo_cfg.batch_size
 
         next_value = _critic_value(critic_state.params, next_obs["critic_obs"]).reshape(-1)
@@ -258,6 +279,8 @@ def train(args: CLIArgs) -> None:
             next_done = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
             episode_returns = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
             episode_lengths = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.float32)
+            source = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.int8)
+            phase2_buffer = _build_phase2_buffer(env, env.stage)
 
         if wandb_run is not None:
             _log_iteration(
@@ -383,12 +406,15 @@ def _collect_rollout(
     next_done: Array,
     episode_returns: Array,
     episode_lengths: Array,
+    source: Array,
+    phase2_buffer: Phase2Buffer,
+    global_step: int,
 ) -> dict[str, Any]:
     """Collect one PPO rollout with the JAX-scanned race-core path."""
     if env.env is None:
         raise RuntimeError("Cannot collect a rollout before env construction.")
 
-    static_cfg = _rollout_static_config(env, ppo_cfg)
+    static_cfg = _rollout_static_config(env, ppo_cfg, global_step)
     # Track-perturbation placement buffers. Wrapper guarantees they're
     # initialized after ``env.reset()`` even for non-level-3 stages; for
     # those stages ``track_perturbation_enabled=False`` so the scan ignores
@@ -404,9 +430,11 @@ def _collect_rollout(
         next_done,
         episode_returns,
         episode_lengths,
+        source,
         env.placed_gates_pos,
         env.placed_gates_quat,
         env.placed_obstacles_pos,
+        phase2_buffer,
         env.env._step,
         env.env._reset,
         static_cfg,
@@ -421,6 +449,11 @@ def _collect_rollout(
     env.placed_gates_quat = scan_result.placed_gates_quat
     env.placed_obstacles_pos = scan_result.placed_obstacles_pos
     metrics = _rollout_metrics(scan_result.outputs, scan_result.metrics)
+    # Surface per-gate buffer fill for wandb. Slot 0 is unused; we still
+    # log it (it stays at 0) so the histogram axis labels are consistent.
+    phase2_fill = np.asarray(scan_result.phase2_buffer.fill)
+    for g, count in enumerate(phase2_fill):
+        metrics[f"phase2_buffer_fill_g{g}"] = float(count)
 
     return {
         "actor_obs": scan_result.outputs.actor_obs,
@@ -434,15 +467,44 @@ def _collect_rollout(
         "next_done": scan_result.next_done,
         "episode_returns": scan_result.episode_returns,
         "episode_lengths": scan_result.episode_lengths,
+        "source": scan_result.source,
+        "phase2_buffer": scan_result.phase2_buffer,
         "rng_key": scan_result.rng_key,
         "metrics": metrics,
     }
 
 
-def _rollout_static_config(env: RLSongVecEnv, ppo_cfg: PPOConfig) -> RolloutStaticConfig:
-    """Build the static config for the compiled rollout path."""
+def _build_phase2_buffer(env: RLSongVecEnv, stage: Any) -> Phase2Buffer:
+    """Allocate an empty Phase 2 buffer for the current stage.
+
+    ``n_gates`` and ``n_obstacles`` are read from the constructed env so
+    the buffer shape matches the env's track. Called once at startup and
+    again after each curriculum promotion (stage may carry a different
+    ``phase2_capacity_per_gate``).
+    """
+    if env.env is None:
+        raise RuntimeError("Cannot build Phase 2 buffer before env construction.")
+    n_gates = int(env.env.data.gates_pos.shape[1])
+    n_obstacles = int(env.env.data.obstacles_pos.shape[1])
+    state_dim = phase2_state_dim(n_obstacles)
+    return empty_phase2_buffer(n_gates, stage.phase2_capacity_per_gate, state_dim)
+
+
+def _rollout_static_config(
+    env: RLSongVecEnv, ppo_cfg: PPOConfig, global_step: int
+) -> RolloutStaticConfig:
+    """Build the static config for the compiled rollout path.
+
+    ``global_step`` gates ``phase2_prob``: during the curriculum stage's
+    warm-up window (``global_step < stage.phase2_warmup_steps``) the
+    effective probability is forced to 0.0 so the compiled scan never
+    samples from an empty Phase 2 buffer. Crossing the warm-up threshold
+    flips ``phase2_prob`` to the stage's configured value, which triggers
+    exactly one JIT re-trace.
+    """
     thrust_min, thrust_max = env.get_thrust_bounds()
     gate_pos_max, obstacle_pos_max = env.track_perturbation_bounds(env.stage)
+    phase2_prob = env.stage.phase2_prob if global_step >= env.stage.phase2_warmup_steps else 0.0
     return RolloutStaticConfig(
         n_steps=ppo_cfg.n_steps,
         n_envs=ppo_cfg.n_envs,
@@ -459,6 +521,8 @@ def _rollout_static_config(env: RLSongVecEnv, ppo_cfg: PPOConfig) -> RolloutStat
         segment_init_prob=env.stage.segment_init_prob,
         segment_init_perturb_m=env.stage.segment_init_perturb_m,
         segment_init_vel_mps=env.stage.segment_init_vel_mps,
+        phase2_prob=phase2_prob,
+        phase2_capacity_per_gate=env.stage.phase2_capacity_per_gate,
     )
 
 
@@ -468,13 +532,6 @@ def _rollout_metrics(
     """Convert scanned rollout tensors into Python logging metrics."""
     completed_count = metric_sums.completed_count
     completed_denominator = jnp.maximum(completed_count, 1.0)
-    # finish_rate_true_start: per-episode finish rate restricted to episodes
-    # that did NOT start with seg-init (i.e. true ground-spawn starts). Equal
-    # to ``finish_rate * ep_len`` only when ``segment_init_prob = 0``;
-    # otherwise this is the unbiased deployment metric and the unrestricted
-    # ``finish_rate`` (per-step) is inflated by the seg-init bias.
-    true_start_completed = metric_sums.true_start_completed_count
-    true_start_denominator = jnp.maximum(true_start_completed, 1.0)
     metrics = {
         "ep_ret": float(np.asarray(metric_sums.completed_return_sum / completed_denominator)),
         "ep_len": float(np.asarray(metric_sums.completed_length_sum / completed_denominator)),
@@ -485,11 +542,16 @@ def _rollout_metrics(
         ),
         "crash_rate": float(np.asarray(jnp.mean(outputs.crash.astype(jnp.float32)))),
         "finish_rate": float(np.asarray(jnp.mean(outputs.finished.astype(jnp.float32)))),
-        "true_start_episodes": float(np.asarray(true_start_completed)),
-        "finish_rate_true_start": float(
-            np.asarray(metric_sums.true_start_finished_count / true_start_denominator)
-        ),
     }
+    # Per-source finish-rate breakdown. finish_rate_true_start is the
+    # unbiased deployment metric; the Phase 1 / Phase 2 ratios diagnose
+    # how much the curriculum's respawn sources are contributing.
+    for src in ("true_start", "phase1_seg", "phase2_replay"):
+        src_completed = getattr(metric_sums, f"{src}_completed_count")
+        src_finished = getattr(metric_sums, f"{src}_finished_count")
+        src_denominator = jnp.maximum(src_completed, 1.0)
+        metrics[f"{src}_episodes"] = float(np.asarray(src_completed))
+        metrics[f"finish_rate_{src}"] = float(np.asarray(src_finished / src_denominator))
     for key, value_component in outputs.reward_components.items():
         metrics[key] = float(np.asarray(jnp.mean(value_component)))
     return metrics
@@ -780,11 +842,12 @@ def _log_iteration(
         "rollout/max_gate": rollout_metrics["max_gate_mean"],
         "rollout/crash_rate": rollout_metrics["crash_rate"],
         "rollout/finish_rate": rollout_metrics["finish_rate"],
-        "rollout/finish_rate_true_start": rollout_metrics["finish_rate_true_start"],
-        "rollout/true_start_episodes": rollout_metrics["true_start_episodes"],
     }
+    for src in ("true_start", "phase1_seg", "phase2_replay"):
+        log_data[f"rollout/finish_rate_{src}"] = rollout_metrics[f"finish_rate_{src}"]
+        log_data[f"rollout/{src}_episodes"] = rollout_metrics[f"{src}_episodes"]
     for key, value in rollout_metrics.items():
-        if key.startswith("r_"):
+        if key.startswith("r_") or key.startswith("phase2_buffer_fill_"):
             log_data[f"rollout/{key}"] = value
     wandb_run.log(log_data, step=global_step)
 

@@ -27,6 +27,7 @@ from lsy_drone_racing.control.rl_song.config import (
 )
 from lsy_drone_racing.control.rl_song.policy import raw_to_env_action
 from lsy_drone_racing.control.rl_song.reward import step_reward
+from lsy_drone_racing.control.rl_song.rollout import _refresh_aux_fields_after_respawn
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
 from lsy_drone_racing.envs.race_core import _reset_env_data
 from lsy_drone_racing.envs.race_core import obs as race_core_obs
@@ -573,6 +574,12 @@ class RLSongVecEnv:
 
         sim_data = data.sim_data.replace(states=new_states)
         self.env.data = data.replace(sim_data=sim_data, target_gate=new_target)
+        # Refresh ``last_drone_pos`` / ``takeoff_pos`` / ``gates_visited`` /
+        # ``obstacles_visited`` so they're consistent with the just-spawned
+        # state. Mirrors the in-scan call from ``rollout._apply_segment_init``.
+        self.env.data = _refresh_aux_fields_after_respawn(
+            self.env.data, do_seg, new_pos, segment_idx
+        )
 
     def _apply_track_perturbation(self, mask: Array) -> None:
         """Snap per-env placed buffer to current layout, then add ±max wobble.

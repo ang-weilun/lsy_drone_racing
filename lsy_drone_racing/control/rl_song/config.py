@@ -542,6 +542,21 @@ class CurriculumStage:
     # exploitable "spawned hovering" state distribution while still putting
     # the policy at later-gate approach poses for training.
     segment_init_vel_mps: float = 0.0
+    # Song 2023 §III-B Phase 2 successful-state buffer. With probability
+    # ``phase2_prob`` an env that just reset is re-spawned from a state
+    # sampled out of a per-gate stratified buffer of past successful
+    # gate-pass events. Distinct from Phase 1 seg-init: the buffer
+    # captures real trajectory states the policy has reached, instead of
+    # synthetic segment midpoints.
+    #
+    # Gated by a warm-up: until ``global_step >= phase2_warmup_steps`` the
+    # effective probability is 0.0 (the buffer needs time to populate, and
+    # an empty replay is wasted compute). Cross-warmup retraces the JIT
+    # cache once, then runs at the configured ``phase2_prob`` for the rest
+    # of the stage.
+    phase2_prob: float = 0.0
+    phase2_capacity_per_gate: int = 4096
+    phase2_warmup_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -556,7 +571,22 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v29: single level-3 stage with full distribution
+    v30: single level-3 stage with Phase 1 seg-init at
+    ``segment_init_prob=0.30`` (velocity-aware, 2.5 m/s) **plus** Song
+    §III-B Phase 2 successful-state replay at ``phase2_prob=0.30``
+    (warm-up ``phase2_warmup_steps=50e6`` lets the buffer populate
+    before any replay happens). Total per-reset partition: 40 % true
+    start, 30 % Phase 1, 30 % Phase 2 — keeps the true-start floor that
+    v29 lost when it pushed seg-init alone too hard.
+
+    Designed to **warm-start from v26**
+    (``level3_warmstart_seed0_v26_v25cont_300M``, the current best
+    level-3 controller with 1.625 gates/ep eval) so the takeoff skill
+    survives the curriculum change. Use ``--init-from`` to load v26's
+    actor / critic / normalizer; the optimizer schedule restarts
+    fresh.
+
+    v29 (history note): single level-3 stage with full distribution
     (``gate_rand_scale=1.0``), Song §III-B seg-init at
     ``segment_init_prob=0.5``, and **velocity-aware seg-init**
     (``segment_init_vel_mps=2.5``). Designed to cold-train from scratch
@@ -609,15 +639,18 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v29_segvel",
+                name="level3_v30_phase2",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=pi_over_4,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.5,
+                segment_init_prob=0.30,
                 segment_init_vel_mps=2.5,
+                phase2_prob=0.30,
+                phase2_capacity_per_gate=4096,
+                phase2_warmup_steps=50_000_000,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=0.3,
             ),

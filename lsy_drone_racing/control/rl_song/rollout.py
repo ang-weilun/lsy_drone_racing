@@ -20,6 +20,12 @@ SINGLE_DRONE_INDEX: int = 0
 RESET_RNG_SPLITS: int = 4
 YAW_TO_HALF_ANGLE: float = 0.5  # quaternion half-angle factor
 
+# Per-env episode-source enum stored in ``_ScanCarry.source``. Drives the
+# per-source ``finish_rate_*`` metrics. Width int8 keeps the carry small.
+SRC_TRUE_START: int = 0
+SRC_PHASE1_SEG: int = 1
+SRC_PHASE2_REPLAY: int = 2
+
 
 def _patch_env_obs_with_placed(
     env_obs: dict[str, Array],
@@ -134,6 +140,15 @@ class RolloutStaticConfig:
     # is given velocity ``segment_init_vel_mps * unit(next_gate - prev_anchor)``
     # at re-spawn instead of zero. See ``CurriculumStage.segment_init_vel_mps``.
     segment_init_vel_mps: float = 0.0
+    # Song 2023 §III-B Phase 2 successful-state buffer. ``phase2_prob`` is
+    # the *effective* probability inside the scan — the caller (train.py)
+    # zeroes it during the warm-up window so the rollout is traced with
+    # ``phase2_prob=0.0`` until the buffer has populated, then re-traced
+    # once with the configured value. ``phase2_capacity_per_gate`` is the
+    # per-gate ring-buffer capacity and is therefore part of the static
+    # shape contract.
+    phase2_prob: float = 0.0
+    phase2_capacity_per_gate: int = 4096
 
     @property
     def reset_perturbation_enabled(self) -> bool:
@@ -148,6 +163,71 @@ class RolloutStaticConfig:
         )
 
 
+class Phase2Buffer(NamedTuple):
+    """Per-gate stratified ring buffer of successful gate-pass states.
+
+    Implements Song 2023 §III-B Phase 2 — a buffer of past states the
+    policy has reached, from which selected envs are re-spawned at reset
+    so the policy practices later-gate approaches without having to
+    survive the early gates first. Stratification by target gate keeps
+    the buffer from being dominated by gate-0 → gate-1 transitions
+    (which are far more common than gate-(N-1) → finish transitions).
+
+    States are stored in the **previous gate's local frame**: the position
+    offset rotated by the gate's orientation, the velocity rotated to that
+    frame, and the orientation expressed relative to the gate. This makes
+    the buffer valid across level-3 track-randomization layouts:
+    reconstruction at replay applies the current layout's gate transform
+    to the stored local-frame entry.
+
+    Fields
+    ------
+    data : Array, shape (n_gates, capacity, state_dim), dtype float32
+        Ring-buffered entries. Slot index ``g`` holds states whose
+        ``target_gate == g``. Slot 0 is unused (every true-start episode
+        already approaches gate 0). Slot ``n_gates`` is never written
+        because finished states (``target_gate == -1``) are deliberately
+        filtered out.
+    ptr : Array, shape (n_gates,), dtype int32
+        Per-slot write head. Next write goes to ``data[g, ptr[g] % capacity]``.
+    fill : Array, shape (n_gates,), dtype int32
+        Per-slot count of valid entries, clipped to ``capacity``. Read
+        sampling masks slots with ``fill[g] == 0`` so empty slots aren't
+        sampled before being populated.
+    """
+
+    data: Array
+    ptr: Array
+    fill: Array
+
+
+# State-tuple layout for ``Phase2Buffer.data`` entries. The layout is
+# (pos_local, vel_local, quat_local, ang_vel, prev_action, obstacles_visited),
+# so ``state_dim = 17 + n_obstacles``. Used by both the write path
+# (concatenate into event tensor) and the read path (slice into named
+# components).
+PHASE2_STATE_FIXED_DIM: int = 3 + 3 + 4 + 3 + 4  # = 17
+
+
+def phase2_state_dim(n_obstacles: int) -> int:
+    """Return the per-entry state dim of a Phase 2 buffer at this n_obs."""
+    return PHASE2_STATE_FIXED_DIM + n_obstacles
+
+
+def empty_phase2_buffer(n_gates: int, capacity: int, state_dim: int) -> Phase2Buffer:
+    """Allocate an empty (all-zero) Phase 2 buffer.
+
+    Called once at training startup and again on each curriculum
+    promotion (so per-stage capacity changes drop the previous buffer
+    instead of trying to copy it).
+    """
+    return Phase2Buffer(
+        data=jnp.zeros((n_gates, capacity, state_dim), dtype=jnp.float32),
+        ptr=jnp.zeros((n_gates,), dtype=jnp.int32),
+        fill=jnp.zeros((n_gates,), dtype=jnp.int32),
+    )
+
+
 class RolloutScanOutputs(NamedTuple):
     """Stacked transition tensors emitted by the rollout scan.
 
@@ -160,6 +240,12 @@ class RolloutScanOutputs(NamedTuple):
         Per-component reward arrays, each shaped ``(n_steps, n_envs)``.
     target_gate_progress : Array, shape (n_steps, n_envs)
     crash, finished : Array, shape (n_steps, n_envs)
+    p2_event_valid : Array, shape (n_steps, n_envs), bool
+    p2_event_slot  : Array, shape (n_steps, n_envs), int32
+    p2_event_data  : Array, shape (n_steps, n_envs, state_dim), float32
+        Per-step Phase 2 buffer-write candidates. Folded into the buffer
+        once after the scan in ``_apply_phase2_writes``; the in-scan body
+        only emits them so the write itself doesn't run ``n_steps`` times.
     """
 
     actor_obs: Array
@@ -173,6 +259,9 @@ class RolloutScanOutputs(NamedTuple):
     target_gate_progress: Array
     crash: Array
     finished: Array
+    p2_event_valid: Array
+    p2_event_slot: Array
+    p2_event_data: Array
 
 
 class RolloutMetricSums(NamedTuple):
@@ -189,15 +278,14 @@ class RolloutMetricSums(NamedTuple):
         the average best-gate-reached per finished episode and is robust to
         the episode-length bias that distorts ``target_gate_mean`` for fast
         policies.
-    true_start_completed_count, true_start_finished_count : Array
-        Scalar counters restricted to episodes that did *not* start with
-        Song §III-B seg-init (i.e. true ground-spawn starts). Their ratio
-        is the unbiased ``finish_rate_true_start`` metric — it reports the
-        per-episode finish rate the controller would see when deployed on
-        a real ground spawn, regardless of how aggressively seg-init is
-        applied during training. When seg-init is disabled
-        (``segment_init_prob = 0``) both counters equal their unrestricted
-        counterparts ``completed_count`` and the finished-subset thereof.
+    (true_start|phase1_seg|phase2_replay)_(completed|finished)_count : Array
+        Scalar counters restricted to episodes that started from each of
+        the three sources (see ``SRC_*`` constants). Their per-source
+        ratios are the ``finish_rate_<source>`` metrics. The
+        ``finish_rate_true_start`` ratio is the unbiased deployment metric
+        — the per-episode finish rate the controller would see from a real
+        ground spawn, regardless of how aggressively the curriculum's
+        Phase 1 / Phase 2 respawns are applied during training.
     """
 
     completed_return_sum: Array
@@ -206,6 +294,10 @@ class RolloutMetricSums(NamedTuple):
     completed_max_gate_sum: Array
     true_start_completed_count: Array
     true_start_finished_count: Array
+    phase1_seg_completed_count: Array
+    phase1_seg_finished_count: Array
+    phase2_replay_completed_count: Array
+    phase2_replay_finished_count: Array
 
 
 class RolloutScanResult(NamedTuple):
@@ -220,6 +312,16 @@ class RolloutScanResult(NamedTuple):
     rng_key, reset_rng_key : Array, shape (2,)
         Updated policy-sampling and reset-perturbation keys.
     next_done, episode_returns, episode_lengths : Array, shape (n_envs,)
+    source : Array, shape (n_envs,), dtype int8
+        Per-env episode-source code at the end of the rollout (see
+        ``SRC_*`` constants). Plumbed back through the train loop so the
+        classification persists across rollout boundaries — episodes
+        longer than ``n_steps`` would otherwise be reclassified mid-flight,
+        biasing the per-source finish-rate metrics.
+    phase2_buffer : Phase2Buffer
+        Per-gate stratified buffer of successful gate-pass states after
+        this rollout's writes have been folded in. Plumbed back so the
+        next rollout reads from the latest buffer.
     next_env_obs : dict[str, Array]
         Squeezed race-core observation for the final state.
     next_obs : dict[str, Array]
@@ -237,6 +339,8 @@ class RolloutScanResult(NamedTuple):
     next_done: Array
     episode_returns: Array
     episode_lengths: Array
+    source: Array
+    phase2_buffer: Phase2Buffer
     next_env_obs: dict[str, Array]
     next_obs: dict[str, Array]
     outputs: RolloutScanOutputs
@@ -264,18 +368,21 @@ class _ScanCarry(NamedTuple):
     completed_length_sum: Array
     completed_count: Array
     completed_max_gate_sum: Array
-    # Per-env flag: True if the currently-running episode started via Song
-    # §III-B seg-init (re-spawned at a segment midpoint), False if it
-    # started from the true reset state (toml start position + reset
-    # perturbation). Updated on each ``done`` event using the ``do_seg``
-    # mask returned by ``_reset_done_worlds``. Drives the
-    # ``finish_rate_true_start`` metric: the dying episode's stats are
-    # tallied into ``true_start_*`` counters *only* if this flag was
-    # False, so the metric reports performance on the deployment
-    # state distribution regardless of seg-init aggressiveness.
-    is_seg_init: Array
+    # Per-env episode-source code (int8, see ``SRC_*`` constants). Tags
+    # how the currently-running episode started: from the true reset
+    # state, from a Song §III-B Phase 1 seg-init midpoint, or replayed
+    # from the Phase 2 successful-state buffer. Updated on each ``done``
+    # event using the source returned by ``_reset_done_worlds``. Drives
+    # the per-source ``finish_rate_*`` metrics: the dying episode's
+    # stats are tallied into the counter pair matching its source, so
+    # each ratio reports performance on its own start distribution.
+    source: Array
     true_start_completed_count: Array
     true_start_finished_count: Array
+    phase1_seg_completed_count: Array
+    phase1_seg_finished_count: Array
+    phase2_replay_completed_count: Array
+    phase2_replay_finished_count: Array
     # Per-env Layer-1 placement (pre-wobble), used to patch ``env_obs`` for
     # non-visited gates / obstacles so the actor sees the placement instead
     # of the framework's broken ``(0, 0, z)`` toml nominal. See
@@ -283,6 +390,13 @@ class _ScanCarry(NamedTuple):
     placed_gates_pos: Array
     placed_gates_quat: Array
     placed_obstacles_pos: Array
+    # Phase 2 successful-state buffer. Read by the reset path to sample
+    # replay states; written once after the scan (in ``scan_rollout``,
+    # not inside the scan body) using a masked-scatter pattern. Carrying
+    # it through the scan keeps the read path consistent across steps
+    # of the same rollout (writes from earlier steps are not visible to
+    # later same-rollout reads — by design, to avoid in-rollout feedback).
+    phase2_buffer: Phase2Buffer
 
 
 @partial(jax.jit, static_argnames=("env_step_fn", "env_reset_fn", "static_cfg"))
@@ -297,9 +411,11 @@ def scan_rollout(
     next_done: Array,
     episode_returns: Array,
     episode_lengths: Array,
+    source: Array,
     placed_gates_pos: Array,
     placed_gates_quat: Array,
     placed_obstacles_pos: Array,
+    phase2_buffer: Phase2Buffer,
     env_step_fn: EnvStepFn,
     env_reset_fn: EnvResetFn,
     static_cfg: RolloutStaticConfig,
@@ -324,6 +440,17 @@ def scan_rollout(
         Done flags carried from the previous rollout.
     episode_returns, episode_lengths : Array, shape (n_envs,)
         Partial episode statistics carried across rollout boundaries.
+    source : Array, shape (n_envs,), dtype int8
+        Per-env episode-source code carried from the previous rollout
+        (see ``SRC_*`` constants). The caller must persist this across
+        rollout boundaries: episodes longer than ``n_steps`` would
+        otherwise be reclassified as ``SRC_TRUE_START`` mid-flight,
+        biasing every per-source ``finish_rate_*`` metric.
+    phase2_buffer : Phase2Buffer
+        Per-gate stratified buffer of past successful gate-pass states.
+        Read by the in-scan reset path for Phase 2 replay (B3 — not yet
+        wired) and written once after the scan (B2 — not yet wired).
+        Threaded through unchanged by the B1 plumbing.
     env_step_fn : callable
         JIT-compatible ``RaceCoreEnv._step`` function.
     env_reset_fn : callable
@@ -347,16 +474,19 @@ def scan_rollout(
     calling SciPy inside the trace.
     """
     _validate_scan_inputs(
-        prev_action_env_4vec, next_done, episode_returns, episode_lengths, static_cfg
+        prev_action_env_4vec, next_done, episode_returns, episode_lengths, source, static_cfg
     )
     zero_scalar = jnp.asarray(0.0, dtype=jnp.float32)
     episode_max_gate = jnp.zeros_like(episode_returns)
-    # Initialize is_seg_init to all False (assume the first episode in each
-    # env is a true-start). The eager wrapper's initial reset may apply
-    # seg-init, so the very first batch of completed episodes can be
-    # mis-classified — but this washes out after one episode-length per env
-    # (~3-10 s of training), negligible against the 60+ min runs we do.
-    initial_is_seg_init = jnp.zeros_like(next_done, dtype=jnp.bool_)
+    # ``source`` is passed in by the caller (train.py) and threaded back
+    # out via ``RolloutScanResult.source`` so the per-env source code
+    # persists across rollout boundaries. Initializing here to all
+    # ``SRC_TRUE_START`` would reclassify episodes longer than
+    # ``n_steps`` mid-flight, inflating ``finish_rate_true_start`` and
+    # deflating the Phase 1 / Phase 2 ratios. The eager wrapper's first
+    # reset may apply Phase 1 seg-init without tagging it, so the first
+    # batch of completed episodes after process start can still be
+    # mis-classified; that washes out after one episode-length per env.
     initial_carry = _ScanCarry(
         env_data=env_data,
         prev_action_env_4vec=prev_action_env_4vec,
@@ -370,12 +500,17 @@ def scan_rollout(
         completed_length_sum=zero_scalar,
         completed_count=zero_scalar,
         completed_max_gate_sum=zero_scalar,
-        is_seg_init=initial_is_seg_init,
+        source=source,
         true_start_completed_count=zero_scalar,
         true_start_finished_count=zero_scalar,
+        phase1_seg_completed_count=zero_scalar,
+        phase1_seg_finished_count=zero_scalar,
+        phase2_replay_completed_count=zero_scalar,
+        phase2_replay_finished_count=zero_scalar,
         placed_gates_pos=placed_gates_pos,
         placed_gates_quat=placed_gates_quat,
         placed_obstacles_pos=placed_obstacles_pos,
+        phase2_buffer=phase2_buffer,
     )
 
     def scan_step(carry: _ScanCarry, _: None) -> tuple[_ScanCarry, RolloutScanOutputs]:
@@ -450,16 +585,30 @@ def scan_rollout(
         )
         completed_count = carry.completed_count + jnp.sum(done)
 
-        # finish_rate_true_start tally: a dying episode counts here iff it
-        # started from a true reset (carry.is_seg_init is False). Use the
-        # current is_seg_init *before* updating it for the just-reset envs
-        # below — the flag belongs to the episode that just ended.
-        true_start_done = done_bool & ~carry.is_seg_init
+        # Per-source finish-rate tally: a dying episode counts toward the
+        # counter pair matching its source code. Use ``carry.source``
+        # (the *pre-reset* value), so the dying episode's classification
+        # belongs to the episode that just ended.
+        true_start_done = done_bool & (carry.source == SRC_TRUE_START)
+        phase1_seg_done = done_bool & (carry.source == SRC_PHASE1_SEG)
+        phase2_replay_done = done_bool & (carry.source == SRC_PHASE2_REPLAY)
         true_start_completed_count = carry.true_start_completed_count + jnp.sum(
             true_start_done.astype(jnp.float32)
         )
         true_start_finished_count = carry.true_start_finished_count + jnp.sum(
             (true_start_done & finished).astype(jnp.float32)
+        )
+        phase1_seg_completed_count = carry.phase1_seg_completed_count + jnp.sum(
+            phase1_seg_done.astype(jnp.float32)
+        )
+        phase1_seg_finished_count = carry.phase1_seg_finished_count + jnp.sum(
+            (phase1_seg_done & finished).astype(jnp.float32)
+        )
+        phase2_replay_completed_count = carry.phase2_replay_completed_count + jnp.sum(
+            phase2_replay_done.astype(jnp.float32)
+        )
+        phase2_replay_finished_count = carry.phase2_replay_finished_count + jnp.sum(
+            (phase2_replay_done & finished).astype(jnp.float32)
         )
 
         (
@@ -469,6 +618,8 @@ def scan_rollout(
             next_placed_gates_quat,
             next_placed_obstacles_pos,
             do_seg,
+            do_phase2,
+            replay_prev_action,
         ) = _reset_done_worlds(
             stepped_data,
             done_bool,
@@ -476,14 +627,31 @@ def scan_rollout(
             carry.placed_gates_pos,
             carry.placed_gates_quat,
             carry.placed_obstacles_pos,
+            carry.phase2_buffer,
             env_reset_fn,
             static_cfg,
         )
-        # On done events, the new episode's is_seg_init is set from the
-        # do_seg mask returned by the reset path. Non-reset envs carry
-        # their existing flag forward.
-        next_is_seg_init = jnp.where(done_bool, do_seg, carry.is_seg_init)
+        # On done events, derive the new episode's source code from the
+        # reset path's two masks. Phase 2 wins over Phase 1 (they're
+        # disjoint by construction so the priority order doesn't actually
+        # matter, but the conditional keeps the intent explicit).
+        # Non-reset envs carry their existing source code forward.
+        reset_source = jnp.where(
+            do_phase2,
+            jnp.asarray(SRC_PHASE2_REPLAY, dtype=carry.source.dtype),
+            jnp.where(
+                do_seg,
+                jnp.asarray(SRC_PHASE1_SEG, dtype=carry.source.dtype),
+                jnp.asarray(SRC_TRUE_START, dtype=carry.source.dtype),
+            ),
+        )
+        next_source = jnp.where(done_bool, reset_source, carry.source)
+        # Default ``prev_action`` zeroing on done; Phase 2 replay
+        # overrides with the action stored alongside the replayed state
+        # so the policy's autoregressive input is consistent with the
+        # respawned pose.
         next_prev_action = jnp.where(done_bool[:, None], jnp.zeros_like(env_action), env_action)
+        next_prev_action = jnp.where(do_phase2[:, None], replay_prev_action, next_prev_action)
         next_episode_returns = jnp.where(done_bool, 0.0, episode_returns)
         next_episode_lengths = jnp.where(done_bool, 0.0, episode_lengths)
         next_episode_max_gate = jnp.where(done_bool, 0.0, episode_max_gate)
@@ -502,12 +670,28 @@ def scan_rollout(
             completed_length_sum=completed_length_sum,
             completed_count=completed_count,
             completed_max_gate_sum=completed_max_gate_sum,
-            is_seg_init=next_is_seg_init,
+            source=next_source,
             true_start_completed_count=true_start_completed_count,
             true_start_finished_count=true_start_finished_count,
+            phase1_seg_completed_count=phase1_seg_completed_count,
+            phase1_seg_finished_count=phase1_seg_finished_count,
+            phase2_replay_completed_count=phase2_replay_completed_count,
+            phase2_replay_finished_count=phase2_replay_finished_count,
             placed_gates_pos=next_placed_gates_pos,
             placed_gates_quat=next_placed_gates_quat,
             placed_obstacles_pos=next_placed_obstacles_pos,
+            # Buffer round-trips unchanged in B1 — writes land after the
+            # scan in B2. In-scan reads for Phase 2 replay land in B3.
+            phase2_buffer=carry.phase2_buffer,
+        )
+        p2_event_valid, p2_event_slot, p2_event_data = _compute_phase2_event(
+            stepped_data=stepped_data,
+            next_env_obs=next_env_obs,
+            env_action=env_action,
+            current_target=current_target,
+            gate_just_passed=gate_just_passed,
+            done_bool=done_bool,
+            source=carry.source,
         )
         transition = RolloutScanOutputs(
             actor_obs=actor_obs,
@@ -521,10 +705,25 @@ def scan_rollout(
             target_gate_progress=target_gate_progress,
             crash=crash,
             finished=finished,
+            p2_event_valid=p2_event_valid,
+            p2_event_slot=p2_event_slot,
+            p2_event_data=p2_event_data,
         )
         return next_carry, transition
 
     final_carry, outputs = jax.lax.scan(scan_step, initial_carry, None, length=static_cfg.n_steps)
+    # Fold this rollout's gate-pass events into the Phase 2 buffer once
+    # (instead of n_steps times inside the scan body). ``n_gates`` is a
+    # Python int known at trace time, so the per-slot loop unrolls.
+    n_gates_for_writes = int(env_data.gates_pos.shape[1])
+    updated_phase2_buffer = _apply_phase2_writes(
+        final_carry.phase2_buffer,
+        outputs.p2_event_valid,
+        outputs.p2_event_slot,
+        outputs.p2_event_data,
+        n_gates_for_writes,
+    )
+    final_carry = final_carry._replace(phase2_buffer=updated_phase2_buffer)
     next_env_obs = _patch_env_obs_with_placed(
         _single_drone_obs(race_core_obs(final_carry.env_data)),
         final_carry.placed_gates_pos,
@@ -550,6 +749,10 @@ def scan_rollout(
         completed_max_gate_sum=final_carry.completed_max_gate_sum,
         true_start_completed_count=final_carry.true_start_completed_count,
         true_start_finished_count=final_carry.true_start_finished_count,
+        phase1_seg_completed_count=final_carry.phase1_seg_completed_count,
+        phase1_seg_finished_count=final_carry.phase1_seg_finished_count,
+        phase2_replay_completed_count=final_carry.phase2_replay_completed_count,
+        phase2_replay_finished_count=final_carry.phase2_replay_finished_count,
     )
     return RolloutScanResult(
         env_data=final_carry.env_data,
@@ -559,6 +762,8 @@ def scan_rollout(
         next_done=final_carry.next_done,
         episode_returns=final_carry.episode_returns,
         episode_lengths=final_carry.episode_lengths,
+        source=final_carry.source,
+        phase2_buffer=final_carry.phase2_buffer,
         next_env_obs=next_env_obs,
         next_obs={"actor_obs": next_actor_obs, "critic_obs": next_critic_obs},
         outputs=outputs,
@@ -574,6 +779,7 @@ def _validate_scan_inputs(
     next_done: Array,
     episode_returns: Array,
     episode_lengths: Array,
+    source: Array,
     static_cfg: RolloutStaticConfig,
 ) -> None:
     """Validate static rollout input shapes before tracing the scan."""
@@ -587,6 +793,7 @@ def _validate_scan_inputs(
         ("next_done", next_done),
         ("episode_returns", episode_returns),
         ("episode_lengths", episode_lengths),
+        ("source", source),
     ):
         if value.shape != (n_envs,):
             raise ValueError(f"{name} must have shape {(n_envs,)}; got {value.shape}")
@@ -599,20 +806,27 @@ def _reset_done_worlds(
     placed_gates_pos: Array,
     placed_gates_quat: Array,
     placed_obstacles_pos: Array,
+    phase2_buffer: Phase2Buffer,
     env_reset_fn: EnvResetFn,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array, Array]:
+) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
     """Reset completed worlds and apply curriculum perturbations.
 
     Returns ``(env_data, rng_key, placed_gates_pos, placed_gates_quat,
-    placed_obstacles_pos, do_seg)``. The placed snapshots reflect the
-    Layer-1 placement (pre-wobble) for envs that were just reset and the
-    previous values for envs that were not. ``do_seg`` is a per-env bool
-    mask indicating which envs had their state replaced by seg-init this
-    call; envs not reset have ``do_seg = False``.
+    placed_obstacles_pos, do_seg, do_phase2, replay_prev_action)``. The
+    placed snapshots reflect the Layer-1 placement (pre-wobble) for envs
+    that were just reset and the previous values for envs that were not.
+    ``do_seg`` / ``do_phase2`` are per-env bool masks identifying which
+    envs had their state replaced by each respawn source. ``replay_prev_action``
+    is the env-action 4-vec from each Phase 2-replayed entry — the scan
+    caller uses it to overwrite ``prev_action_env_4vec`` for those envs.
+    Envs not reset have all-False masks and zero replay_prev_action.
     """
+    n_envs_local = done.shape[0]
 
-    def reset_branch(data: EnvData) -> tuple[EnvData, Array, Array, Array, Array, Array]:
+    def reset_branch(
+        data: EnvData,
+    ) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
         reset_data, _ = env_reset_fn(data, None, done)
         return _apply_reset_perturbation(
             reset_data,
@@ -621,6 +835,7 @@ def _reset_done_worlds(
             placed_gates_pos,
             placed_gates_quat,
             placed_obstacles_pos,
+            phase2_buffer,
             static_cfg,
         )
 
@@ -634,6 +849,8 @@ def _reset_done_worlds(
             placed_gates_quat,
             placed_obstacles_pos,
             jnp.zeros_like(done, dtype=jnp.bool_),
+            jnp.zeros_like(done, dtype=jnp.bool_),
+            jnp.zeros((n_envs_local, ENV_ACTION_DIM), dtype=jnp.float32),
         ),
         env_data,
     )
@@ -646,19 +863,18 @@ def _apply_reset_perturbation(
     placed_gates_pos: Array,
     placed_gates_quat: Array,
     placed_obstacles_pos: Array,
+    phase2_buffer: Phase2Buffer,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array, Array]:
+) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
     """Apply curriculum drone-state and track perturbations in pure JAX.
 
     Returns the updated env data, RNG key, per-env ``placed_*`` snapshots
-    (Layer-1 layout, *before* the Layer-2 wobble is added), and the
-    ``do_seg`` mask identifying which envs had their state replaced by
-    seg-init this call. Callers plumb ``placed_*`` through their carry /
-    instance state to patch ``env_obs["gates_pos"]`` for non-visited
-    entries (the framework's ``nominal_*`` fields can't be repurposed
-    because ``race_core.obs`` assumes they have shape ``(n_gates, 3)``)
-    and use ``do_seg`` to update the per-env ``is_seg_init`` flag that
-    drives the ``finish_rate_true_start`` metric.
+    (Layer-1 layout, *before* the Layer-2 wobble is added), and the two
+    masks ``do_seg`` / ``do_phase2`` identifying which envs were
+    respawned by which path, plus ``replay_prev_action`` (the env-action
+    4-vec from each Phase 2-replayed entry, used to overwrite
+    ``prev_action_env_4vec`` on respawn so the policy's autoregressive
+    input is consistent with the replayed state).
 
     Order of operations:
 
@@ -671,6 +887,9 @@ def _apply_reset_perturbation(
        ``track_perturbation_enabled``.
     3. ``_reset_env_data`` to recompute ``gates_visited`` etc. with the
        final (Layer-1+2) positions.
+    4. Three-way categorical: assign each just-reset env to Phase 2
+       replay, Phase 1 seg-init, or true start. Apply each branch on
+       its mask.
     """
     # Snapshot the toml start position before any perturbation is applied.
     # ``_apply_segment_init`` consumes this as the segment-0 anchor.
@@ -732,29 +951,196 @@ def _apply_reset_perturbation(
         )
 
     env_data = _reset_env_data(env_data, mask)
-    if static_cfg.segment_init_prob > 0.0:
-        env_data, rng_key, do_seg = _apply_segment_init(
-            env_data, mask, rng_key, placed_gates_pos, start_pos, static_cfg
+
+    # Three-way categorical reset partition. A single uniform draw
+    # assigns each just-reset env to Phase 2 replay (u < p_p2), Phase 1
+    # seg-init (p_p2 <= u < p_p2 + p_p1), or true start (rest). Phase 2
+    # and Phase 1 are mutually exclusive by construction. When
+    # ``p_phase2 == 0`` (warm-up) Phase 2 is skipped entirely; when
+    # ``segment_init_prob == 0`` Phase 1 is skipped entirely.
+    n_envs = mask.shape[0]
+    if static_cfg.phase2_prob > 0.0 or static_cfg.segment_init_prob > 0.0:
+        rng_key, cat_key = jax.random.split(rng_key)
+        u = jax.random.uniform(cat_key, shape=(n_envs,))
+    else:
+        u = jnp.zeros((n_envs,), dtype=jnp.float32)
+    do_phase2_desired = mask & (u < static_cfg.phase2_prob)
+    do_seg_desired = (
+        mask
+        & (u >= static_cfg.phase2_prob)
+        & (u < static_cfg.phase2_prob + static_cfg.segment_init_prob)
+    )
+
+    # Phase 2: replay from the successful-state buffer. ``do_phase2`` may
+    # be a strict subset of ``do_phase2_desired`` if the buffer has no
+    # non-empty slots yet (the envs that wanted replay fall back to
+    # true-start, not to Phase 1, to keep the categorical interpretable).
+    if static_cfg.phase2_prob > 0.0:
+        env_data, rng_key, do_phase2, replay_prev_action = _apply_phase2_replay(
+            env_data, do_phase2_desired, rng_key, phase2_buffer
         )
     else:
+        do_phase2 = jnp.zeros_like(mask, dtype=jnp.bool_)
+        replay_prev_action = jnp.zeros((n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+
+    # Phase 1: seg-init on the precomputed mask (independent of buffer state).
+    if static_cfg.segment_init_prob > 0.0:
+        env_data, rng_key = _apply_segment_init(
+            env_data, do_seg_desired, rng_key, placed_gates_pos, start_pos, static_cfg
+        )
+        do_seg = do_seg_desired
+    else:
         do_seg = jnp.zeros_like(mask, dtype=jnp.bool_)
-    return env_data, rng_key, placed_gates_pos, placed_gates_quat, placed_obstacles_pos, do_seg
+    return (
+        env_data,
+        rng_key,
+        placed_gates_pos,
+        placed_gates_quat,
+        placed_obstacles_pos,
+        do_seg,
+        do_phase2,
+        replay_prev_action,
+    )
+
+
+def _apply_phase2_replay(
+    env_data: EnvData, do_phase2_desired: Array, rng_key: Array, buffer: Phase2Buffer
+) -> tuple[EnvData, Array, Array, Array]:
+    """Re-spawn selected envs from the Phase 2 successful-state buffer.
+
+    Samples one buffer entry per env in ``do_phase2_desired``:
+
+    1. Pick a slot ``g`` uniformly over non-empty slots (excluding the
+       unused slot 0). If every slot is empty, the effective mask
+       collapses to all-False and no override happens — the caller's
+       categorical leaves these envs at true-start.
+    2. Pick an entry index uniformly in ``[0, fill[g])``.
+    3. Read the stored gate-frame state and reconstruct world-frame
+       quantities against the current layout's gate ``g - 1`` pose.
+    4. Override ``sim_data.states.pos / vel / quat / ang_vel`` and
+       ``target_gate`` for the selected envs; refresh aux fields via
+       :func:`_refresh_aux_fields_after_respawn`.
+
+    Returns
+    -------
+    env_data : EnvData
+        Env state with the Phase 2 overrides applied.
+    rng_key : Array
+        Advanced PRNG key.
+    do_phase2_effective : Array, shape (n_envs,), bool
+        Mask of envs whose state was actually replaced (== desired mask
+        when at least one slot is non-empty; all-False otherwise).
+    replay_prev_action : Array, shape (n_envs, ENV_ACTION_DIM), float32
+        Per-env env-action 4-vec from the replayed buffer entry. Used
+        by the caller to override ``prev_action_env_4vec`` for the
+        replayed envs so the policy's autoregressive input matches the
+        replayed state.
+    """
+    n_envs = env_data.gates_pos.shape[0]
+    n_gates = env_data.gates_pos.shape[1]
+    n_obstacles = env_data.obstacles_pos.shape[1]
+
+    rng_key, slot_key, idx_key = jax.random.split(rng_key, 3)
+
+    # Sample slot uniformly over non-empty gates. Slot 0 is unused
+    # (drones already approach gate 0 from every true-start episode);
+    # mask it out. If all sampleable slots are empty, fall back to
+    # do_phase2_effective = False — the caller leaves these envs as
+    # true-start, no override applied.
+    sampleable = (buffer.fill > 0).at[0].set(False)
+    any_sampleable = jnp.any(sampleable)
+    logits = jnp.where(sampleable, 0.0, -jnp.inf)
+    g_raw = jax.random.categorical(slot_key, logits, shape=(n_envs,))
+    # Guard for the all-empty case where categorical's output is
+    # undefined; the where-mask below discards the result anyway, but
+    # we clamp the index so the gathers don't read garbage.
+    g_safe = jnp.clip(g_raw, 1, n_gates - 1)
+
+    slot_fill = buffer.fill[g_safe]
+    entry_idx = jax.random.randint(
+        idx_key, shape=(n_envs,), minval=0, maxval=jnp.maximum(slot_fill, 1)
+    )
+    entry = buffer.data[g_safe, entry_idx]  # (n_envs, state_dim)
+
+    # Unpack the gate-frame state (matches _compute_phase2_event's layout).
+    pos_local = entry[..., 0:3]
+    vel_local = entry[..., 3:6]
+    quat_local = entry[..., 6:10]
+    ang_vel = entry[..., 10:13]
+    prev_action = entry[..., 13:17]
+    obstacles_visited_f = entry[..., 17 : 17 + n_obstacles]
+
+    # Reconstruct world-frame using current-layout previous gate.
+    env_arange = jnp.arange(n_envs)
+    prev_gate_idx = g_safe - 1
+    prev_gate_pos = env_data.gates_pos[env_arange, prev_gate_idx]
+    prev_gate_quat = env_data.gates_quat[env_arange, prev_gate_idx]
+    rot_prev = _quat_to_rotmat(prev_gate_quat)
+
+    pos_world = prev_gate_pos + jnp.einsum("nij,nj->ni", rot_prev, pos_local)
+    pos_world = jnp.clip(pos_world, env_data.pos_limit_low, env_data.pos_limit_high)
+    vel_world = jnp.einsum("nij,nj->ni", rot_prev, vel_local)
+    quat_world = _quat_multiply_xyzw(prev_gate_quat, quat_local)
+
+    # Effective mask: desired AND buffer has at least one usable entry.
+    do_phase2_effective = do_phase2_desired & any_sampleable
+
+    # Override env state for selected envs.
+    mask_b3 = do_phase2_effective[:, None, None]
+    states = env_data.sim_data.states
+    new_states = states.replace(
+        pos=jnp.where(mask_b3, pos_world[:, None, :], states.pos),
+        vel=jnp.where(mask_b3, vel_world[:, None, :], states.vel),
+        quat=jnp.where(mask_b3, quat_world[:, None, :], states.quat),
+        ang_vel=jnp.where(mask_b3, ang_vel[:, None, :], states.ang_vel),
+    )
+    new_target = jnp.where(
+        do_phase2_effective[:, None],
+        g_safe[:, None].astype(env_data.target_gate.dtype),
+        env_data.target_gate,
+    )
+    sim_data = env_data.sim_data.replace(states=new_states)
+    env_data = env_data.replace(sim_data=sim_data, target_gate=new_target)
+    env_data = _refresh_aux_fields_after_respawn(env_data, do_phase2_effective, pos_world, g_safe)
+
+    # Override obstacles_visited with the stored entry (overrides the
+    # default-True fallback set by ``_refresh_aux_fields_after_respawn``
+    # — Phase 2 replay knows exactly which obstacles the original
+    # trajectory had observed, so use that rather than defaulting all).
+    replayed_obs_visited = obstacles_visited_f > 0.5
+    new_obstacles_visited = jnp.where(
+        do_phase2_effective[:, None, None],
+        replayed_obs_visited[:, None, :],
+        env_data.obstacles_visited,
+    )
+    env_data = env_data.replace(obstacles_visited=new_obstacles_visited)
+
+    # Mask prev_action to zero for envs that did NOT replay (otherwise
+    # the gather above produced arbitrary bytes that we'd accidentally
+    # overwrite the caller's action with).
+    replay_prev_action = jnp.where(do_phase2_effective[:, None], prev_action, 0.0)
+
+    return env_data, rng_key, do_phase2_effective, replay_prev_action
 
 
 def _apply_segment_init(
     env_data: EnvData,
-    mask: Array,
+    do_seg: Array,
     rng_key: Array,
     placed_gates_pos: Array,
     start_pos: Array,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array]:
-    """Re-spawn a Bernoulli-selected subset of envs at random segment centers.
+) -> tuple[EnvData, Array]:
+    """Re-spawn the envs identified by ``do_seg`` at random segment centers.
 
     Pure-JAX counterpart of ``RLSongVecEnv._apply_segment_init`` used inside
     the scanned rollout path. Both branches must produce the same
     state-distribution semantics for the policy. Implements Song 2023
     §III-B Phase 1 (state-coverage initial-state distribution).
+
+    Selection is now done by the caller (``_apply_reset_perturbation``)
+    via a three-way categorical that also dispatches Phase 2 replay; this
+    function only applies the override on the envs the caller pre-selected.
 
     v29: when ``static_cfg.segment_init_vel_mps > 0`` the seg-init re-spawn
     velocity is set to ``segment_init_vel_mps * unit(next_gate -
@@ -767,8 +1153,10 @@ def _apply_segment_init(
     ----------
     env_data : EnvData
         Post-``_reset_env_data`` env state.
-    mask : Array, shape (n_envs,)
-        Envs eligible for segment init (i.e., those that just reset).
+    do_seg : Array, shape (n_envs,), dtype bool
+        Pre-computed mask of envs to apply seg-init to. Caller's
+        responsibility to ensure these envs are also marked as
+        ``SRC_PHASE1_SEG`` in the source enum.
     rng_key : Array
         PRNG key; consumed and returned.
     placed_gates_pos : Array, shape (n_envs, n_gates, 3)
@@ -777,8 +1165,7 @@ def _apply_segment_init(
     start_pos : Array, shape (n_envs, n_drones, 3)
         Pre-perturbation drone position used as the segment-0 anchor.
     static_cfg : RolloutStaticConfig
-        Provides ``segment_init_prob``, ``segment_init_perturb_m`` and
-        ``segment_init_vel_mps``.
+        Provides ``segment_init_perturb_m`` and ``segment_init_vel_mps``.
 
     Returns
     -------
@@ -787,16 +1174,10 @@ def _apply_segment_init(
         overridden for the selected envs.
     rng_key : Array
         Advanced PRNG key.
-    do_seg : Array, shape (n_envs,)
-        Boolean mask of envs whose state was overridden by seg-init this
-        call. Plumbed back to ``scan_rollout`` so the per-env
-        ``is_seg_init`` flag (used by the ``finish_rate_true_start``
-        metric) can be updated.
     """
-    rng_key, bern_key, seg_key, jit_key = jax.random.split(rng_key, 4)
+    rng_key, seg_key, jit_key = jax.random.split(rng_key, 3)
     n_envs = env_data.gates_pos.shape[0]
     n_gates = env_data.gates_pos.shape[1]
-    do_seg = jax.random.bernoulli(bern_key, p=static_cfg.segment_init_prob, shape=(n_envs,)) & mask
     segment_idx = jax.random.randint(seg_key, shape=(n_envs,), minval=0, maxval=n_gates)
     env_arange = jnp.arange(n_envs)
     prev_idx = jnp.clip(segment_idx - 1, 0, n_gates - 1)
@@ -839,7 +1220,231 @@ def _apply_segment_init(
 
     sim_data = env_data.sim_data.replace(states=new_states)
     env_data = env_data.replace(sim_data=sim_data, target_gate=new_target)
-    return env_data, rng_key, do_seg
+    env_data = _refresh_aux_fields_after_respawn(env_data, do_seg, new_pos, segment_idx)
+    return env_data, rng_key
+
+
+def _refresh_aux_fields_after_respawn(
+    env_data: EnvData, mask: Array, new_pos: Array, new_target_gate: Array
+) -> EnvData:
+    """Recompute ``EnvData`` aux fields after a seg-init / Phase 2 respawn.
+
+    ``_apply_segment_init`` and the future Phase 2 replay override
+    ``sim_data.states.pos / vel / quat`` and ``target_gate`` but leave
+    ``last_drone_pos``, ``takeoff_pos``, ``gates_visited`` and
+    ``obstacles_visited`` stale. Stale ``last_drone_pos`` corrupts the
+    next step's ``check_gate_pass`` line-crossing test; stale
+    ``takeoff_pos`` corrupts the platform-departure crash logic in
+    ``race_core.py:check_done``; stale ``gates_visited`` mis-masks the
+    actor observation.
+
+    Parameters
+    ----------
+    env_data : EnvData
+        Env state after the respawn override has been applied to
+        ``sim_data.states`` and ``target_gate``.
+    mask : Array, shape (n_envs,)
+        Per-env mask identifying which envs were respawned this call.
+        Non-masked envs are left untouched.
+    new_pos : Array, shape (n_envs, 3)
+        Post-respawn world-frame drone position. Used for both
+        ``last_drone_pos`` (line-crossing reference) and ``takeoff_pos``
+        (platform reference). Setting ``takeoff_pos`` to ``new_pos``
+        means the platform-check is satisfied trivially on the first
+        post-respawn step — a respawned drone hovers off-platform.
+    new_target_gate : Array, shape (n_envs,)
+        New target-gate index. ``gates_visited`` is reconstructed
+        deterministically as ``[i < new_target_gate for i in range(n_gates)]``.
+
+    Returns
+    -------
+    EnvData
+        Env state with aux fields consistent with the respawned position
+        and target. Single-drone assumption (drone axis size 1).
+    """
+    mask_drone3 = mask[:, None, None]  # (n_envs, 1, 1) for (n_envs, n_drones, 3)
+    new_pos_drones = jnp.broadcast_to(new_pos[:, None, :], env_data.last_drone_pos.shape)
+    n_gates = env_data.gates_visited.shape[-1]
+    gate_indices = jnp.arange(n_gates)
+    new_gates_visited = jnp.broadcast_to(
+        gate_indices[None, None, :] < new_target_gate[:, None, None], env_data.gates_visited.shape
+    )
+    # Default-True for obstacles: a respawned drone is assumed to have
+    # already seen the course's obstacles. This avoids spurious
+    # sensor-bonus rewards on the first post-respawn step and matches
+    # the typical mid-course state distribution.
+    new_obstacles_visited = jnp.ones_like(env_data.obstacles_visited)
+    return env_data.replace(
+        last_drone_pos=jnp.where(mask_drone3, new_pos_drones, env_data.last_drone_pos),
+        takeoff_pos=jnp.where(mask_drone3, new_pos_drones, env_data.takeoff_pos),
+        gates_visited=jnp.where(mask_drone3, new_gates_visited, env_data.gates_visited),
+        obstacles_visited=jnp.where(mask_drone3, new_obstacles_visited, env_data.obstacles_visited),
+    )
+
+
+def _quat_conjugate(quat: Array) -> Array:
+    """Return the conjugate of an xyzw quaternion (== inverse for unit quats)."""
+    return quat * jnp.asarray([-1.0, -1.0, -1.0, 1.0], dtype=quat.dtype)
+
+
+def _quat_to_rotmat(quat: Array) -> Array:
+    """Return the active rotation matrix for an xyzw quaternion.
+
+    For a unit quaternion ``q`` and a vector ``v_local`` in the body
+    frame, the rotated vector in the world frame is ``R(q) @ v_local``.
+
+    Parameters
+    ----------
+    quat : Array, shape (..., 4)
+        xyzw quaternions (last axis = components). Need not be unit.
+
+    Returns
+    -------
+    Array, shape (..., 3, 3)
+    """
+    x = quat[..., 0]
+    y = quat[..., 1]
+    z = quat[..., 2]
+    w = quat[..., 3]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    row0 = jnp.stack([1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)], axis=-1)
+    row1 = jnp.stack([2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)], axis=-1)
+    row2 = jnp.stack([2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)], axis=-1)
+    return jnp.stack([row0, row1, row2], axis=-2)
+
+
+def _compute_phase2_event(
+    stepped_data: EnvData,
+    next_env_obs: dict[str, Array],
+    env_action: Array,
+    current_target: Array,
+    gate_just_passed: Array,
+    done_bool: Array,
+    source: Array,
+) -> tuple[Array, Array, Array]:
+    """Build per-env Phase 2 event tensors for one scan step.
+
+    For every env that just passed a gate (and meets the storage
+    filters), packs the post-step drone state into the per-gate buffer
+    state layout, expressed in the **previous gate's local frame** so
+    the entry is valid against later layouts (level-3 randomization).
+
+    Filters (codex): valid iff
+    * ``gate_just_passed`` this step,
+    * the new ``current_target`` indexes a writable slot
+      (``1 <= current_target < n_gates``); slot 0 is unused and
+      ``current_target == -1`` means finished,
+    * the episode did not crash / truncate on the pass step
+      (``~done_bool``), and
+    * the dying episode's source was not itself a Phase 2 replay (avoid
+      buffer feeding itself).
+
+    Returns
+    -------
+    event_valid : Array, shape (n_envs,), bool
+    event_slot  : Array, shape (n_envs,), int32 (the new target gate index)
+    event_data  : Array, shape (n_envs, state_dim)
+    """
+    n_envs = stepped_data.gates_pos.shape[0]
+    n_gates = stepped_data.gates_pos.shape[1]
+    env_arange = jnp.arange(n_envs)
+    # ``current_target`` is the gate now being approached, so the gate
+    # that was just passed is ``current_target - 1``. Clip the index so
+    # the gather is safe for envs where the filter mask will reject the
+    # event anyway (slot 0 or finished).
+    prev_idx = jnp.clip(current_target - 1, 0, n_gates - 1)
+    prev_gate_pos = stepped_data.gates_pos[env_arange, prev_idx]
+    prev_gate_quat = stepped_data.gates_quat[env_arange, prev_idx]
+    rot_prev_t = jnp.swapaxes(_quat_to_rotmat(prev_gate_quat), -1, -2)
+
+    drone_pos = stepped_data.sim_data.states.pos[:, SINGLE_DRONE_INDEX]
+    drone_vel = stepped_data.sim_data.states.vel[:, SINGLE_DRONE_INDEX]
+    drone_quat = stepped_data.sim_data.states.quat[:, SINGLE_DRONE_INDEX]
+    drone_ang_vel = stepped_data.sim_data.states.ang_vel[:, SINGLE_DRONE_INDEX]
+
+    pos_local = jnp.einsum("nij,nj->ni", rot_prev_t, drone_pos - prev_gate_pos)
+    vel_local = jnp.einsum("nij,nj->ni", rot_prev_t, drone_vel)
+    quat_local = _quat_multiply_xyzw(_quat_conjugate(prev_gate_quat), drone_quat)
+
+    obstacles_visited = next_env_obs["obstacles_visited"].astype(jnp.float32)
+
+    event_data = jnp.concatenate(
+        [pos_local, vel_local, quat_local, drone_ang_vel, env_action, obstacles_visited], axis=-1
+    )
+    event_valid = (
+        gate_just_passed
+        & (current_target >= 1)
+        & (current_target < n_gates)
+        & ~done_bool
+        & (source != SRC_PHASE2_REPLAY)
+    )
+    event_slot = current_target.astype(jnp.int32)
+    return event_valid, event_slot, event_data
+
+
+def _apply_phase2_writes(
+    buffer: Phase2Buffer, event_valid: Array, event_slot: Array, event_data: Array, n_gates: int
+) -> Phase2Buffer:
+    """Fold one rollout's gate-pass events into the per-gate ring buffer.
+
+    Applies the cumsum-rank scatter pattern (codex) once per writable
+    slot. ``unique_indices`` would be hard to prove without the
+    capacity guard, so we use ``mode="drop"`` with OOB indices to safely
+    discard the "no event" lanes — both more readable than scatter and
+    no slower at this scale (n_steps * n_envs ~= a few thousand entries
+    per slot per rollout, capacity 4096).
+
+    Parameters
+    ----------
+    buffer : Phase2Buffer
+        Buffer state at the start of this rollout.
+    event_valid : Array, shape (n_steps, n_envs), bool
+        Gate-pass events to write. Flattened internally.
+    event_slot : Array, shape (n_steps, n_envs), int32
+        Target-gate index per event (== which buffer slot).
+    event_data : Array, shape (n_steps, n_envs, state_dim), float32
+        Per-event state-tuple in gate-frame (see ``_compute_phase2_event``).
+    n_gates : int
+        Number of gates on the track. Loop bound (Python int, unrolled
+        by the JIT trace).
+
+    Returns
+    -------
+    Phase2Buffer
+        Updated buffer with ``ptr`` and ``fill`` advanced per slot.
+    """
+    capacity = buffer.data.shape[1]
+    state_dim = buffer.data.shape[-1]
+    valid_flat = event_valid.reshape(-1)
+    slot_flat = event_slot.reshape(-1)
+    data_flat = event_data.reshape(-1, state_dim)
+
+    new_data = buffer.data
+    new_ptr = buffer.ptr
+    new_fill = buffer.fill
+    # Slot 0 is unused (a drone "approaching gate 0" is the true-start
+    # condition every env already trains on). Skip it to keep the buffer
+    # densely packed on the slots we actually replay from.
+    for g in range(1, n_gates):
+        mask_g = valid_flat & (slot_flat == g)
+        # Per-event rank in this slot's write batch. ``rank`` is 0-based
+        # for valid entries, irrelevant for invalid ones (masked below).
+        rank = jnp.cumsum(mask_g.astype(jnp.int32)) - 1
+        idx = (buffer.ptr[g] + rank) % capacity
+        # Map invalid entries to OOB (= ``capacity``) so the ``mode="drop"``
+        # scatter discards them. This avoids a separate gather + boolean
+        # mask round-trip.
+        idx_masked = jnp.where(mask_g, idx, capacity)
+        new_data_g = buffer.data[g].at[idx_masked].set(data_flat, mode="drop")
+        n_added = jnp.sum(mask_g.astype(jnp.int32))
+        new_ptr_g = (buffer.ptr[g] + n_added) % capacity
+        new_fill_g = jnp.minimum(capacity, buffer.fill[g] + n_added)
+        new_data = new_data.at[g].set(new_data_g)
+        new_ptr = new_ptr.at[g].set(new_ptr_g)
+        new_fill = new_fill.at[g].set(new_fill_g)
+    return Phase2Buffer(data=new_data, ptr=new_ptr, fill=new_fill)
 
 
 def _apply_yaw_delta(quat: Array, yaw_delta: Array, mask: Array) -> Array:
