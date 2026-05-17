@@ -164,8 +164,12 @@ def simulate(
     if checkpoint is not None:
         cfg.controller.checkpoint = checkpoint
 
+    # This script is dedicated to the RL Song controller; ignore
+    # ``cfg.controller.file`` (which is ``state_controller.py`` in the stock
+    # config TOMLs and would silently produce 13-d state-mode actions against
+    # an attitude-mode env).
     control_path = repo_root / "lsy_drone_racing" / "control"
-    controller_rel = controller or cfg.controller.file or DEFAULT_CONTROLLER
+    controller_rel = controller or DEFAULT_CONTROLLER
     controller_cls = load_controller(control_path / controller_rel)
 
     env = gymnasium.make(
