@@ -288,6 +288,49 @@ def simulate(
     return ep_times
 
 
+def _build_trace_row(
+    *,
+    i: int,
+    t: float,
+    obs: dict,
+    action_applied: np.ndarray,
+    action_policy_mean: np.ndarray | None,
+    true_gates_pos: np.ndarray,
+    true_gates_quat: np.ndarray,
+    true_obstacles_pos: np.ndarray,
+    reward_total: float | None,
+    reward_terms: dict[str, float] | None,
+    terminated: bool,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Build one JSONL row. All ndarray values are tolist()'d for json."""
+    return {
+        "step": i,
+        "t": float(t),
+        "pos": obs["pos"].tolist(),
+        "vel": obs["vel"].tolist(),
+        "quat": obs["quat"].tolist(),
+        "ang_vel": obs["ang_vel"].tolist(),
+        "action_policy_mean": (
+            action_policy_mean.tolist() if action_policy_mean is not None else None
+        ),
+        "action_applied": action_applied.tolist(),
+        "target_gate": int(obs["target_gate"]),
+        "gates_pos_true": true_gates_pos.tolist(),
+        "gates_quat_true": true_gates_quat.tolist(),
+        "obstacles_pos_true": true_obstacles_pos.tolist(),
+        "gates_pos": obs["gates_pos"].tolist(),
+        "gates_quat": obs["gates_quat"].tolist(),
+        "obstacles_pos": obs["obstacles_pos"].tolist(),
+        "gates_visited": obs["gates_visited"].tolist(),
+        "obstacles_visited": obs["obstacles_visited"].tolist(),
+        "reward_total": reward_total,
+        "reward_terms": reward_terms,
+        "terminated": bool(terminated),
+        "truncated": bool(truncated),
+    }
+
+
 def _run_episode(
     env: gymnasium.Env,
     controller_cls: type[Controller],
@@ -326,6 +369,27 @@ def _run_episode(
             controller_finished = controller.step_callback(
                 action, obs, reward, terminated, truncated, info
             )
+
+            if trace_writer is not None:
+                n_gates = len(cfg.env.track.gates)
+                n_obstacles = len(cfg.env.track.obstacles)
+                row = _build_trace_row(
+                    i=i,
+                    t=curr_time,
+                    obs=obs,
+                    action_applied=np.asarray(action, dtype=np.float32),
+                    action_policy_mean=getattr(controller, "_last_policy_mean", None),
+                    true_gates_pos=np.zeros((n_gates, 3), dtype=np.float32),  # placeholder, B4
+                    true_gates_quat=np.zeros((n_gates, 4), dtype=np.float32),  # placeholder, B4
+                    true_obstacles_pos=np.zeros(
+                        (n_obstacles, 3), dtype=np.float32
+                    ),  # placeholder, B4
+                    reward_total=None,  # placeholder, B5
+                    reward_terms=None,  # placeholder, B5
+                    terminated=terminated,
+                    truncated=truncated,
+                )
+                trace_writer.write_row(row)
 
             if video_writer is not None:
                 frame = _grab_offscreen_frame(env, camera, width, height)
