@@ -568,8 +568,12 @@ def integrate_reward(ep: Episode) -> dict[str, Any] | None:
     return {
         "total": float(total),
         "by_term": sums,
-        "dominant_positive": max(positives, key=positives.get) if positives else None,
-        "dominant_negative": min(negatives, key=negatives.get) if negatives else None,
+        "dominant_positive": (
+            max(positives, key=lambda k: positives[k]) if positives else None
+        ),
+        "dominant_negative": (
+            min(negatives, key=lambda k: negatives[k]) if negatives else None
+        ),
     }
 
 
