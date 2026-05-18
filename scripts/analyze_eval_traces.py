@@ -218,6 +218,71 @@ def detect_gate_passes(ep: Episode) -> list[dict[str, Any]]:
     return events
 
 
+def detect_hovers(ep: Episode) -> list[dict[str, Any]]:
+    """Detect xy-stationary windows.
+
+    A frame is part of a hover when, over a sliding window of
+    ``HOVER_WINDOW_STEPS`` frames ending at that frame, the bounding-box
+    extent on both ``x`` and ``y`` axes is below ``HOVER_XY_BBOX_M``.
+    Adjacent hover frames are coalesced into one event.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    list of dict
+        Each event has type ``"hover"`` plus ``t_start``, ``t_end``,
+        ``duration_s``, ``xy_bbox_extent_m``, ``mean_pos``, ``near_gate``.
+    """
+    pos = _rows_pos(ep.rows)
+    n = len(pos)
+    if n < HOVER_WINDOW_STEPS:
+        return []
+    is_hover = np.zeros(n, dtype=bool)
+    for i in range(HOVER_WINDOW_STEPS - 1, n):
+        window = pos[i - HOVER_WINDOW_STEPS + 1 : i + 1, :2]
+        extent = window.max(axis=0) - window.min(axis=0)
+        if extent.max() < HOVER_XY_BBOX_M:
+            is_hover[i - HOVER_WINDOW_STEPS + 1 : i + 1] = True
+
+    events: list[dict[str, Any]] = []
+    in_run = False
+    start = 0
+    for i in range(n):
+        if is_hover[i] and not in_run:
+            in_run = True
+            start = i
+        elif not is_hover[i] and in_run:
+            in_run = False
+            events.append(_hover_event(ep, start, i - 1))
+    if in_run:
+        events.append(_hover_event(ep, start, n - 1))
+    return events
+
+
+def _hover_event(ep: Episode, i_start: int, i_end: int) -> dict[str, Any]:
+    """Build a hover event from a (start, end) frame range."""
+    rows = ep.rows[i_start : i_end + 1]
+    xy = np.array([r["pos"][:2] for r in rows])
+    mean_pos = np.array([r["pos"] for r in rows]).mean(axis=0)
+    mid = rows[len(rows) // 2]
+    gates = np.asarray(mid["gates_pos_true"])
+    distances = np.linalg.norm(gates - np.asarray(mid["pos"]), axis=-1)
+    near_gate = int(distances.argmin())
+    return {
+        "type": "hover",
+        "t_start": float(rows[0]["t"]),
+        "t_end": float(rows[-1]["t"]),
+        "duration_s": float(rows[-1]["t"] - rows[0]["t"]),
+        "xy_bbox_extent_m": float((xy.max(axis=0) - xy.min(axis=0)).max()),
+        "mean_pos": mean_pos.tolist(),
+        "near_gate": near_gate,
+    }
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
