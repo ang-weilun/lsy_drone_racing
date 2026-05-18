@@ -577,6 +577,140 @@ def integrate_reward(ep: Episode) -> dict[str, Any] | None:
     }
 
 
+# Priority order for the headline's "dominant anomaly" pick (most
+# load-bearing first).
+_ANOMALY_PRIORITY: list[str] = ["collision", "near_miss", "hover", "wobble"]
+
+
+def build_headline(outcome: dict, events: list[dict], n_gates: int) -> str:
+    """Build the one-line per-episode headline.
+
+    Deterministic templating -- no LLM. The leading bit is always
+    ``"Passed N/G gates"``. The next bit comes from the highest-priority
+    anomaly present in ``events`` (collision > near_miss > hover >
+    wobble). If the episode finished, a trailing finish-time bit is
+    appended.
+
+    Parameters
+    ----------
+    outcome : dict
+        Outcome block from :func:`detect_outcome` (after any C6 patch).
+    events : list of dict
+        All detected events for the episode, in any order.
+    n_gates : int
+        Total number of gates on the track (denominator of the
+        "Passed N/G" prefix).
+
+    Returns
+    -------
+    str
+        Semicolon-joined headline string.
+
+    Notes
+    -----
+    Collision time and approach speed are wrapped in U+2248 ("nearly
+    equals") because they're 50 Hz-bounded -- the actual impact
+    happened somewhere between this frame and the next.
+    """
+    by_type: dict[str, list[dict]] = {}
+    for e in events:
+        by_type.setdefault(e["type"], []).append(e)
+    primary: dict | None = None
+    for kind in _ANOMALY_PRIORITY:
+        if kind in by_type:
+            primary = by_type[kind][0]
+            break
+
+    parts: list[str] = [f"Passed {outcome['gates_passed']}/{n_gates} gates"]
+    if primary is not None:
+        if primary["type"] == "hover":
+            parts.append(
+                f"hovered {primary['duration_s']:.2f}s near gate {primary['near_gate']}"
+            )
+        elif primary["type"] == "near_miss":
+            parts.append(
+                f"near-miss gate {primary['gate']} "
+                f"at {primary['closest_frame_dist_m']:.2f}m"
+            )
+        elif primary["type"] == "collision":
+            parts.append(
+                f"crashed {primary['object']} at t≈{primary['t']:.2f}s "
+                f"@ ≈{primary['approach_speed_50hz']:.1f} m/s"
+            )
+        elif primary["type"] == "wobble":
+            parts.append(
+                f"wobbled {primary['duration_s']:.2f}s "
+                f"(peak {primary['max_ang_vel_rad_s']:.1f} rad/s)"
+            )
+    if outcome["finished"]:
+        parts.append(f"finished in {outcome['flight_time_s']:.2f}s")
+    return "; ".join(parts)
+
+
+def summarize_episode(ep: Episode) -> dict[str, Any]:
+    """Build the per-episode summary block.
+
+    Calls all detectors, sorts events by time, patches
+    ``outcome.terminal_cause`` with the collision label if applicable,
+    and assembles the final dict.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    dict
+        Keys: ``outcome``, ``spawn``, ``events``,
+        ``kinematics_metrics``, ``reward_integrated``, ``headline``.
+
+    Notes
+    -----
+    Events are sorted by start time -- ``t`` for point events,
+    ``t_start`` for ranges (hover, wobble). The collision event, when
+    present, overrides the placeholder ``"collision:unknown"`` set by
+    :func:`detect_outcome` with the resolved object label.
+    """
+    outcome = detect_outcome(ep)
+    events: list[dict[str, Any]] = []
+    takeoff = detect_takeoff(ep)
+    if takeoff is not None:
+        events.append(takeoff)
+    events.extend(detect_gate_passes(ep))
+    events.extend(detect_hovers(ep))
+    events.extend(detect_near_misses(ep))
+    collision = detect_collision(ep, outcome)
+    if collision is not None:
+        events.append(collision)
+        outcome["terminal_cause"] = f"collision:{collision['object']}"
+    events.extend(detect_wobbles(ep))
+    events.sort(key=lambda x: x.get("t", x.get("t_start", 0.0)))
+
+    pos = _rows_pos(ep.rows)
+    vel = _rows_vel(ep.rows)
+    speeds = np.linalg.norm(vel, axis=-1)
+    ang_vel_mags = np.array(
+        [np.linalg.norm(r["ang_vel"]) for r in ep.rows]
+    )
+
+    return {
+        "outcome": outcome,
+        "spawn": {"pos": ep.header["spawn_pos"], "quat": ep.header["spawn_quat"]},
+        "events": events,
+        "kinematics_metrics": {
+            "max_speed": float(speeds.max()),
+            "mean_speed": float(speeds.mean()),
+            "max_ang_vel": float(ang_vel_mags.max()),
+            "path_length_m": float(
+                np.linalg.norm(np.diff(pos, axis=0), axis=-1).sum()
+            ),
+        },
+        "reward_integrated": integrate_reward(ep),
+        "headline": build_headline(outcome, events, ep.header["n_gates"]),
+    }
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
@@ -597,6 +731,16 @@ def analyze(trace_dir: str) -> None:
 
     _ = run_meta  # consumed in C10 when the run rollup is wired
     print(f"Loaded {len(episodes)} episodes from {trace}")
+
+    summaries: dict[int, dict[str, Any]] = {}
+    for idx, ep in episodes:
+        s = summarize_episode(ep)
+        s["episode"] = idx
+        (analysis / f"episode_{idx:03d}.summary.json").write_text(
+            json.dumps(s, indent=2), encoding="utf-8"
+        )
+        summaries[idx] = s
+    print(f"Wrote {len(summaries)} episode summaries")
 
 
 if __name__ == "__main__":
