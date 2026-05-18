@@ -310,11 +310,19 @@ def _run_episode(
         fps_live_view = 60  # Hz cadence for the live MuJoCo viewer
         i = 0
         curr_time = 0.0
+        prev_obs = obs
 
         while True:
-            curr_time = i / cfg.env.freq
             action = controller.compute_control(obs, info)
             obs, reward, terminated, truncated, info = env.step(action)
+            i += 1
+            curr_time = i / cfg.env.freq
+
+            prev_tg = int(prev_obs["target_gate"])
+            obs_tg = int(obs["target_gate"])
+            gate_just_passed = (prev_tg >= 0) and (obs_tg != prev_tg)
+            finished = (obs_tg == -1) and (prev_tg != -1)
+
             controller_finished = controller.step_callback(
                 action, obs, reward, terminated, truncated, info
             )
@@ -328,9 +336,9 @@ def _run_episode(
                     controller.render_callback(env.unwrapped.sim)
                     env.render()
 
-            if terminated or truncated or controller_finished:
+            if terminated or truncated or controller_finished or finished:
                 break
-            i += 1
+            prev_obs = obs
 
         controller.episode_callback()
         _log_episode_stats(obs, cfg, curr_time)
