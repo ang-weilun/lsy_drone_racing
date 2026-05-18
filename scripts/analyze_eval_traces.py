@@ -283,6 +283,81 @@ def _hover_event(ep: Episode, i_start: int, i_end: int) -> dict[str, Any]:
     }
 
 
+# Gate aperture half-extents (m) — must match obs.GATE_HALF_SIZE_M.
+# Source: lsy_drone_racing/control/rl_song/obs.py:46.
+_GATE_HALF_Y: float = 0.20
+_GATE_HALF_Z: float = 0.20
+
+# Gate aperture corners in gate-local coords (x=0, +/- half_y, +/- half_z).
+_GATE_FRAME_CORNERS_LOCAL = np.array([
+    [0.0, +_GATE_HALF_Y, +_GATE_HALF_Z],
+    [0.0, +_GATE_HALF_Y, -_GATE_HALF_Z],
+    [0.0, -_GATE_HALF_Y, +_GATE_HALF_Z],
+    [0.0, -_GATE_HALF_Y, -_GATE_HALF_Z],
+])
+# Edge endpoint pairs: right-vertical, left-vertical, top-horiz, bottom-horiz.
+_GATE_FRAME_EDGES: list[tuple[int, int]] = [(0, 1), (2, 3), (0, 2), (1, 3)]
+
+
+def _gate_frame_edge_dist(
+    pos: np.ndarray, gate_pos: np.ndarray, gate_quat: np.ndarray
+) -> float:
+    """Minimum distance from ``pos`` to any of the four gate-frame edges.
+
+    Mirrors ``reward._gate_frame_edge_dist_sq`` (sqrt'd for human readability).
+    """
+    rot = _quat_to_rotmat(gate_quat)
+    corners = (rot @ _GATE_FRAME_CORNERS_LOCAL.T).T + gate_pos  # (4, 3)
+    best = np.inf
+    for a, b in _GATE_FRAME_EDGES:
+        ab = corners[b] - corners[a]
+        ap = pos - corners[a]
+        ab_sq = ab @ ab
+        t = float(np.clip((ap @ ab) / max(ab_sq, 1e-12), 0.0, 1.0))
+        closest = corners[a] + t * ab
+        d = float(np.linalg.norm(pos - closest))
+        if d < best:
+            best = d
+    return best
+
+
+def detect_near_misses(ep: Episode) -> list[dict[str, Any]]:
+    """Close-approach to a gate frame that did NOT result in a pass.
+
+    Walks the episode while the same target_gate persists. If the
+    drone's minimum distance to that gate's frame edges drops below
+    ``NEAR_MISS_DIST_M`` and that gate is never subsequently passed,
+    record one ``near_miss`` event. Stops after the first miss (rest
+    of the trace is typically post-failure).
+    """
+    events: list[dict[str, Any]] = []
+    seen_pass: set[int] = set()
+    n = len(ep.rows)
+    for i in range(n):
+        row = ep.rows[i]
+        tg = row["target_gate"]
+        if tg < 0:
+            break
+        if tg in seen_pass:
+            continue
+        gate_pos = np.asarray(row["gates_pos_true"][tg])
+        gate_quat = np.asarray(row["gates_quat_true"][tg])
+        d = _gate_frame_edge_dist(np.asarray(row["pos"]), gate_pos, gate_quat)
+        if d < NEAR_MISS_DIST_M:
+            advanced = any(r["target_gate"] != tg for r in ep.rows[i + 1 :])
+            if not advanced:
+                events.append({
+                    "type": "near_miss",
+                    "t": float(row["t"]),
+                    "gate": int(tg),
+                    "closest_frame_dist_m": d,
+                    "passed": False,
+                })
+                seen_pass.add(tg)
+                break
+    return events
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
