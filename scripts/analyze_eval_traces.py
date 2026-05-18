@@ -483,6 +483,59 @@ def detect_collision(
     }
 
 
+def detect_wobbles(ep: Episode) -> list[dict[str, Any]]:
+    """Detect runs of sustained high angular velocity.
+
+    A frame is "high" when the body-rate magnitude exceeds
+    ``WOBBLE_ANG_VEL_RAD_S``. Contiguous high frames are coalesced into a
+    single event when the run length is at least
+    ``WOBBLE_MIN_DURATION_STEPS`` frames.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    list of dict
+        Each event has ``type="wobble"`` plus ``t_start``, ``t_end``,
+        ``duration_s``, and ``max_ang_vel_rad_s`` (peak magnitude over
+        the run). Empty when no run is long enough.
+    """
+    n = len(ep.rows)
+    mag = np.array([np.linalg.norm(r["ang_vel"]) for r in ep.rows])
+    high = mag > WOBBLE_ANG_VEL_RAD_S
+
+    events: list[dict[str, Any]] = []
+    in_run = False
+    start = 0
+    for i in range(n):
+        if high[i] and not in_run:
+            in_run = True
+            start = i
+        elif not high[i] and in_run:
+            in_run = False
+            if i - start >= WOBBLE_MIN_DURATION_STEPS:
+                events.append(_wobble_event(ep, mag, start, i - 1))
+    if in_run and n - start >= WOBBLE_MIN_DURATION_STEPS:
+        events.append(_wobble_event(ep, mag, start, n - 1))
+    return events
+
+
+def _wobble_event(
+    ep: Episode, mag: np.ndarray, i_start: int, i_end: int
+) -> dict[str, Any]:
+    """Build a wobble event from a (start, end) frame range."""
+    return {
+        "type": "wobble",
+        "t_start": float(ep.rows[i_start]["t"]),
+        "t_end": float(ep.rows[i_end]["t"]),
+        "duration_s": float(ep.rows[i_end]["t"] - ep.rows[i_start]["t"]),
+        "max_ang_vel_rad_s": float(mag[i_start : i_end + 1].max()),
+    }
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
