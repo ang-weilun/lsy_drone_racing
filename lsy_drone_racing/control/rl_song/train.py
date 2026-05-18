@@ -146,6 +146,8 @@ def train(args: CLIArgs) -> None:
     _validate_ppo_config(ppo_cfg)
     run_name = _resolve_run_name(args, train_cfg)
     run_dir = CHECKPOINT_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_reward_config(run_dir, train_cfg)
 
     rng_key = jax.random.PRNGKey(train_cfg.seed)
     actor_state, critic_state = _init_train_states(ppo_cfg, rng_key)
@@ -897,6 +899,31 @@ def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
     if checkpoint_path is None:
         raise FileNotFoundError(f"No Orbax checkpoint found under {init_run_dir}")
     return ocp.PyTreeCheckpointer().restore(checkpoint_path)
+
+
+def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
+    """Persist ``train_cfg.reward`` as JSON at ``run_dir/reward_config.json``.
+
+    Written once at training start. On warm-start (file already present),
+    refuses to overwrite a config that does not match the current one —
+    a silent overwrite would mislabel every checkpoint produced by the
+    prior run under the stale config.
+    """
+    import json
+    from dataclasses import asdict
+
+    target = run_dir / "reward_config.json"
+    current = asdict(train_cfg.reward)
+    if target.exists():
+        existing = json.loads(target.read_text())
+        if existing != current:
+            raise RuntimeError(
+                f"reward_config.json at {target} disagrees with current "
+                f"train_cfg.reward; delete the file to overwrite "
+                f"intentionally or fix train_cfg.reward."
+            )
+        return
+    target.write_text(json.dumps(current, indent=2, sort_keys=True))
 
 
 def _save_checkpoint(
