@@ -23,6 +23,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -80,6 +81,61 @@ GATE_ACCENT_GEOMS = (
 )
 
 
+class _TraceWriter:
+    """JSONL trace writer with per-episode files and a header row."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, dump_dir: Path, header_common: dict[str, Any]) -> None:
+        self.dump_dir = dump_dir
+        self.dump_dir.mkdir(parents=True, exist_ok=True)
+        self._header_common = header_common
+        self._fh: Any = None
+        self._episode_idx = -1
+
+    def open_episode(self, episode_idx: int, episode_header: dict[str, Any]) -> None:
+        self._episode_idx = episode_idx
+        path = self.dump_dir / f"episode_{episode_idx:03d}.jsonl"
+        self._fh = path.open("w", encoding="utf-8", newline="\n")
+        header = {
+            "_header": True,
+            **self._header_common,
+            **episode_header,
+            "schema_version": self.SCHEMA_VERSION,
+        }
+        self._fh.write(json.dumps(header, separators=(",", ":")) + "\n")
+
+    def write_row(self, row: dict[str, Any]) -> None:
+        self._fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def close_episode(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def write_run_meta(self, run_meta: dict[str, Any]) -> None:
+        path = self.dump_dir / "run_meta.json"
+        path.write_text(json.dumps(run_meta, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _get_git_sha() -> str | None:
+    """Return the short git SHA, or None if git is unavailable."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2.0,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
 def simulate(
     config: str = "level3.toml",
     controller: str | None = None,
@@ -92,6 +148,8 @@ def simulate(
     height: int = DEFAULT_RECORD_HEIGHT,
     checkpoint: str | None = None,
     control_mode: str | None = None,
+    dump_trace: str | None = None,
+    reward_cfg: str | None = None,
 ) -> list[float | None]:
     """Run the RL Song controller in sim with recording / render extras.
 
@@ -125,6 +183,12 @@ def simulate(
         Override ``config.env.control_mode`` (``"state"`` or ``"attitude"``).
         Needed when running an attitude-output controller against a
         state-mode config without editing the toml.
+    dump_trace : str, optional
+        If set, write per-step JSONL traces under this directory. Header
+        row carries metadata; one row per env step. Default: no dump.
+    reward_cfg : str, optional
+        Override path to ``reward_config.json``. Default: resolved
+        relative to the checkpoint.
 
     Returns
     -------
@@ -165,12 +229,41 @@ def simulate(
         seed=cfg.env.seed,
     )
     _color_code_gates(env)
+
+    trace_writer: _TraceWriter | None = None
+    if dump_trace is not None:
+        dump_dir = Path(dump_trace)
+        if not dump_dir.is_absolute():
+            dump_dir = Path(__file__).resolve().parents[3] / dump_dir
+        trace_writer = _TraceWriter(
+            dump_dir=dump_dir,
+            header_common={
+                "config": config,
+                "control_mode": cfg.env.control_mode,
+                "freq": int(cfg.env.freq),
+                "checkpoint": str(checkpoint) if checkpoint else None,
+                "n_gates": len(cfg.env.track.gates),
+                "n_obstacles": len(cfg.env.track.obstacles),
+            },
+        )
+        trace_writer.write_run_meta(
+            {
+                "checkpoint": str(checkpoint) if checkpoint else None,
+                "config": config,
+                "control_mode": cfg.env.control_mode,
+                "n_runs": n_runs,
+                "seed": cfg.env.seed,
+                "schema_version": _TraceWriter.SCHEMA_VERSION,
+                "git_sha": _get_git_sha(),
+            }
+        )
+
     env = JaxToNumpy(env)
 
     video_writer = _open_video_writer(record, fps) if record else None
     ep_times: list[float | None] = []
     try:
-        for _ in range(n_runs):
+        for episode_idx in range(n_runs):
             ep_time = _run_episode(
                 env=env,
                 controller_cls=controller_cls,
@@ -179,6 +272,8 @@ def simulate(
                 camera=camera,
                 width=width,
                 height=height,
+                trace_writer=trace_writer,
+                episode_idx=episode_idx,
             )
             ep_times.append(ep_time)
     finally:
@@ -198,9 +293,15 @@ def _run_episode(
     camera: str,
     width: int,
     height: int,
+    trace_writer: _TraceWriter | None = None,
+    episode_idx: int = 0,
 ) -> float | None:
     """Run one episode end-to-end. Mirrors ``scripts.sim._run_episode``."""
     obs, info = env.reset()
+    if trace_writer is not None:
+        trace_writer.open_episode(
+            episode_idx, {"spawn_pos": obs["pos"].tolist(), "spawn_quat": obs["quat"].tolist()}
+        )
     controller: Controller = controller_cls(obs, info, cfg)
     fps_live_view = 60  # Hz cadence for the live MuJoCo viewer
     i = 0
@@ -230,6 +331,8 @@ def _run_episode(
     controller.episode_callback()
     _log_episode_stats(obs, cfg, curr_time)
     controller.episode_reset()
+    if trace_writer is not None:
+        trace_writer.close_episode()
     return curr_time if obs["target_gate"] == -1 else None
 
 
