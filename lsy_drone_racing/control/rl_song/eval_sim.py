@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 import fire
 import gymnasium
+import jax.numpy as jnp
 import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from ml_collections import ConfigDict
 
     from lsy_drone_racing.control.controller import Controller
+    from lsy_drone_racing.control.rl_song.config import RewardConfig
 
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,32 @@ def _get_git_sha() -> str | None:
         return None
 
 
+def _load_reward_config(
+    checkpoint: Path | None, override: str | None
+) -> tuple["RewardConfig | None", Path | None]:
+    """Load RewardConfig JSON. Returns (config, path) or (None, None) if not found.
+
+    Resolution order:
+      1. ``override`` (CLI ``--reward-cfg``), if given.
+      2. ``checkpoint/../reward_config.json`` for a step_NNN checkpoint dir.
+      3. ``checkpoint/reward_config.json`` for a run-dir checkpoint.
+    """
+    from lsy_drone_racing.control.rl_song.config import RewardConfig
+
+    candidates: list[Path] = []
+    if override is not None:
+        candidates.append(Path(override))
+    if checkpoint is not None:
+        ckpt_path = Path(checkpoint)
+        candidates.append(ckpt_path.parent / "reward_config.json")
+        candidates.append(ckpt_path / "reward_config.json")
+    for c in candidates:
+        if c.exists():
+            data = json.loads(c.read_text(encoding="utf-8"))
+            return RewardConfig(**data), c
+    return None, None
+
+
 def simulate(
     config: str = "level3.toml",
     controller: str | None = None,
@@ -233,6 +261,16 @@ def simulate(
     )
     _color_code_gates(env)
 
+    reward_cfg_obj, reward_cfg_path = _load_reward_config(
+        cfg.controller.get("checkpoint", None), reward_cfg
+    )
+    if reward_cfg_obj is None and dump_trace is not None:
+        logger.warning(
+            "No reward_config.json found near %s and --reward-cfg not set; "
+            "trace will record null reward fields.",
+            cfg.controller.get("checkpoint", None),
+        )
+
     trace_writer: _TraceWriter | None = None
     if dump_trace is not None:
         dump_dir = Path(dump_trace)
@@ -258,6 +296,7 @@ def simulate(
                 "seed": cfg.env.seed,
                 "schema_version": _TraceWriter.SCHEMA_VERSION,
                 "git_sha": _get_git_sha(),
+                "reward_cfg_path": str(reward_cfg_path) if reward_cfg_path else None,
             }
         )
 
@@ -277,6 +316,7 @@ def simulate(
                 height=height,
                 trace_writer=trace_writer,
                 episode_idx=episode_idx,
+                reward_cfg_obj=reward_cfg_obj,
             )
             ep_times.append(ep_time)
     finally:
@@ -331,6 +371,45 @@ def _build_trace_row(
     }
 
 
+def _compute_reward_terms(
+    *,
+    prev_obs: dict,
+    obs: dict,
+    terminated: bool,
+    truncated: bool,
+    finished: bool,
+    gate_just_passed: bool,
+    reward_cfg_obj: "RewardConfig",
+    true_gates_pos: np.ndarray,
+    true_gates_quat: np.ndarray,
+) -> tuple[float, dict[str, float]]:
+    """Call ``step_reward`` with an n_envs=1 leading axis on obs fields only.
+
+    True poses already have the env axis squeezed off by the caller
+    (B4 reads them as ``np.asarray(sim_data.X)[0]``); we re-add the
+    leading axis here to match ``step_reward``'s vec convention.
+    """
+    from lsy_drone_racing.control.rl_song.reward import step_reward
+
+    def _batched(d: dict) -> dict:
+        return {k: jnp.asarray(v)[None] for k, v in d.items()}
+
+    total, components = step_reward(
+        _batched(obs),
+        _batched(prev_obs),
+        jnp.asarray([terminated]),
+        jnp.asarray([truncated]),
+        jnp.asarray([finished]),
+        jnp.asarray([gate_just_passed]),
+        reward_cfg_obj,
+        true_gates_pos=jnp.asarray(true_gates_pos)[None],
+        true_gates_quat=jnp.asarray(true_gates_quat)[None],
+    )
+    total_f = float(np.asarray(total).squeeze())
+    components_f = {k: float(np.asarray(v).squeeze()) for k, v in components.items()}
+    return total_f, components_f
+
+
 def _run_episode(
     env: gymnasium.Env,
     controller_cls: type[Controller],
@@ -341,6 +420,7 @@ def _run_episode(
     height: int,
     trace_writer: _TraceWriter | None = None,
     episode_idx: int = 0,
+    reward_cfg_obj: "RewardConfig | None" = None,
 ) -> float | None:
     """Run one episode end-to-end. Mirrors ``scripts.sim._run_episode``."""
     obs, info = env.reset()
@@ -375,6 +455,20 @@ def _run_episode(
                 true_gates_pos = np.asarray(sim_data.gates_pos)[0]
                 true_gates_quat = np.asarray(sim_data.gates_quat)[0]
                 true_obstacles_pos = np.asarray(sim_data.obstacles_pos)[0]
+                if reward_cfg_obj is not None:
+                    reward_total, reward_terms = _compute_reward_terms(
+                        prev_obs=prev_obs,
+                        obs=obs,
+                        terminated=terminated,
+                        truncated=truncated,
+                        finished=finished,
+                        gate_just_passed=gate_just_passed,
+                        reward_cfg_obj=reward_cfg_obj,
+                        true_gates_pos=true_gates_pos,
+                        true_gates_quat=true_gates_quat,
+                    )
+                else:
+                    reward_total, reward_terms = None, None
                 row = _build_trace_row(
                     i=i,
                     t=curr_time,
@@ -384,8 +478,8 @@ def _run_episode(
                     true_gates_pos=true_gates_pos,
                     true_gates_quat=true_gates_quat,
                     true_obstacles_pos=true_obstacles_pos,
-                    reward_total=None,  # placeholder, B5
-                    reward_terms=None,  # placeholder, B5
+                    reward_total=reward_total,
+                    reward_terms=reward_terms,
                     terminated=terminated,
                     truncated=truncated,
                 )
