@@ -568,12 +568,8 @@ def integrate_reward(ep: Episode) -> dict[str, Any] | None:
     return {
         "total": float(total),
         "by_term": sums,
-        "dominant_positive": (
-            max(positives, key=lambda k: positives[k]) if positives else None
-        ),
-        "dominant_negative": (
-            min(negatives, key=lambda k: negatives[k]) if negatives else None
-        ),
+        "dominant_positive": (max(positives, key=lambda k: positives[k]) if positives else None),
+        "dominant_negative": (min(negatives, key=lambda k: negatives[k]) if negatives else None),
     }
 
 
@@ -624,13 +620,10 @@ def build_headline(outcome: dict, events: list[dict], n_gates: int) -> str:
     parts: list[str] = [f"Passed {outcome['gates_passed']}/{n_gates} gates"]
     if primary is not None:
         if primary["type"] == "hover":
-            parts.append(
-                f"hovered {primary['duration_s']:.2f}s near gate {primary['near_gate']}"
-            )
+            parts.append(f"hovered {primary['duration_s']:.2f}s near gate {primary['near_gate']}")
         elif primary["type"] == "near_miss":
             parts.append(
-                f"near-miss gate {primary['gate']} "
-                f"at {primary['closest_frame_dist_m']:.2f}m"
+                f"near-miss gate {primary['gate']} at {primary['closest_frame_dist_m']:.2f}m"
             )
         elif primary["type"] == "collision":
             parts.append(
@@ -690,9 +683,7 @@ def summarize_episode(ep: Episode) -> dict[str, Any]:
     pos = _rows_pos(ep.rows)
     vel = _rows_vel(ep.rows)
     speeds = np.linalg.norm(vel, axis=-1)
-    ang_vel_mags = np.array(
-        [np.linalg.norm(r["ang_vel"]) for r in ep.rows]
-    )
+    ang_vel_mags = np.array([np.linalg.norm(r["ang_vel"]) for r in ep.rows])
 
     return {
         "outcome": outcome,
@@ -702,12 +693,151 @@ def summarize_episode(ep: Episode) -> dict[str, Any]:
             "max_speed": float(speeds.max()),
             "mean_speed": float(speeds.mean()),
             "max_ang_vel": float(ang_vel_mags.max()),
-            "path_length_m": float(
-                np.linalg.norm(np.diff(pos, axis=0), axis=-1).sum()
-            ),
+            "path_length_m": float(np.linalg.norm(np.diff(pos, axis=0), axis=-1).sum()),
         },
         "reward_integrated": integrate_reward(ep),
         "headline": build_headline(outcome, events, ep.header["n_gates"]),
+    }
+
+
+SPAWN_GRID_X: list[tuple[float, float]] = [(-1.5, -0.5), (-0.5, 0.5), (0.5, 1.5)]
+SPAWN_GRID_Y: list[tuple[float, float]] = [(-1.5, -0.5), (-0.5, 0.5), (0.5, 1.5)]
+
+
+def _spawn_bucket(spawn: dict) -> str:
+    """Bucket a spawn (x, y) into the 8-cell grid (or 'x∈out, y∈out')."""
+    x, y = spawn["pos"][0], spawn["pos"][1]
+    bx = next((f"x∈[{lo},{hi}]" for lo, hi in SPAWN_GRID_X if lo <= x < hi), "x∈out")
+    by = next((f"y∈[{lo},{hi}]" for lo, hi in SPAWN_GRID_Y if lo <= y < hi), "y∈out")
+    return f"{bx}, {by}"
+
+
+def _hist(values: list[str]) -> dict[str, int]:
+    """Count occurrences of each value (preserves insertion order)."""
+    out: dict[str, int] = {}
+    for v in values:
+        out[v] = out.get(v, 0) + 1
+    return out
+
+
+def build_run_summary(
+    run_meta: dict[str, Any], summaries: dict[int, dict[str, Any]], n_gates: int
+) -> dict[str, Any]:
+    """Aggregate per-episode summaries into a single run-level rollup.
+
+    Parameters
+    ----------
+    run_meta : dict
+        Contents of ``run_meta.json`` (checkpoint, config, git_sha, ...).
+    summaries : dict[int, dict]
+        Per-episode summary blocks keyed by episode index (insertion
+        order is the run order).
+    n_gates : int
+        Total number of gates on the track; sets the histogram length.
+
+    Returns
+    -------
+    dict
+        Run-level rollup with ``aggregate`` stats, terminal-cause and
+        anomaly histograms, optional ``reward_per_episode`` means,
+        per-spawn-bucket pass rates, an ``episodes`` index block, and a
+        ``investigator_notes`` placeholder filled in by C11.
+
+    Notes
+    -----
+    ``reward_per_episode`` is ``None`` when any episode lacks integrated
+    rewards. Spawn buckets are sorted by bucket name so output is
+    deterministic across runs.
+    """
+    eps = list(summaries.values())
+    if not eps:
+        return {"checkpoint": run_meta.get("checkpoint"), "n_episodes": 0}
+
+    gates_passed = [e["outcome"]["gates_passed"] for e in eps]
+    ep_lens = [e["outcome"]["ep_len_steps"] for e in eps]
+    times = [e["outcome"]["flight_time_s"] for e in eps]
+    max_speeds = [e["kinematics_metrics"]["max_speed"] for e in eps]
+
+    aggregate = {
+        "finish_rate": float(np.mean([e["outcome"]["finished"] for e in eps])),
+        "gates_passed": {
+            "mean": float(np.mean(gates_passed)),
+            "max": int(max(gates_passed)),
+            "histogram": [int((np.array(gates_passed) == g).sum()) for g in range(n_gates + 1)],
+        },
+        "ep_len_steps": {
+            "mean": float(np.mean(ep_lens)),
+            "median": float(np.median(ep_lens)),
+            "min": int(min(ep_lens)),
+            "max": int(max(ep_lens)),
+        },
+        "flight_time_s": {"mean": float(np.mean(times)), "median": float(np.median(times))},
+        "max_speed": {"mean": float(np.mean(max_speeds)), "max": float(max(max_speeds))},
+    }
+
+    terminal_causes = _hist([e["outcome"]["terminal_cause"] for e in eps])
+    anomalies = _hist(
+        [
+            kind
+            for e in eps
+            for kind in {
+                ev["type"]
+                for ev in e["events"]
+                if ev["type"] in {"hover", "near_miss", "wobble", "collision"}
+            }
+        ]
+    )
+
+    reward_per_episode: dict[str, Any] | None = None
+    if all(e["reward_integrated"] is not None for e in eps):
+        keys = list(eps[0]["reward_integrated"]["by_term"].keys())
+        sums = {
+            k: float(np.mean([e["reward_integrated"]["by_term"][k] for e in eps])) for k in keys
+        }
+        negatives = {k: v for k, v in sums.items() if v < 0}
+        reward_per_episode = {
+            **sums,
+            "dominant_negative_modal": (
+                min(negatives, key=lambda k: negatives[k]) if negatives else None
+            ),
+        }
+
+    bucket_map: dict[str, list[dict[str, Any]]] = {}
+    for e in eps:
+        bucket_map.setdefault(_spawn_bucket(e["spawn"]), []).append(e)
+    spawn_buckets = [
+        {
+            "bucket": k,
+            "n": len(v),
+            "finish_rate": float(np.mean([x["outcome"]["finished"] for x in v])),
+            "mean_gates": float(np.mean([x["outcome"]["gates_passed"] for x in v])),
+        }
+        for k, v in sorted(bucket_map.items())
+    ]
+
+    episodes_block = [
+        {
+            "i": int(e["episode"]),
+            "gates": e["outcome"]["gates_passed"],
+            "finished": e["outcome"]["finished"],
+            "headline": e["headline"],
+        }
+        for e in eps
+    ]
+
+    return {
+        "checkpoint": run_meta.get("checkpoint"),
+        "config": run_meta.get("config"),
+        "control_mode": run_meta.get("control_mode"),
+        "n_episodes": len(eps),
+        "git_sha": run_meta.get("git_sha"),
+        "aggregate": aggregate,
+        "terminal_cause_histogram": terminal_causes,
+        "anomaly_histogram": anomalies,
+        "reward_per_episode": reward_per_episode,
+        "spawn_buckets": spawn_buckets,
+        "episodes": episodes_block,
+        "investigator_notes": [],  # filled in C11
     }
 
 
@@ -729,7 +859,6 @@ def analyze(trace_dir: str) -> None:
         idx = int(path.stem.removeprefix("episode_"))
         episodes.append((idx, load_episode(path)))
 
-    _ = run_meta  # consumed in C10 when the run rollup is wired
     print(f"Loaded {len(episodes)} episodes from {trace}")
 
     summaries: dict[int, dict[str, Any]] = {}
@@ -741,6 +870,11 @@ def analyze(trace_dir: str) -> None:
         )
         summaries[idx] = s
     print(f"Wrote {len(summaries)} episode summaries")
+
+    n_gates = episodes[0][1].header["n_gates"]
+    run_summary = build_run_summary(run_meta, summaries, n_gates)
+    (analysis / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+    print("Wrote run_summary.json")
 
 
 if __name__ == "__main__":
