@@ -910,12 +910,11 @@ def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
     prior run under the stale config.
     """
     import json
-    from dataclasses import asdict
 
     target = run_dir / "reward_config.json"
     current = asdict(train_cfg.reward)
     if target.exists():
-        existing = json.loads(target.read_text())
+        existing = json.loads(target.read_text(encoding="utf-8"))
         if existing != current:
             raise RuntimeError(
                 f"reward_config.json at {target} disagrees with current "
@@ -923,7 +922,7 @@ def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
                 f"intentionally or fix train_cfg.reward."
             )
         return
-    target.write_text(json.dumps(current, indent=2, sort_keys=True))
+    target.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _save_checkpoint(
