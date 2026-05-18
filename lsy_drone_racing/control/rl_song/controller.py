@@ -90,6 +90,12 @@ class RLSongController(Controller):
         -------
         action : ndarray, shape (4,)
             Env attitude command ``[roll, pitch, yaw, thrust]``.
+
+        Notes
+        -----
+        Side effect: sets ``self._last_policy_mean`` to the 7-D
+        pre-projection policy mean each call. The attribute is not part
+        of the :class:`Controller` base contract.
         """
         _ = info
         actor_obs = obs_encoding.build_actor_obs(
