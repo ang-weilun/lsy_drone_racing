@@ -95,19 +95,30 @@ class RLSongController(Controller):
         actor_obs = obs_encoding.build_actor_obs(
             _to_jax_obs(obs), self.prev_action_env_4vec, self.normalizer
         )
-        env_action = self._deterministic_inference(
+        env_action, raw_action = self._deterministic_inference(
             self.actor_params, actor_obs, self.thrust_min, self.thrust_max
         )
         self.prev_action_env_4vec = env_action
+        self._last_policy_mean = np.asarray(raw_action, dtype=np.float32)
         return np.asarray(env_action, dtype=np.float32)
 
 
 def _deterministic_env_action(
     actor_params: dict[str, Any], actor_obs: Array, thrust_min: float, thrust_max: float
-) -> Array:
-    """Run deterministic actor inference and raw-to-env projection."""
+) -> tuple[Array, Array]:
+    """Run deterministic actor inference and raw-to-env projection.
+
+    Returns
+    -------
+    env_action : Array, shape (4,)
+        Projected attitude command ``[roll, pitch, yaw, thrust]``.
+    raw_action : Array, shape (7,)
+        Policy mean before projection. Surfaced so the controller can
+        stash it on ``self._last_policy_mean`` for trace logging.
+    """
     raw_action = deterministic_raw_action(actor_params, actor_obs)
-    return raw_to_env_action(raw_action, thrust_min, thrust_max)
+    env_action = raw_to_env_action(raw_action, thrust_min, thrust_max)
+    return env_action, raw_action
 
 
 def _to_jax_obs(obs: dict[str, npt.NDArray[np.floating]]) -> dict[str, Array]:
