@@ -108,6 +108,8 @@ class _TraceWriter:
         self._fh.write(json.dumps(header, separators=(",", ":")) + "\n")
 
     def write_row(self, row: dict[str, Any]) -> None:
+        if self._fh is None:
+            raise RuntimeError("write_row called before open_episode")
         self._fh.write(json.dumps(row, separators=(",", ":")) + "\n")
 
     def close_episode(self) -> None:
