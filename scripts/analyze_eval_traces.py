@@ -358,6 +358,131 @@ def detect_near_misses(ep: Episode) -> list[dict[str, Any]]:
     return events
 
 
+def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    """Distance from point ``p`` to the line segment ``ab`` (3D)."""
+    ab = b - a
+    ap = p - a
+    ab_sq = ab @ ab
+    t = float(np.clip((ap @ ab) / max(ab_sq, 1e-12), 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def _resolve_collision_object(
+    pos: np.ndarray,
+    gates_pos: np.ndarray,
+    obstacles_top: np.ndarray,
+) -> tuple[str, float]:
+    """Return ``(object_label, distance)`` for the nearest collision candidate.
+
+    Parameters
+    ----------
+    pos : ndarray, shape (3,)
+        Drone position to test.
+    gates_pos : ndarray, shape (n_gates, 3)
+        Ground-truth gate centroids.
+    obstacles_top : ndarray, shape (n_obstacles, 3)
+        Ground-truth obstacle top markers. The obstacle is modelled as
+        a vertical capsule from ``(x, y, z_top)`` down to ``(x, y, 0)``;
+        ``obstacles_pos`` is the top marker, not the centroid (codex
+        review), so a point-to-point distance would over-estimate
+        clearance for tall obstacles.
+
+    Returns
+    -------
+    tuple of (str, float)
+        Label of the form ``"gate:<i>"``, ``"obstacle:<i>"``, or
+        ``"floor"``, and the distance to that object. The floor plane
+        is added as a candidate only when ``pos[2] < FLOOR_Z_M``.
+    """
+    candidates: list[tuple[float, str]] = []
+    for i, g in enumerate(gates_pos):
+        candidates.append((float(np.linalg.norm(pos - g)), f"gate:{i}"))
+    for i, top in enumerate(obstacles_top):
+        a = np.array([top[0], top[1], 0.0])
+        candidates.append((_point_to_segment_dist(pos, top, a), f"obstacle:{i}"))
+    if pos[2] < FLOOR_Z_M:
+        candidates.append((float(pos[2]), "floor"))
+    distance, label = min(candidates, key=lambda x: x[0])
+    return label, distance
+
+
+def detect_collision(
+    ep: Episode, outcome: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Detect a collision event from the pre-terminal frame.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+    outcome : dict
+        Result of :func:`detect_outcome`. Collision is only emitted when
+        the episode did not finish and was not truncated.
+
+    Returns
+    -------
+    dict or None
+        Event with ``type="collision"``, ``t`` (seconds), ``object``
+        label (``gate:<i>`` / ``obstacle:<i>`` / ``floor``),
+        ``approach_speed_50hz`` (m/s), ``last_pos_50hz_pre_terminal``
+        (raw JSON list of length 3), and ``min_approach_dist_5frame_m``
+        (the minimum approach distance to the inferred object across
+        the last ``COLLISION_RECENT_WINDOW`` pre-terminal frames).
+        ``None`` when the outcome is ``finished`` or ``truncated``, or
+        the episode has fewer than two rows.
+
+    Notes
+    -----
+    Uses ``pos[T-1]`` (the last pre-terminal frame) because the sim
+    warps the drone before producing the terminal observation, so
+    ``pos[T]`` is the reset pose rather than the impact pose (see
+    ``reward.py:443-446``). At 50 Hz this is up to 20 ms before the
+    actual contact; the 5-frame robustness window catches
+    glance-then-warp cases where the closest approach happened a few
+    steps before the terminal frame.
+    """
+    if outcome["finished"] or outcome["terminal_cause"] == "truncated":
+        return None
+    rows = ep.rows
+    if len(rows) < 2:
+        return None
+    i = len(rows) - 2  # last pre-terminal frame
+    row = rows[i]
+    pos = np.asarray(row["pos"])
+    gates_pos = np.asarray(row["gates_pos_true"])
+    obstacles_top = np.asarray(row["obstacles_pos_true"])
+    label, _ = _resolve_collision_object(pos, gates_pos, obstacles_top)
+
+    # 5-frame robustness: minimum approach distance to the inferred object.
+    start = max(0, i - COLLISION_RECENT_WINDOW + 1)
+    distances: list[float] = []
+    for j in range(start, i + 1):
+        rj = rows[j]
+        if label.startswith("gate:"):
+            idx = int(label.split(":")[1])
+            d = float(np.linalg.norm(
+                np.asarray(rj["pos"]) - np.asarray(rj["gates_pos_true"][idx])
+            ))
+        elif label.startswith("obstacle:"):
+            idx = int(label.split(":")[1])
+            top = np.asarray(rj["obstacles_pos_true"][idx])
+            a = np.array([top[0], top[1], 0.0])
+            d = _point_to_segment_dist(np.asarray(rj["pos"]), top, a)
+        else:  # floor
+            d = float(rj["pos"][2])
+        distances.append(d)
+    min_d = float(min(distances))
+
+    return {
+        "type": "collision",
+        "t": float(row["t"]),
+        "object": label,
+        "approach_speed_50hz": float(np.linalg.norm(np.asarray(row["vel"]))),
+        "last_pos_50hz_pre_terminal": row["pos"],
+        "min_approach_dist_5frame_m": min_d,
+    }
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
