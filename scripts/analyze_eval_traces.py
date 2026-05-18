@@ -112,6 +112,112 @@ def detect_outcome(ep: Episode) -> dict[str, Any]:
     }
 
 
+def _quat_to_rotmat(quat_xyzw: np.ndarray) -> np.ndarray:
+    """xyzw quaternion -> 3x3 rotation matrix. Mirrors obs._quat_to_matrix."""
+    x, y, z, w = quat_xyzw
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array([
+        [1 - 2 * (yy + zz),     2 * (xy - wz),     2 * (xz + wy)],
+        [    2 * (xy + wz), 1 - 2 * (xx + zz),     2 * (yz - wx)],
+        [    2 * (xz - wy),     2 * (yz + wx), 1 - 2 * (xx + yy)],
+    ])
+
+
+def _rows_pos(rows: list[dict]) -> np.ndarray:
+    """Stack per-step pos into (N, 3) array."""
+    return np.array([r["pos"] for r in rows], dtype=np.float64)
+
+
+def _rows_vel(rows: list[dict]) -> np.ndarray:
+    """Stack per-step vel into (N, 3) array."""
+    return np.array([r["vel"] for r in rows], dtype=np.float64)
+
+
+def detect_takeoff(ep: Episode) -> dict[str, Any] | None:
+    """First frame where pos.z exceeds TAKEOFF_Z_M.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    dict or None
+        Event with ``type="takeoff"``, ``t`` (seconds), and
+        ``vz_at_liftoff`` (m/s). ``None`` if the drone never left the
+        ground.
+    """
+    pos = _rows_pos(ep.rows)
+    above = np.where(pos[:, 2] > TAKEOFF_Z_M)[0]
+    if above.size == 0:
+        return None
+    i = int(above[0])
+    return {
+        "type": "takeoff",
+        "t": float(ep.rows[i]["t"]),
+        "vz_at_liftoff": float(ep.rows[i]["vel"][2]),
+    }
+
+
+def detect_gate_passes(ep: Episode) -> list[dict[str, Any]]:
+    """One ``gate_pass`` event per ``target_gate`` advance.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    list of dict
+        Each event has ``type="gate_pass"``, ``t`` (seconds), ``gate``
+        (int index of the gate just passed), ``speed`` (m/s),
+        ``in_plane_offset_m`` (aperture-plane miss distance), and
+        ``angle_off_normal_rad`` (velocity angle off gate normal, in
+        ``[0, pi/2]`` since front/back passes are collapsed). Empty if
+        no gates were passed.
+
+    Notes
+    -----
+    Reads the ground-truth gate poses from ``gates_pos_true`` /
+    ``gates_quat_true`` rather than the masked policy-view fields.
+    Gate-local x-axis is forward through the aperture; (y, z) span the
+    aperture plane.
+    """
+    events: list[dict[str, Any]] = []
+    for i in range(1, len(ep.rows)):
+        prev_tg = ep.rows[i - 1]["target_gate"]
+        curr_tg = ep.rows[i]["target_gate"]
+        if prev_tg < 0 or curr_tg == prev_tg:
+            continue
+        passed_idx = prev_tg
+        row = ep.rows[i]
+        gate_pos = np.asarray(row["gates_pos_true"][passed_idx])
+        gate_quat = np.asarray(row["gates_quat_true"][passed_idx])
+        rot_gw = _quat_to_rotmat(gate_quat)
+        # Project drone position into gate-local frame: x = forward
+        # through gate, y/z = aperture coords.
+        rel = np.asarray(row["pos"]) - gate_pos
+        local = rot_gw.T @ rel
+        offset = float(np.linalg.norm(local[1:]))  # (y, z) magnitude
+        vel = np.asarray(row["vel"])
+        speed = float(np.linalg.norm(vel))
+        forward = rot_gw[:, 0]
+        cos_angle = float(np.clip(vel @ forward / max(speed, 1e-9), -1.0, 1.0))
+        events.append({
+            "type": "gate_pass",
+            "t": float(row["t"]),
+            "gate": int(passed_idx),
+            "speed": speed,
+            "in_plane_offset_m": offset,
+            "angle_off_normal_rad": float(np.arccos(abs(cos_angle))),
+        })
+    return events
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
