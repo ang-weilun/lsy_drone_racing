@@ -13,6 +13,7 @@ per-episode JSONL files. Output is written to ``<trace_dir>/../analysis/``.
 See ``docs/plans/2026-05-18-eval-trace-tooling-design.md`` for the
 schema and event taxonomy.
 """
+
 from __future__ import annotations
 
 import json
@@ -24,14 +25,14 @@ import fire
 import numpy as np
 
 # Detector thresholds (module-level so they're easy to tune).
-HOVER_WINDOW_STEPS: int = 20         # 0.4 s at 50 Hz
+HOVER_WINDOW_STEPS: int = 20  # 0.4 s at 50 Hz
 HOVER_XY_BBOX_M: float = 0.15
 NEAR_MISS_DIST_M: float = 0.20
 WOBBLE_ANG_VEL_RAD_S: float = 6.0
 WOBBLE_MIN_DURATION_STEPS: int = 10  # 0.2 s
 TAKEOFF_Z_M: float = 0.10
 FLOOR_Z_M: float = 0.05
-COLLISION_RECENT_WINDOW: int = 5     # frames pre-terminal
+COLLISION_RECENT_WINDOW: int = 5  # frames pre-terminal
 
 
 @dataclass(frozen=True)
@@ -118,11 +119,13 @@ def _quat_to_rotmat(quat_xyzw: np.ndarray) -> np.ndarray:
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
     wx, wy, wz = w * x, w * y, w * z
-    return np.array([
-        [1 - 2 * (yy + zz),     2 * (xy - wz),     2 * (xz + wy)],
-        [    2 * (xy + wz), 1 - 2 * (xx + zz),     2 * (yz - wx)],
-        [    2 * (xz - wy),     2 * (yz + wx), 1 - 2 * (xx + yy)],
-    ])
+    return np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ]
+    )
 
 
 def _rows_pos(rows: list[dict]) -> np.ndarray:
@@ -207,14 +210,16 @@ def detect_gate_passes(ep: Episode) -> list[dict[str, Any]]:
         speed = float(np.linalg.norm(vel))
         forward = rot_gw[:, 0]
         cos_angle = float(np.clip(vel @ forward / max(speed, 1e-9), -1.0, 1.0))
-        events.append({
-            "type": "gate_pass",
-            "t": float(row["t"]),
-            "gate": int(passed_idx),
-            "speed": speed,
-            "in_plane_offset_m": offset,
-            "angle_off_normal_rad": float(np.arccos(abs(cos_angle))),
-        })
+        events.append(
+            {
+                "type": "gate_pass",
+                "t": float(row["t"]),
+                "gate": int(passed_idx),
+                "speed": speed,
+                "in_plane_offset_m": offset,
+                "angle_off_normal_rad": float(np.arccos(abs(cos_angle))),
+            }
+        )
     return events
 
 
@@ -289,19 +294,19 @@ _GATE_HALF_Y: float = 0.20
 _GATE_HALF_Z: float = 0.20
 
 # Gate aperture corners in gate-local coords (x=0, +/- half_y, +/- half_z).
-_GATE_FRAME_CORNERS_LOCAL = np.array([
-    [0.0, +_GATE_HALF_Y, +_GATE_HALF_Z],
-    [0.0, +_GATE_HALF_Y, -_GATE_HALF_Z],
-    [0.0, -_GATE_HALF_Y, +_GATE_HALF_Z],
-    [0.0, -_GATE_HALF_Y, -_GATE_HALF_Z],
-])
+_GATE_FRAME_CORNERS_LOCAL = np.array(
+    [
+        [0.0, +_GATE_HALF_Y, +_GATE_HALF_Z],
+        [0.0, +_GATE_HALF_Y, -_GATE_HALF_Z],
+        [0.0, -_GATE_HALF_Y, +_GATE_HALF_Z],
+        [0.0, -_GATE_HALF_Y, -_GATE_HALF_Z],
+    ]
+)
 # Edge endpoint pairs: right-vertical, left-vertical, top-horiz, bottom-horiz.
 _GATE_FRAME_EDGES: list[tuple[int, int]] = [(0, 1), (2, 3), (0, 2), (1, 3)]
 
 
-def _gate_frame_edge_dist(
-    pos: np.ndarray, gate_pos: np.ndarray, gate_quat: np.ndarray
-) -> float:
+def _gate_frame_edge_dist(pos: np.ndarray, gate_pos: np.ndarray, gate_quat: np.ndarray) -> float:
     """Minimum distance from ``pos`` to any of the four gate-frame edges.
 
     Mirrors ``reward._gate_frame_edge_dist_sq`` (sqrt'd for human readability).
@@ -346,13 +351,15 @@ def detect_near_misses(ep: Episode) -> list[dict[str, Any]]:
         if d < NEAR_MISS_DIST_M:
             advanced = any(r["target_gate"] != tg for r in ep.rows[i + 1 :])
             if not advanced:
-                events.append({
-                    "type": "near_miss",
-                    "t": float(row["t"]),
-                    "gate": int(tg),
-                    "closest_frame_dist_m": d,
-                    "passed": False,
-                })
+                events.append(
+                    {
+                        "type": "near_miss",
+                        "t": float(row["t"]),
+                        "gate": int(tg),
+                        "closest_frame_dist_m": d,
+                        "passed": False,
+                    }
+                )
                 seen_pass.add(tg)
                 break
     return events
@@ -368,9 +375,7 @@ def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float
 
 
 def _resolve_collision_object(
-    pos: np.ndarray,
-    gates_pos: np.ndarray,
-    obstacles_top: np.ndarray,
+    pos: np.ndarray, gates_pos: np.ndarray, obstacles_top: np.ndarray
 ) -> tuple[str, float]:
     """Return ``(object_label, distance)`` for the nearest collision candidate.
 
@@ -406,9 +411,7 @@ def _resolve_collision_object(
     return label, distance
 
 
-def detect_collision(
-    ep: Episode, outcome: dict[str, Any]
-) -> dict[str, Any] | None:
+def detect_collision(ep: Episode, outcome: dict[str, Any]) -> dict[str, Any] | None:
     """Detect a collision event from the pre-terminal frame.
 
     Parameters
@@ -460,9 +463,7 @@ def detect_collision(
         rj = rows[j]
         if label.startswith("gate:"):
             idx = int(label.split(":")[1])
-            d = float(np.linalg.norm(
-                np.asarray(rj["pos"]) - np.asarray(rj["gates_pos_true"][idx])
-            ))
+            d = float(np.linalg.norm(np.asarray(rj["pos"]) - np.asarray(rj["gates_pos_true"][idx])))
         elif label.startswith("obstacle:"):
             idx = int(label.split(":")[1])
             top = np.asarray(rj["obstacles_pos_true"][idx])
@@ -523,9 +524,7 @@ def detect_wobbles(ep: Episode) -> list[dict[str, Any]]:
     return events
 
 
-def _wobble_event(
-    ep: Episode, mag: np.ndarray, i_start: int, i_end: int
-) -> dict[str, Any]:
+def _wobble_event(ep: Episode, mag: np.ndarray, i_start: int, i_end: int) -> dict[str, Any]:
     """Build a wobble event from a (start, end) frame range."""
     return {
         "type": "wobble",
@@ -533,6 +532,44 @@ def _wobble_event(
         "t_end": float(ep.rows[i_end]["t"]),
         "duration_s": float(ep.rows[i_end]["t"] - ep.rows[i_start]["t"]),
         "max_ang_vel_rad_s": float(mag[i_start : i_end + 1].max()),
+    }
+
+
+def integrate_reward(ep: Episode) -> dict[str, Any] | None:
+    """Sum reward terms across the episode.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    dict or None
+        ``None`` if any row has ``reward_terms == None`` (back-compat
+        path when no ``reward_config.json`` was available at eval time).
+        Otherwise: ``total`` (float), ``by_term`` (dict[str, float] of
+        per-component sums), ``dominant_positive`` (term key with
+        largest positive sum, or ``None`` if no positives),
+        ``dominant_negative`` (term key with most negative sum, or
+        ``None`` if no negatives).
+    """
+    rows = ep.rows
+    if any(r["reward_terms"] is None for r in rows):
+        return None
+    keys = list(rows[0]["reward_terms"].keys())
+    sums = {k: 0.0 for k in keys}
+    for r in rows:
+        for k in keys:
+            sums[k] += float(r["reward_terms"][k])
+    total = sum(r["reward_total"] for r in rows)
+    positives = {k: v for k, v in sums.items() if v > 0}
+    negatives = {k: v for k, v in sums.items() if v < 0}
+    return {
+        "total": float(total),
+        "by_term": sums,
+        "dominant_positive": max(positives, key=positives.get) if positives else None,
+        "dominant_negative": min(negatives, key=negatives.get) if negatives else None,
     }
 
 
