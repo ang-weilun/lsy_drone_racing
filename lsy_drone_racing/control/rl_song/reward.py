@@ -220,15 +220,11 @@ def step_reward(
     gates_visited_bool = env_obs["gates_visited"].astype(jnp.bool_)
     obstacles_visited_bool = env_obs["obstacles_visited"].astype(jnp.bool_)
     if placed_gates_pos is not None:
-        safety_gates_pos = jnp.where(
-            gates_visited_bool[..., None], gates_pos, placed_gates_pos
-        )
+        safety_gates_pos = jnp.where(gates_visited_bool[..., None], gates_pos, placed_gates_pos)
     else:
         safety_gates_pos = gates_pos
     if placed_gates_quat is not None:
-        safety_gates_quat = jnp.where(
-            gates_visited_bool[..., None], gates_quat, placed_gates_quat
-        )
+        safety_gates_quat = jnp.where(gates_visited_bool[..., None], gates_quat, placed_gates_quat)
     else:
         safety_gates_quat = gates_quat
     if placed_obstacles_pos is not None:
@@ -399,9 +395,7 @@ def step_reward(
     #     frame's plane and the penalty is negligible.
     window_lo = jnp.maximum(target_idx - 1, 0)[:, None]
     window_hi = jnp.minimum(target_idx + 1, n_gates_total - 1)[:, None]
-    gate_window = (gate_indices[None, :] >= window_lo) & (
-        gate_indices[None, :] <= window_hi
-    )
+    gate_window = (gate_indices[None, :] >= window_lo) & (gate_indices[None, :] <= window_hi)
     gate_frame_barrier = gate_frame_barrier * gate_window[..., None].astype(
         gate_frame_barrier.dtype
     )

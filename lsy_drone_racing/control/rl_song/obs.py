@@ -32,10 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from lsy_drone_racing.control.rl_song.config import (
-    ACTOR_OBS_DIM,
-    ENV_ACTION_DIM,
-)
+from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, ENV_ACTION_DIM
 
 # Number of future gates encoded in the actor observation (target + 1).
 N_FUTURE_GATES: int = 2
@@ -261,9 +258,7 @@ def build_actor_obs(
 
     visited_chan = gates_visited[gate_indices].astype(jnp.float32)
 
-    prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(
-        ENV_ACTION_DIM
-    )
+    prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(ENV_ACTION_DIM)
 
     # Obstacle channel: body-frame relative position + visited flag, per
     # obstacle.
@@ -286,9 +281,7 @@ def build_actor_obs(
         [obstacles_rel_body, obstacles_visited.astype(jnp.float32)[..., None]], axis=-1
     ).reshape(-1)
 
-    raw = jnp.concatenate(
-        [drone_chan, gate_chan, visited_chan, prev_action_chan, obstacle_chan]
-    )
+    raw = jnp.concatenate([drone_chan, gate_chan, visited_chan, prev_action_chan, obstacle_chan])
     return apply_normalizer(normalizer, raw)
 
 
