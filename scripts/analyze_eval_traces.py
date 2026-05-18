@@ -825,7 +825,7 @@ def build_run_summary(
         for e in eps
     ]
 
-    return {
+    summary = {
         "checkpoint": run_meta.get("checkpoint"),
         "config": run_meta.get("config"),
         "control_mode": run_meta.get("control_mode"),
@@ -837,8 +837,76 @@ def build_run_summary(
         "reward_per_episode": reward_per_episode,
         "spawn_buckets": spawn_buckets,
         "episodes": episodes_block,
-        "investigator_notes": [],  # filled in C11
+        "investigator_notes": [],
     }
+    summary["investigator_notes"] = build_investigator_notes(summary)
+    return summary
+
+
+def build_investigator_notes(summary: dict[str, Any]) -> list[str]:
+    """Rule-based observations summarising the run.
+
+    Three deterministic rules -- no LLM. Each rule contributes at most
+    one line per qualifying entry, appended in rule order.
+
+    Parameters
+    ----------
+    summary : dict
+        Run-level summary produced by :func:`build_run_summary` with the
+        ``terminal_cause_histogram``, ``anomaly_histogram``, ``aggregate``,
+        and ``spawn_buckets`` fields already populated.
+
+    Returns
+    -------
+    list of str
+        Observation strings, one per triggered rule instance, in this
+        order:
+
+        1. Any non-``"finished"`` terminal cause present in more than
+           30% of episodes is flagged as the dominant failure mode.
+        2. Any anomaly type present in more than 50% of episodes is
+           flagged.
+        3. Any spawn bucket whose ``finish_rate`` differs from the run
+           mean by a factor greater than 2 (with at least 2 episodes in
+           the bucket) is flagged as a strong spawn dependence. Skipped
+           entirely when the run mean ``finish_rate`` is 0, both to
+           avoid divide-by-zero and because the diagnostic is
+           uninformative when nothing finishes.
+
+    Notes
+    -----
+    Returns an empty list when ``n_episodes`` is 0 -- there is nothing
+    to flag.
+    """
+    notes: list[str] = []
+    n = summary["n_episodes"]
+    if n == 0:
+        return notes
+
+    for cause, count in summary["terminal_cause_histogram"].items():
+        if cause == "finished" or count / n <= 0.30:
+            continue
+        notes.append(f"{count}/{n} episodes ended in {cause} -- dominant failure mode.")
+
+    for kind, count in summary["anomaly_histogram"].items():
+        if count / n <= 0.50:
+            continue
+        notes.append(f"{kind} events present in {count}/{n} episodes.")
+
+    mean_fr = summary["aggregate"]["finish_rate"]
+    if mean_fr > 0:
+        for b in summary["spawn_buckets"]:
+            if b["n"] < 2:
+                continue
+            ratio = b["finish_rate"] / mean_fr
+            if ratio > 2.0 or ratio < 0.5:
+                notes.append(
+                    f"Spawn bucket {b['bucket']} has finish_rate "
+                    f"{b['finish_rate']:.2f} vs run mean {mean_fr:.2f} "
+                    f"-- strong spawn dependence."
+                )
+
+    return notes
 
 
 def analyze(trace_dir: str) -> None:
