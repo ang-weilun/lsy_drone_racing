@@ -150,6 +150,9 @@ def step_reward(
     true_gates_pos: Array | None = None,
     true_gates_quat: Array | None = None,
     true_obstacles_pos: Array | None = None,
+    placed_gates_pos: Array | None = None,
+    placed_gates_quat: Array | None = None,
+    placed_obstacles_pos: Array | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute one vectorized Song-style reward step.
 
@@ -182,6 +185,15 @@ def step_reward(
     true_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
         Unmasked obstacle positions. If omitted, ``env_obs["obstacles_pos"]``
         is used.
+    placed_gates_pos : Array, shape (n_envs, n_gates, 3), optional
+    placed_gates_quat : Array, shape (n_envs, n_gates, 4), optional
+    placed_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
+        v33 — Layer-1 placed poses (pre-wobble) used by the actor obs
+        for unvisited objects. ``r_obs`` and ``r_gate_frame`` blend
+        these with ``true_*`` via the per-object visited masks so the
+        actor is only graded on safety against poses it can actually
+        observe. When omitted, the function falls back to ``true_*``
+        unconditionally (v32a behaviour).
 
     Returns
     -------
@@ -196,6 +208,35 @@ def step_reward(
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
     gates_quat = env_obs["gates_quat"] if true_gates_quat is None else true_gates_quat
     obstacles_pos = env_obs["obstacles_pos"] if true_obstacles_pos is None else true_obstacles_pos
+
+    # v33: assemble the actor-visible safety poses by blending true (for
+    # visited objects, where the actor obs gets the true sensor read) with
+    # the placed (Layer-1) snapshot (for unvisited objects, where the
+    # actor obs sees the placed value). ``r_obs`` and ``r_gate_frame`` are
+    # then computed against these so the per-step avoidance gradient maps
+    # to features the policy can actually observe. Falls back to
+    # ``true_*`` when the placed snapshot wasn't passed, preserving v32a
+    # behaviour for callers that haven't been updated yet.
+    gates_visited_bool = env_obs["gates_visited"].astype(jnp.bool_)
+    obstacles_visited_bool = env_obs["obstacles_visited"].astype(jnp.bool_)
+    if placed_gates_pos is not None:
+        safety_gates_pos = jnp.where(
+            gates_visited_bool[..., None], gates_pos, placed_gates_pos
+        )
+    else:
+        safety_gates_pos = gates_pos
+    if placed_gates_quat is not None:
+        safety_gates_quat = jnp.where(
+            gates_visited_bool[..., None], gates_quat, placed_gates_quat
+        )
+    else:
+        safety_gates_quat = gates_quat
+    if placed_obstacles_pos is not None:
+        safety_obstacles_pos = jnp.where(
+            obstacles_visited_bool[..., None], obstacles_pos, placed_obstacles_pos
+        )
+    else:
+        safety_obstacles_pos = obstacles_pos
 
     prev_target = prev_env_obs["target_gate"]
     current_target = env_obs["target_gate"]
@@ -291,7 +332,16 @@ def step_reward(
     # near zero despite dropping the visited mask. Dropping z treats
     # obstacles as infinite vertical poles, matching the actual capsule
     # geometry well over the racing altitude range.
-    obstacle_delta_xy = pos[:, None, :2] - obstacles_pos[:, :, :2]
+    # v33: distance computed against ``safety_obstacles_pos`` (true for
+    # visited, placed for unvisited) so the actor's per-step gradient is
+    # against the obstacle it can actually observe. v32a used
+    # ``obstacles_pos`` unconditionally, which graded the policy on the
+    # post-wobble true location even when the actor obs was showing the
+    # pre-wobble placed location (up to 0.15 m off) — that mismatch is
+    # roughly the obstacle_sigma half-width, so the avoidance gradient
+    # was being optimized against a feature distribution shifted from
+    # what the policy could see.
+    obstacle_delta_xy = pos[:, None, :2] - safety_obstacles_pos[:, :, :2]
     obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta_xy), axis=-1)
     # v32: drop the ``obstacle_active = 1 - obstacles_visited`` mask. The
     # old mask zeroed the penalty exactly when ``obstacles_visited``
@@ -308,15 +358,53 @@ def step_reward(
     # ``obs.GATE_HALF_SIZE_M``) form 4 line-segment edges in world frame.
     # We compute the per-edge min squared distance from the drone to the
     # segment, apply a Gaussian barrier, and sum over edges and gates.
-    # Applied to all gates equally — the drone should fly through the
-    # passage *center* of every gate, not graze any frame. With
-    # ``gate_frame_sigma=0.08 m`` and passage half-width 0.20 m the
-    # barrier at center is exp(-(0.20/0.08)^2) ≈ 0.002 (negligible),
-    # while at 0.10 m from the rim it's exp(-(0.10/0.08)^2) ≈ 0.21
-    # (steep avoidance gradient). Replaces the missing collision signal
-    # that v30 / v31 evals showed as "crashes into gate frames".
-    edge_dist_sq = _gate_frame_edge_dist_sq(pos, gates_pos, gates_quat)  # (n_envs, n_gates, 4)
+    # v33: applied with two changes vs v32a:
+    #   * Distance is to ``safety_gates_pos`` / ``safety_gates_quat``
+    #     (true for visited, placed for unvisited), so the actor's
+    #     per-step avoidance gradient is against the frame location it
+    #     can actually observe. v32a graded against true post-wobble
+    #     pose, which moved by up to 0.15 m XY (and 0.20 rad yaw) from
+    #     the actor's observed pose for unvisited gates — comparable
+    #     to one ``gate_frame_sigma`` step and enough to invert the
+    #     gradient at close approach.
+    #   * Masked to the gates in ``{target_idx - 1, target_idx,
+    #     target_idx + 1}``. v32a summed over all 4 gates, including
+    #     gates outside the actor's ``N_FUTURE_GATES=2`` observation
+    #     window. Those far-gate contributions were near zero on
+    #     average but their gradient (when occasionally aligned with
+    #     the racing line) pulled the actor off the natural path. The
+    #     window keeps the just-passed exit frame (target_idx - 1) for
+    #     post-pass clearance, the current target frame for the
+    #     active approach, and the next target frame for look-ahead.
+    # With ``gate_frame_sigma=0.08 m`` and passage half-width 0.20 m the
+    # barrier at passage center is exp(-(0.20/0.08)^2) ≈ 0.002
+    # (negligible) and at 0.10 m from the rim is exp(-(0.10/0.08)^2)
+    # ≈ 0.21 (steep avoidance gradient).
+    edge_dist_sq = _gate_frame_edge_dist_sq(
+        pos, safety_gates_pos, safety_gates_quat
+    )  # (n_envs, n_gates, 4)
     gate_frame_barrier = jnp.exp(-edge_dist_sq / jnp.square(reward_cfg.gate_frame_sigma))
+    n_gates_total = safety_gates_pos.shape[1]
+    gate_indices = jnp.arange(n_gates_total)
+    # Window mask: gate g is active iff ``|g - target_idx| <= 1`` AND
+    # ``0 <= g <= n_gates - 1``. Edge cases:
+    #   * target_idx == 0   -> window = {0, 1}        (no previous gate)
+    #   * target_idx == N-1 -> window = {N-2, N-1}    (no next gate)
+    #   * finished step -> ``prev_target`` was the last gate ``N-1``,
+    #     so ``target_idx = N-1`` and the window is ``{N-2, N-1}``.
+    #     Dense terms are *not* zeroed on finish steps (only on crash
+    #     steps via ``crash_mask = terminated & ~finished`` below), so
+    #     r_gate_frame is a legitimate per-step penalty on the finish
+    #     step itself — but the drone is geometrically past the last
+    #     frame's plane and the penalty is negligible.
+    window_lo = jnp.maximum(target_idx - 1, 0)[:, None]
+    window_hi = jnp.minimum(target_idx + 1, n_gates_total - 1)[:, None]
+    gate_window = (gate_indices[None, :] >= window_lo) & (
+        gate_indices[None, :] <= window_hi
+    )
+    gate_frame_barrier = gate_frame_barrier * gate_window[..., None].astype(
+        gate_frame_barrier.dtype
+    )
     r_gate_frame = -reward_cfg.gate_frame_weight * jnp.sum(gate_frame_barrier, axis=(-1, -2))
 
     # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
@@ -352,13 +440,23 @@ def step_reward(
     norm_to_next = jnp.linalg.norm(diff_to_next, axis=-1, keepdims=True)
     direction_to_next = diff_to_next / jnp.maximum(norm_to_next, 1e-6)
     v_to_next = jnp.sum(env_obs["vel"] * direction_to_next, axis=-1)
+    # v33: clip ``v_to_next`` to ``±exit_vel_clip_mps``. With v33's
+    # ``exit_vel_coef=10.0`` an unclipped outlier (e.g. ~12 m/s
+    # transient on a hard pitch) would mint a +120 one-shot reward at
+    # gate pass, which is comparable to a full gate's jackpot and would
+    # spike value-function targets. Clipping at 5 m/s leaves a clean
+    # racing-speed exit (3-5 m/s aligned) paying +30 to +50, while
+    # capping outliers at the same +50 ceiling.
+    v_to_next_clipped = jnp.clip(
+        v_to_next, -reward_cfg.exit_vel_clip_mps, reward_cfg.exit_vel_clip_mps
+    )
     exit_vel_active = (
         jnp.asarray(reward_cfg.use_exit_vel_bonus, dtype=bool)
         & gate_just_passed
         & (new_target >= 0)
     )
     r_exit_vel = jnp.where(
-        exit_vel_active, reward_cfg.exit_vel_coef * v_to_next, jnp.zeros_like(r_prog)
+        exit_vel_active, reward_cfg.exit_vel_coef * v_to_next_clipped, jnp.zeros_like(r_prog)
     )
 
     r_finish = jnp.where(finished, reward_cfg.finish_bonus, jnp.zeros_like(r_prog))

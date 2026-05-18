@@ -265,8 +265,23 @@ def build_actor_obs(
         ENV_ACTION_DIM
     )
 
-    # Obstacle channel: body-frame relative position + visited flag, per obstacle.
-    obstacles_rel_body = (obstacles_pos - pos) @ rot_bw.T  # (N_OBSTACLES, 3)
+    # Obstacle channel: body-frame relative position + visited flag, per
+    # obstacle.
+    #
+    # v33: project the obstacle's world-frame XY onto the drone's altitude
+    # plane (replace ``obs_z`` with ``pos_z``) before rotating into the
+    # body frame. Obstacles are vertical capsules from the floor to
+    # z≈1.55 (see ``envs/assets/obstacle.xml`` and the level-3 toml
+    # header); the relevant collision surface is at the drone's altitude,
+    # not at the top marker. ``reward.step_reward`` already uses
+    # XY-only distance for ``r_obs`` (treating obstacles as infinite
+    # vertical poles); pre-v33 the actor saw the body-frame vector to
+    # the top marker (z≈1.55) instead, so the geometry the policy was
+    # graded on disagreed with the geometry it could observe. Same
+    # 3 floats per obstacle, so the obs dimensionality (and the
+    # observation normalizer it interacts with) is unchanged.
+    obstacles_at_alt = obstacles_pos.at[:, 2].set(pos[2])
+    obstacles_rel_body = (obstacles_at_alt - pos) @ rot_bw.T  # (N_OBSTACLES, 3)
     obstacle_chan = jnp.concatenate(
         [obstacles_rel_body, obstacles_visited.astype(jnp.float32)[..., None]], axis=-1
     ).reshape(-1)

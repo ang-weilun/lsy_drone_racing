@@ -212,6 +212,12 @@ class RLSongVecEnv:
             true_gates_pos=self.true_gates_pos(),
             true_gates_quat=self.true_gates_quat(),
             true_obstacles_pos=self.true_obstacles_pos(),
+            # v33: actor-visible safety reward. Falls back to ``true_*``
+            # inside ``step_reward`` when these are ``None`` (e.g. on
+            # non-level-3 stages that don't populate the placed buffer).
+            placed_gates_pos=self.placed_gates_pos,
+            placed_gates_quat=self.placed_gates_quat,
+            placed_obstacles_pos=self.placed_obstacles_pos,
         )
 
         done = terminated | truncated

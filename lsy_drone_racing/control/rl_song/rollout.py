@@ -611,6 +611,14 @@ def scan_rollout(
             true_gates_pos=stepped_data.gates_pos,
             true_gates_quat=stepped_data.gates_quat,
             true_obstacles_pos=stepped_data.obstacles_pos,
+            # v33: actor-visible safety reward. The scan body has the
+            # placed buffer in ``carry`` already; pass it through so
+            # ``r_obs`` / ``r_gate_frame`` blend visited (true) vs
+            # unvisited (placed) on a per-object basis. Mirrors the
+            # eager-path call in ``env_wrapper.py``.
+            placed_gates_pos=carry.placed_gates_pos,
+            placed_gates_quat=carry.placed_gates_quat,
+            placed_obstacles_pos=carry.placed_obstacles_pos,
         )
 
         done_bool = terminated | truncated
@@ -1382,11 +1390,26 @@ def _refresh_aux_fields_after_respawn(
     new_gates_visited = jnp.broadcast_to(
         gate_indices[None, None, :] < new_target_gate[:, None, None], env_data.gates_visited.shape
     )
-    # Default-True for obstacles: a respawned drone is assumed to have
-    # already seen the course's obstacles. This avoids spurious
-    # sensor-bonus rewards on the first post-respawn step and matches
-    # the typical mid-course state distribution.
-    new_obstacles_visited = jnp.ones_like(env_data.obstacles_visited)
+    # v33: recompute ``obstacles_visited`` from XY sensor range exactly
+    # like ``_reset_env_data`` does at a true reset, instead of the
+    # blanket-True the pre-v33 default used. The blanket-True was
+    # introduced when ``r_obs`` masked itself by ``1 - obstacles_visited``
+    # (so True kept the penalty off after a respawn), but v32 dropped
+    # that mask and v33's actor obs leans on the visited flag as a
+    # "trust this position" signal. Blanket-True after seg-init/Phase 2
+    # taught the actor that mid-track respawns claim sensor discovery
+    # of obstacles outside sensor range, which contaminates the
+    # feature distribution at exactly the obs states (mid-track) the
+    # buffer is supposed to populate.
+    sensor_range = env_data.sensor_range
+    obstacles_pos = env_data.obstacles_pos  # (n_envs, n_obstacles, 3)
+    # ``new_pos_drones`` is (n_envs, n_drones, 3). Add a per-obstacle
+    # broadcast axis to match the (n_envs, n_drones, n_obstacles, 2)
+    # delta shape used by ``_reset_env_data``.
+    dpos_xy = (
+        new_pos_drones[..., None, :2] - obstacles_pos[:, None, :, :2]
+    )  # (n_envs, n_drones, n_obstacles, 2)
+    new_obstacles_visited = jnp.linalg.norm(dpos_xy, axis=-1) < sensor_range
     return env_data.replace(
         last_drone_pos=jnp.where(mask_drone3, new_pos_drones, env_data.last_drone_pos),
         takeoff_pos=jnp.where(mask_drone3, new_pos_drones, env_data.takeoff_pos),

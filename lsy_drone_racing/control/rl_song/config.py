@@ -130,7 +130,12 @@ class PPOConfig:
     max_grad_norm: float = 1.0
     learning_rate: float = 3e-4
     anneal_lr: bool = True
-    total_timesteps: int = 100_000_000
+    # v33: bumped default 100M -> 500M to match the v32a-era launch
+    # convention (every recent run has overridden this on the CLI). The
+    # entropy anneal endpoint and the LR cosine endpoint both read
+    # ``total_timesteps``, so a stale default silently mis-anneals if a
+    # launch forgets the override.
+    total_timesteps: int = 500_000_000
     # Initial log-std for the raw 7-vec Gaussian; sigma ~= 0.6.
     init_log_std: float = -0.5
 
@@ -214,7 +219,18 @@ class RewardConfig:
     # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
     # control frequency and the 100 Hz figure was a misreading. Reverting
     # to the verbatim paper value.
-    omega_coef: float = 0.01
+    # v33: 0.01 -> 0.003. v32a evals showed the drone flying slow, and
+    # the per-step magnitude of r_omega = 0.01 * |ang_vel|_L1 at racing
+    # body rates (~10 rad/s per axis -> L1 ≈ 30) is -0.3/step, which
+    # over a 500-step episode is -150 — larger than ``finish_bonus``
+    # and comparable to the entire gate jackpot total. The policy was
+    # structurally biased toward gentle slow turns. 0.003 keeps the
+    # penalty against thrashing/oscillation (still -0.09/step at 30
+    # rad/s, integrates to -45 over 500 steps, ~half the finish bonus)
+    # but no longer dominates the speed economics. Song's b=0.01 was
+    # justified for the lighter quad in his paper; our cf21B at this
+    # control rate hits higher peak rates routinely.
+    omega_coef: float = 0.003
     # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0.
     # v17: back to 5.0. The v15 raise to 10.0 (combined with progress_coef
     # = 1) made the per-episode crash penalty dominate the per-episode
@@ -230,7 +246,18 @@ class RewardConfig:
     # makes any crash strictly worse than do-nothing (-15 < -7) so the
     # only direction of escape from the attractor is forward through a
     # gate (+20 jackpot dominates by 30+).
-    crash_penalty: float = 15.0
+    # v33: 15 -> 100. v32a banks gate jackpots (40 / 80 / 120 / 160) and
+    # the finish bonus (100) on the way to a finish, and v33 adds another
+    # +50 per gate from the bumped ``exit_vel_coef``. A clean crash after
+    # gates 1+2 with v33's exit-velocity term pays 40 + 50 + 80 + 50 = 220
+    # before crash; with the old crash_penalty=15 the crash netted +205
+    # (strictly more than just standing still), so risky terminal lines
+    # were the dominant policy. crash_penalty=100 brings the same crash
+    # to net +120 — still positive, but a clean continuation banking the
+    # next gate (+120 + ~50 + further events) dominates. crash_penalty=50
+    # (an earlier v33 draft) still netted +170 after two gates and was
+    # caught as too weak in the codex pre-launch review.
+    crash_penalty: float = 100.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
@@ -251,7 +278,17 @@ class RewardConfig:
     # ~exp(-6.25) = 0.002 at 0.5 m, no learning signal until contact).
     # weight stays at 0.2: per-step worst case ~4 obstacles × 1.0 × 0.2
     # = -0.8/step, manageable cumulative over a 100-step episode.
-    obstacle_weight: float = 0.2
+    # v33: 0.2 -> 0.8. v32a evals showed the drone still grazes obstacle
+    # capsules. With weight=0.2, the per-step penalty for being right
+    # next to a single obstacle was -0.2 — small enough that PPO would
+    # absorb it for any nominal progress gain. At 0.8 the same single-
+    # obstacle close-approach is -0.8/step, comparable to a step's
+    # ``r_prog`` at racing speed (so PPO actually has to route around).
+    # Codex's pre-launch review suggested bumping above the 0.6 draft
+    # because the realistic case is "one obstacle close", not "all 4
+    # obstacles touching", so the per-step magnitude needs to scale to
+    # the realistic worst case, not the cumulative bound.
+    obstacle_weight: float = 0.8
     obstacle_sigma: float = 0.3  # m
     # v32: Gate-frame soft barrier. Penalize proximity to gate frame
     # edges (4 line segments per gate, connecting the opening corners
@@ -262,7 +299,16 @@ class RewardConfig:
     # ≈ 0.21 (strong gradient). Applied to all gates equally — the
     # drone wants to fly through the passage center, not graze any
     # frame.
-    gate_frame_weight: float = 0.2
+    # v33: 0.2 -> 1.2 (same rationale as obstacle_weight bump). v32a's
+    # gate-frame hits show the 0.2 weight was insufficient — at d=0.10 m
+    # from the nearest edge the per-step sum across the 4 edges of one
+    # gate is ≈ 0.21 × 0.2 ≈ 0.042 (codex's careful re-estimate; my
+    # earlier 0.67 number assumed all 4 edges sit at 10 cm
+    # simultaneously, which is geometry-impossible for the square
+    # opening). 1.2× lifts the same close-graze to -0.25/step, and a
+    # full second of grazing (~50 steps) costs -12.6 — outweighs the
+    # marginal r_prog gain from a tighter line.
+    gate_frame_weight: float = 1.2
     gate_frame_sigma: float = 0.08  # m
     # v9: shrink gate jackpot from 20 to 2. The v7/v8 jackpot of 20×(idx+1)
     # paid 20/40/60/80 per gate, dominating r_prog (~+0.17/step ≈ +8.5 per
@@ -321,8 +367,20 @@ class RewardConfig:
     # +6 vs gate_pass_bonus's +40-160. Does *not* penalize any maneuver —
     # extreme attitudes (e.g. v7's reverse-into-gate-4 trick) that preserve
     # exit-velocity-toward-next-gate get a larger bonus, not a smaller one.
+    # v33: 2.0 -> 10.0 with ``v_to_next`` clamped to ``±exit_vel_clip``
+    # in ``reward.step_reward``. v32a's value paid 4-15% of the per-gate
+    # jackpot at a 3 m/s aligned exit; PPO routinely ignored it. 10×
+    # makes a clean 5 m/s aligned exit pay ``10 * 5 = +50`` per gate,
+    # comparable to the gate-1 jackpot itself. The clip prevents
+    # arbitrary outliers (e.g. brief 10+ m/s body-frame artifacts after
+    # a hard pitch) from minting one-shot rewards that destabilize the
+    # value function.
     use_exit_vel_bonus: bool = True
-    exit_vel_coef: float = 2.0
+    exit_vel_coef: float = 10.0
+    # Hard cap on the velocity scalar fed into the exit-velocity bonus.
+    # See ``reward.step_reward``: ``r_exit_vel = exit_vel_coef *
+    # clip(v · dir_to_next, -exit_vel_clip, exit_vel_clip)``.
+    exit_vel_clip_mps: float = 5.0
     # v8: per-step time penalty. With randomized gates the random-init policy
     # has zero progress in expectation, while a stationary "hover" policy
     # collects zero shaping reward and just times out — making hover the Q≈0
@@ -366,7 +424,17 @@ class RewardConfig:
     # (policy escaped the r_guid window faster); with use_guide=False
     # in v17/v18/v19 there is no field to escape, so this failure mode
     # does not apply.
-    time_penalty: float = 0.05
+    # v33: 0.05 -> 0.10. v32a achieves first-lap finishes but at slow
+    # lap times. With time_penalty=0.05, the gap between a 200-step
+    # fast lap and a 500-step slow lap is only 0.05 × 300 = 15 reward,
+    # which is rounding error next to the ~600 of event-based reward.
+    # Doubling to 0.10 widens the fast-vs-slow gap to 30 — meaningful
+    # against the +50 v33 exit-velocity bonus per gate. The do-nothing
+    # baseline tightens too (was -25 per 500-step timeout, now -50),
+    # but the v33 crash_penalty=50 still makes any crash strictly
+    # worse than do-nothing, so policy escape from a hover attractor
+    # remains via forward motion, not suicide.
+    time_penalty: float = 0.10
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -587,8 +655,66 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v32a: reward fixes for the obstacle / gate-frame collision problem
-    v30 / v31 evals exposed, with the v32 bugs codex caught corrected:
+    v33: obs/reward-economics overhaul on top of v32a (first lap-finishing
+    controller). Same Phase 2 mix and same cold-train discipline as v32a,
+    but with eight changes prompted by the post-v32a codex+Claude review:
+
+    Observation/geometry consistency
+        * **Obstacle obs at drone altitude** (``obs.py``): encode the
+          body-frame vector to ``[obs_x, obs_y, drone_z]`` instead of the
+          top marker. The reward already does XY-only distance to a
+          vertical pole; the obs now exposes the same geometry instead of
+          a "ball above-and-to-the-side" feature.
+        * **Safety reward against actor-visible poses** (``reward.py``):
+          ``r_obs`` and ``r_gate_frame`` use post-wobble truth for
+          visited objects, pre-wobble placement for unvisited objects.
+          v32a graded the actor on a ±0.15 m XY perturbation it could
+          not see until sensor range, which broke the per-step
+          avoidance gradient on the (large majority of) unvisited
+          frames.
+        * **r_gate_frame masked to target ± 1**: drops the per-step
+          avoidance gradient from gates outside the actor's
+          ``N_FUTURE_GATES=2`` observation window.
+
+    Speed economics
+        * ``omega_coef`` **0.01 -> 0.003**. At 10 rad/s axis rates the
+          old penalty integrated to ~-150 over a 500-step episode,
+          larger than ``finish_bonus`` and structurally biasing the
+          policy toward slow gentle turns.
+        * ``exit_vel_coef`` **2.0 -> 10.0** with ``v_to_next`` clipped to
+          ±5 m/s. v32a's term paid only ~5-15% of the per-gate jackpot,
+          easy to ignore; the bump makes a clean 5 m/s aligned exit
+          worth +50, comparable to the gate-1 jackpot.
+        * ``time_penalty`` **0.05 -> 0.10**. v32a's gap between a
+          200-step fast lap and a 500-step slow lap was a rounding
+          error next to event-based reward; the bump widens it to a
+          gate-bonus-worth differential.
+
+    Safety pricing
+        * ``crash_penalty`` **15 -> 50**. v32a's 15 was lower than the
+          banked early-gate jackpots (40 + 80 = 120), making risky
+          terminal-gate lines net-positive. 50 still leaves a marginal
+          additional gate worth attempting but stops "bank-and-crash"
+          from being a profitable strategy.
+        * ``obstacle_weight`` **0.2 -> 0.6**, ``gate_frame_weight``
+          **0.2 -> 0.8**. v32a's barriers maxed at ~-0.8/step (all 4
+          obstacles touching) and ~-0.04/step (gate-frame graze), too
+          weak relative to ~+10/step ``r_prog`` at full speed. The
+          bumps carve actual no-go zones.
+
+    Segment-init obstacle-visibility (``rollout.py``)
+        * ``_refresh_aux_fields_after_respawn`` now recomputes
+          ``obstacles_visited`` from XY sensor range instead of setting
+          a blanket-True. The blanket-True made mid-track respawns
+          claim sensor discovery of obstacles outside range, which
+          contaminates the actor obs feature distribution.
+
+    All else (Phase 2 mix, seg-init mix, layout-restoring buffer, cold
+    train at 500M, anneal entropy 0.005 -> 0.001) carries over from v32a
+    unchanged.
+
+    v32a (history note): reward fixes for the obstacle / gate-frame collision
+    problem v30 / v31 evals exposed, with the v32 bugs codex caught corrected:
     r_obs uses XY-only distance (obstacles are vertical capsules from
     z≈1.55 down to floor — full 3D distance was dominated by the
     vertical offset, keeping r_obs near zero even right next to the
@@ -672,7 +798,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v32a_reward_fix",
+                name="level3_v33_obs_reward_econ",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
