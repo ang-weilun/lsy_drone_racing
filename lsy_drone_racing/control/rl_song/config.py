@@ -587,8 +587,18 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v32: reward fixes for the obstacle / gate-frame collision problem
-    v30 / v31 evals exposed. Same Phase 2 mix as v31
+    v32a: reward fixes for the obstacle / gate-frame collision problem
+    v30 / v31 evals exposed, with the v32 bugs codex caught corrected:
+    r_obs uses XY-only distance (obstacles are vertical capsules from
+    z≈1.55 down to floor — full 3D distance was dominated by the
+    vertical offset, keeping r_obs near zero even right next to the
+    capsule), the in-scan reward call now passes ``true_gates_quat``
+    (was silently using nominal toml quats for unvisited randomized
+    gates → r_gate_frame and r_guid were oriented against the wrong
+    gates during training), and dense position-dependent terms
+    (r_prog / r_obs / r_gate_frame / r_guid) are zeroed on crash
+    steps to avoid the warp-location spurious gradient. Same Phase 2
+    mix as v31
     (``segment_init_prob=0.30`` velocity-aware 2.5 m/s, ``phase2_prob=0.30``,
     warmup 50M, 40 / 30 / 30 % per-reset partition) and the same
     layout-restoring buffer, but with two reward changes:
@@ -662,7 +672,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v32_reward_fix",
+                name="level3_v32a_reward_fix",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,

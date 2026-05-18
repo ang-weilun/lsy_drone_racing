@@ -280,16 +280,27 @@ def step_reward(
         jnp.asarray(reward_cfg.use_guide, dtype=bool), r_guid_raw, jnp.zeros_like(r_prog)
     )
 
-    obstacle_delta = pos[:, None, :] - obstacles_pos
-    obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta), axis=-1)
+    # v32a: XY-only distance. ``obstacles_pos`` stores the top marker of
+    # a vertical capsule (see ``config/level3.toml`` and
+    # ``envs/assets/obstacle.xml``) at z ≈ 1.55, but the capsule
+    # extends downward through the drone's flight altitude (~0.7 m).
+    # Full 3D distance from the drone to that top marker is dominated
+    # by the ~0.85 m vertical offset, giving a Gaussian barrier of
+    # ~exp(-8) ≈ 3e-4 even when the drone is right next to the
+    # capsule horizontally — which is exactly why v32's r_obs stayed
+    # near zero despite dropping the visited mask. Dropping z treats
+    # obstacles as infinite vertical poles, matching the actual capsule
+    # geometry well over the racing altitude range.
+    obstacle_delta_xy = pos[:, None, :2] - obstacles_pos[:, :, :2]
+    obstacle_dist_sq = jnp.sum(jnp.square(obstacle_delta_xy), axis=-1)
     # v32: drop the ``obstacle_active = 1 - obstacles_visited`` mask. The
     # old mask zeroed the penalty exactly when ``obstacles_visited``
     # flipped True (i.e. when the drone entered sensor range and was
-    # finally close enough for the small-sigma barrier to matter). The
-    # net effect was that ``r_obs`` was always ~0 and the policy got no
-    # gradient toward obstacle avoidance. v32 evaluates the barrier
-    # unconditionally so the drone is rewarded for keeping its distance
-    # whether or not the obstacle has been "discovered" by the sensor.
+    # finally close enough for the small-sigma barrier to matter), so
+    # the policy got no gradient toward obstacle avoidance. v32
+    # evaluates the barrier unconditionally so the drone is rewarded
+    # for keeping its distance whether or not the obstacle has been
+    # "discovered" by the sensor.
     obstacle_barrier = jnp.exp(-obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma))
     r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier, axis=-1)
 
@@ -359,6 +370,26 @@ def step_reward(
     # on average and times out at the episode cap, leaving "do nothing" as
     # the best policy under the entropy bonus. See ``RewardConfig.time_penalty``.
     r_time = jnp.full_like(r_prog, -reward_cfg.time_penalty)
+
+    # v32a: zero the position-dependent dense terms on a crash step.
+    # ``race_core`` warps a disabled drone to ``[-1, -1, -1]`` *before*
+    # producing the post-step observation, so ``pos`` on the crash step
+    # is the warp location, not the collision location. r_prog computed
+    # against that warp can give a large spurious positive value (drone
+    # "fell back" near gate 0) that PPO would otherwise treat as a
+    # reward for crashing. The Gaussian-barrier terms (r_obs,
+    # r_gate_frame, r_guid) all give ~0 at the warp because it's far
+    # from any track feature, but we zero them too for consistency and
+    # to avoid the dependency on warp-location numerics. r_terminal
+    # (including r_crash) is preserved — that's the signal we want on
+    # crash. r_omega / r_time / r_vel are independent of position and
+    # are also preserved.
+    crash_mask = terminated & ~finished
+    not_crash = ~crash_mask
+    r_prog = jnp.where(not_crash, r_prog, jnp.zeros_like(r_prog))
+    r_obs = jnp.where(not_crash, r_obs, jnp.zeros_like(r_obs))
+    r_gate_frame = jnp.where(not_crash, r_gate_frame, jnp.zeros_like(r_gate_frame))
+    r_guid = jnp.where(not_crash, r_guid, jnp.zeros_like(r_guid))
 
     components = {
         "r_prog": r_prog,

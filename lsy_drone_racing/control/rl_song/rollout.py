@@ -609,6 +609,7 @@ def scan_rollout(
             gate_just_passed,
             static_cfg.reward_cfg,
             true_gates_pos=stepped_data.gates_pos,
+            true_gates_quat=stepped_data.gates_quat,
             true_obstacles_pos=stepped_data.obstacles_pos,
         )
 
