@@ -289,7 +289,21 @@ class RewardConfig:
     # obstacles touching", so the per-step magnitude needs to scale to
     # the realistic worst case, not the cumulative bound.
     obstacle_weight: float = 0.8
-    obstacle_sigma: float = 0.3  # m
+    # v34: 0.3 -> 0.5. v33b eval traces showed the policy was effectively
+    # ignoring the obstacle channel: in 3/8 eval episodes the drone flew a
+    # near-straight path from spawn to gate 0 and hit obstacle 0 within
+    # 0.84 s of takeoff, even though obstacle 0 sat <0.11 m off the straight
+    # line in placed-pose. With sigma=0.3 the Gaussian barrier is below
+    # -0.05/step at d>=0.5 m, giving only ~0.4 s of felt gradient at 1.7 m/s
+    # cruise — too short to learn a detour against the continuous r_prog
+    # pull. sigma=0.5 keeps the same peak penalty (-0.8 at d=0) but extends
+    # the felt zone to ~1.0 m, giving ~0.6 s of advance signal so the
+    # policy has enough lead time to curve around. Side effect: 24% of
+    # gate-obstacle XY pairs are within 0.7 m, so passing through a
+    # near-obstacle gate now incurs ~-8 obstacle penalty over ~10 steps —
+    # still well under the +50 gate bonus, but actively biases the policy
+    # toward gate-passing lines that maximize lateral obstacle clearance.
+    obstacle_sigma: float = 0.5  # m
     # v32: Gate-frame soft barrier. Penalize proximity to gate frame
     # edges (4 line segments per gate, connecting the opening corners
     # from ``obs.GATE_HALF_SIZE_M``). The barrier extends ~sigma into
@@ -434,7 +448,15 @@ class RewardConfig:
     # but the v33 crash_penalty=50 still makes any crash strictly
     # worse than do-nothing, so policy escape from a hover attractor
     # remains via forward motion, not suicide.
-    time_penalty: float = 0.10
+    # v34: 0.10 -> 0.15. v33b eval traces show mean max-speed 2.2 m/s and
+    # ~6 s flight time on clean 4-gate laps; the policy is still cautious.
+    # The v33 jump from 0.05 to 0.10 widened the fast/slow lap differential
+    # to 30 reward; bumping to 0.15 widens it to 45, on the order of one
+    # gate bonus. Paired with sigma=0.5 obstacle widening to keep "fly
+    # fast through clean lines" net-positive — both terms push toward
+    # cleaner faster flight, not toward suicide (crash_penalty=100 still
+    # dominates a 500-step timeout's -75).
+    time_penalty: float = 0.15
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -656,6 +678,30 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
+    v34: obstacle-pricing fix on top of v33b (current SOTA, 7/32 finishes).
+    Eval traces of v33b on level 3 (``renders/plan-D1-smoke/``) showed
+    3/8 episodes crashing into obstacle 0 within 0.84 s of takeoff, on
+    near-straight spawn-to-gate-0 trajectories with the obstacle <0.11 m
+    off the line. Diagnosis: v33's r_obs Gaussian barrier (sigma=0.3) is
+    below -0.05/step at d>=0.5 m, so the policy gets <0.4 s of felt
+    gradient at cruise speed — not enough lead time to learn a detour
+    against the continuous r_prog pull. Two parameter changes warm-started
+    from v33b, everything else unchanged:
+
+    * ``obstacle_sigma`` **0.3 -> 0.5**. Same peak penalty at d=0, but the
+      felt zone extends to ~1.0 m. 24% of gate-obstacle XY pairs are
+      within 0.7 m on level 3, so passing a near-obstacle gate now pays
+      ~-8 obstacle penalty — still well under the +50 gate bonus, but
+      actively biases the policy toward gate-passing lines that maximize
+      lateral clearance.
+    * ``time_penalty`` **0.10 -> 0.15**. v33b's clean laps run ~6 s; the
+      0.10 budget widened the fast/slow gap to 30 reward, 0.15 widens it
+      further to 45 reward (~1 gate-bonus differential).
+
+    All other v33 parameters retained: ``crash_penalty=100``,
+    ``obstacle_weight=0.8``, ``gate_frame_weight=1.2``,
+    ``omega_coef=0.003``, ``exit_vel_coef=10.0``, Phase 2 mix.
+
     v33: obs/reward-economics overhaul on top of v32a (first lap-finishing
     controller). Same Phase 2 mix and same cold-train discipline as v32a,
     but with eight changes prompted by the post-v32a codex+Claude review:
@@ -799,7 +845,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v33_obs_reward_econ",
+                name="level3_v34_obstacle_pricing",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
