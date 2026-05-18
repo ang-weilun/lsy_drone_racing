@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 import fire
 import gymnasium
@@ -50,6 +50,8 @@ DEFAULT_RECORD_FPS = 50  # matches the 50 Hz env step → real-time playback
 DEFAULT_RECORD_WIDTH = 1280
 DEFAULT_RECORD_HEIGHT = 720
 DEFAULT_CONTROLLER = "rl_song/controller.py"
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Per-gate colours applied to the frame, ropes, and stand geoms by
 # :func:`_color_code_gates` so that gate 0 ... gate N-1 are visually distinct
@@ -90,7 +92,7 @@ class _TraceWriter:
         self.dump_dir = dump_dir
         self.dump_dir.mkdir(parents=True, exist_ok=True)
         self._header_common = header_common
-        self._fh: Any = None
+        self._fh: TextIO | None = None
         self._episode_idx = -1
 
     def open_episode(self, episode_idx: int, episode_header: dict[str, Any]) -> None:
@@ -125,7 +127,7 @@ def _get_git_sha() -> str | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parents[3],
+            cwd=_REPO_ROOT,
             capture_output=True,
             text=True,
             check=True,
@@ -196,8 +198,7 @@ def simulate(
         One entry per episode: flight time if the drone finished, ``None``
         otherwise.
     """
-    repo_root = Path(__file__).resolve().parents[3]
-    cfg = load_config(repo_root / "config" / config)
+    cfg = load_config(_REPO_ROOT / "config" / config)
     if render is None:
         render = cfg.sim.render
     if record is not None:
@@ -213,7 +214,7 @@ def simulate(
     # ``cfg.controller.file`` (which is ``state_controller.py`` in the stock
     # config TOMLs and would silently produce 13-d state-mode actions against
     # an attitude-mode env).
-    control_path = repo_root / "lsy_drone_racing" / "control"
+    control_path = _REPO_ROOT / "lsy_drone_racing" / "control"
     controller_rel = controller or DEFAULT_CONTROLLER
     controller_cls = load_controller(control_path / controller_rel)
 
@@ -234,7 +235,7 @@ def simulate(
     if dump_trace is not None:
         dump_dir = Path(dump_trace)
         if not dump_dir.is_absolute():
-            dump_dir = Path(__file__).resolve().parents[3] / dump_dir
+            dump_dir = _REPO_ROOT / dump_dir
         trace_writer = _TraceWriter(
             dump_dir=dump_dir,
             header_common={
@@ -302,37 +303,40 @@ def _run_episode(
         trace_writer.open_episode(
             episode_idx, {"spawn_pos": obs["pos"].tolist(), "spawn_quat": obs["quat"].tolist()}
         )
-    controller: Controller = controller_cls(obs, info, cfg)
-    fps_live_view = 60  # Hz cadence for the live MuJoCo viewer
-    i = 0
-    curr_time = 0.0
+    try:
+        controller: Controller = controller_cls(obs, info, cfg)
+        fps_live_view = 60  # Hz cadence for the live MuJoCo viewer
+        i = 0
+        curr_time = 0.0
 
-    while True:
-        curr_time = i / cfg.env.freq
-        action = controller.compute_control(obs, info)
-        obs, reward, terminated, truncated, info = env.step(action)
-        controller_finished = controller.step_callback(
-            action, obs, reward, terminated, truncated, info
-        )
+        while True:
+            curr_time = i / cfg.env.freq
+            action = controller.compute_control(obs, info)
+            obs, reward, terminated, truncated, info = env.step(action)
+            controller_finished = controller.step_callback(
+                action, obs, reward, terminated, truncated, info
+            )
 
-        if video_writer is not None:
-            frame = _grab_offscreen_frame(env, camera, width, height)
-            if frame is not None:
-                video_writer.append_data(frame)
-        elif cfg.sim.render:
-            if ((i * fps_live_view) % cfg.env.freq) < fps_live_view:
-                controller.render_callback(env.unwrapped.sim)
-                env.render()
+            if video_writer is not None:
+                frame = _grab_offscreen_frame(env, camera, width, height)
+                if frame is not None:
+                    video_writer.append_data(frame)
+            elif cfg.sim.render:
+                if ((i * fps_live_view) % cfg.env.freq) < fps_live_view:
+                    controller.render_callback(env.unwrapped.sim)
+                    env.render()
 
-        if terminated or truncated or controller_finished:
-            break
-        i += 1
+            if terminated or truncated or controller_finished:
+                break
+            i += 1
 
-    controller.episode_callback()
-    _log_episode_stats(obs, cfg, curr_time)
-    controller.episode_reset()
-    if trace_writer is not None:
-        trace_writer.close_episode()
+        controller.episode_callback()
+        _log_episode_stats(obs, cfg, curr_time)
+        controller.episode_reset()
+    finally:
+        if trace_writer is not None:
+            trace_writer.close_episode()
+
     return curr_time if obs["target_gate"] == -1 else None
 
 
