@@ -62,6 +62,56 @@ def load_run_meta(trace_dir: Path) -> dict[str, Any]:
     return json.loads((trace_dir / "run_meta.json").read_text(encoding="utf-8"))
 
 
+def detect_outcome(ep: Episode) -> dict[str, Any]:
+    """Compute outcome block: gates_passed, finished, terminal_cause.
+
+    Parameters
+    ----------
+    ep : Episode
+        Loaded episode with header and per-step rows.
+
+    Returns
+    -------
+    dict
+        Keys: ``gates_passed`` (int), ``finished`` (bool),
+        ``ep_len_steps`` (int), ``flight_time_s`` (float),
+        ``terminal_cause`` (str).
+
+    Notes
+    -----
+    Finish detection uses ``target_gate`` transitioning to ``-1`` rather
+    than ``terminated`` -- eval_sim breaks on finish before the env's
+    sparse-reward path sets ``terminated``. ``terminal_cause`` resolves
+    to ``"finished"``, ``"truncated"``, or a ``"collision:unknown"``
+    placeholder; C6 patches the collision label in.
+    """
+    n_gates = ep.header["n_gates"]
+    rows = ep.rows
+    last = rows[-1]
+    target_gates = [r["target_gate"] for r in rows]
+
+    finished = any(t == -1 for t in target_gates)
+    if finished:
+        gates_passed = n_gates
+    else:
+        gates_passed = max(t for t in target_gates if t >= 0) if target_gates else 0
+
+    if finished:
+        terminal_cause = "finished"
+    elif last["truncated"]:
+        terminal_cause = "truncated"
+    else:
+        terminal_cause = "collision:unknown"  # C6 patches the label
+
+    return {
+        "gates_passed": int(gates_passed),
+        "finished": bool(finished),
+        "ep_len_steps": len(rows),
+        "flight_time_s": float(rows[-1]["t"]),
+        "terminal_cause": terminal_cause,
+    }
+
+
 def analyze(trace_dir: str) -> None:
     """Analyze a trace directory and emit summary JSONs.
 
