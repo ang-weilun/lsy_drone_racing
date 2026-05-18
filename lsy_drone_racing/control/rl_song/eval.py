@@ -57,17 +57,9 @@ def evaluate(args: EvalArgs) -> dict[str, float]:
     checkpoint = _restore_checkpoint(_resolve_checkpoint_path(args.checkpoint))
     actor_params = checkpoint["actor_params"]
     normalizer = _normalizer_from_checkpoint(checkpoint["normalizer"])
-    train_cfg = replace(
-        TrainConfig(),
-        seed=args.seed,
-        initial_stage_index=args.stage - 1,
-    )
+    train_cfg = replace(TrainConfig(), seed=args.seed, initial_stage_index=args.stage - 1)
     env = RLSongVecEnv(
-        train_cfg,
-        n_envs=N_EVAL_ENVS,
-        stage_idx=args.stage - 1,
-        seed=args.seed,
-        device="gpu",
+        train_cfg, n_envs=N_EVAL_ENVS, stage_idx=args.stage - 1, seed=args.seed, device="gpu"
     )
     env.set_normalizer(normalizer)
     obs, _ = env.reset(seed=args.seed)
@@ -83,13 +75,10 @@ def evaluate(args: EvalArgs) -> dict[str, float]:
         episode_return += float(np.asarray(reward[0]))
         episode_length += 1
         target_gate_reached = max(
-            target_gate_reached,
-            float(np.asarray(info["target_gate_progress"][0])),
+            target_gate_reached, float(np.asarray(info["target_gate_progress"][0]))
         )
         for key, value in info["reward_components"].items():
-            component_sums[key] = component_sums.get(key, 0.0) + float(
-                np.asarray(value[0])
-            )
+            component_sums[key] = component_sums.get(key, 0.0) + float(np.asarray(value[0]))
         if not args.no_render:
             env.render()
         if bool(np.asarray((terminated | truncated)[0])):
@@ -168,11 +157,7 @@ def _restore_checkpoint(path: Path) -> dict[str, Any]:
 
 def _normalizer_from_checkpoint(data: dict[str, Array]) -> NormalizerState:
     """Restore a frozen observation normalizer from checkpoint data."""
-    return NormalizerState(
-        mean=data["mean"],
-        var=data["var"],
-        count=data["count"],
-    )
+    return NormalizerState(mean=data["mean"], var=data["var"], count=data["count"])
 
 
 if __name__ == "__main__":

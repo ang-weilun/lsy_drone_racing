@@ -16,8 +16,8 @@ from jax import Array
 from lsy_drone_racing.control.rl_song.config import (
     ACTOR_OBS_DIM,
     ENV_ACTION_DIM,
-    PPOConfig,
     RAW_ACTION_DIM,
+    PPOConfig,
 )
 
 HIDDEN_SIZE: int = 256
@@ -56,16 +56,10 @@ class Actor(nn.Module):
         """
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
-            x = nn.Dense(
-                HIDDEN_SIZE,
-                kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)),
-            )(x)
+            x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
             x = nn.tanh(x)
 
-        thrust_mean = nn.Dense(
-            THRUST_RAW_DIM,
-            kernel_init=nn.initializers.orthogonal(0.01),
-        )(x)
+        thrust_mean = nn.Dense(THRUST_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
         rotation_mean = nn.Dense(
             ROTATION_RAW_DIM,
             kernel_init=nn.initializers.orthogonal(0.01),
@@ -74,14 +68,10 @@ class Actor(nn.Module):
         mu_raw = jnp.concatenate([thrust_mean, rotation_mean], axis=-1)
 
         thrust_log_std = self.param(
-            "log_std_thrust",
-            nn.initializers.constant(self.init_log_std),
-            (THRUST_RAW_DIM,),
+            "log_std_thrust", nn.initializers.constant(self.init_log_std), (THRUST_RAW_DIM,)
         )
         rotation_log_std = self.param(
-            "log_std_rotation",
-            nn.initializers.constant(self.init_log_std),
-            (ROTATION_RAW_DIM,),
+            "log_std_rotation", nn.initializers.constant(self.init_log_std), (ROTATION_RAW_DIM,)
         )
         log_std_raw = jnp.concatenate([thrust_log_std, rotation_log_std], axis=-1)
         return mu_raw, jnp.broadcast_to(log_std_raw, mu_raw.shape)
@@ -106,18 +96,13 @@ class Critic(nn.Module):
         """
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
-            x = nn.Dense(
-                HIDDEN_SIZE,
-                kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)),
-            )(x)
+            x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
             x = nn.tanh(x)
         value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
         return jnp.squeeze(value, axis=-1)
 
 
-def sample_and_log_prob(
-    actor_params: dict, obs: Array, key: jax.Array
-) -> tuple[Array, Array]:
+def sample_and_log_prob(actor_params: dict, obs: Array, key: jax.Array) -> tuple[Array, Array]:
     """Sample a raw action and return its raw-space log probability.
 
     Parameters
@@ -138,17 +123,13 @@ def sample_and_log_prob(
         ``Normal(mu_raw, sigma_raw).log_prob(raw_action).sum(-1)``.
     """
     mu_raw, log_std_raw = Actor().apply({"params": actor_params}, obs)
-    raw_action = mu_raw + jnp.exp(log_std_raw) * jax.random.normal(
-        key, shape=mu_raw.shape
-    )
+    raw_action = mu_raw + jnp.exp(log_std_raw) * jax.random.normal(key, shape=mu_raw.shape)
     _validate_last_dim(raw_action, RAW_ACTION_DIM, "raw_action")
     log_prob = _normal_log_prob(mu_raw, log_std_raw, raw_action)
     return raw_action, log_prob
 
 
-def log_prob_of(
-    actor_params: dict, obs: Array, raw_action: Array
-) -> tuple[Array, Array]:
+def log_prob_of(actor_params: dict, obs: Array, raw_action: Array) -> tuple[Array, Array]:
     """Return log probability and entropy for a provided raw action.
 
     Parameters
@@ -194,9 +175,7 @@ def deterministic_raw_action(actor_params: dict, obs: Array) -> Array:
     return mu_raw
 
 
-def raw_to_env_action(
-    raw_action: Array, thrust_min: float, thrust_max: float
-) -> Array:
+def raw_to_env_action(raw_action: Array, thrust_min: float, thrust_max: float) -> Array:
     """Project a raw 7-vector to the env's attitude command.
 
     Parameters
@@ -229,9 +208,7 @@ def raw_to_env_action(
 
     r1 = a1 / (jnp.linalg.norm(a1, axis=-1, keepdims=True) + ROTATION_NORM_EPS)
     r2_unscaled = a2 - jnp.sum(r1 * a2, axis=-1, keepdims=True) * r1
-    r2 = r2_unscaled / (
-        jnp.linalg.norm(r2_unscaled, axis=-1, keepdims=True) + ROTATION_NORM_EPS
-    )
+    r2 = r2_unscaled / (jnp.linalg.norm(r2_unscaled, axis=-1, keepdims=True) + ROTATION_NORM_EPS)
     r3 = jnp.cross(r1, r2, axis=-1)
     rotation_matrix = jnp.stack([r1, r2, r3], axis=-1)
     euler_xyz = _matrix_to_euler_xyz(rotation_matrix)
@@ -286,9 +263,7 @@ def _matrix_to_euler_xyz(rotation_matrix: Array) -> Array:
     gamma = jnp.arctan2(rotation_matrix[..., 1, 0], rotation_matrix[..., 0, 0])
     gimbal_lock = cos_beta < GIMBAL_LOCK_EPS
     alpha = jnp.where(gimbal_lock, jnp.zeros_like(alpha), alpha)
-    gamma_locked = jnp.arctan2(
-        -rotation_matrix[..., 0, 1], rotation_matrix[..., 1, 1]
-    )
+    gamma_locked = jnp.arctan2(-rotation_matrix[..., 0, 1], rotation_matrix[..., 1, 1])
     gamma = jnp.where(gimbal_lock, gamma_locked, gamma)
     return jnp.stack([alpha, beta, gamma], axis=-1)
 
@@ -296,9 +271,7 @@ def _matrix_to_euler_xyz(rotation_matrix: Array) -> Array:
 def _validate_last_dim(array: Array, expected_dim: int, name: str) -> None:
     """Raise if an array's trailing dimension violates a static contract."""
     if array.shape[-1] != expected_dim:
-        raise ValueError(
-            f"{name} trailing dimension must be {expected_dim}; got {array.shape[-1]}"
-        )
+        raise ValueError(f"{name} trailing dimension must be {expected_dim}; got {array.shape[-1]}")
 
 
 _validate_last_dim(jnp.zeros((ACTOR_OBS_DIM,), dtype=jnp.float32), ACTOR_OBS_DIM, "obs")

@@ -208,10 +208,9 @@ def train(args: CLIArgs) -> None:
     # classification noise washes out within one episode length.
     source = jnp.zeros((ppo_cfg.n_envs,), dtype=jnp.int8)
     # Phase 2 successful-state buffer. Allocated empty and populated by
-    # successful gate-pass events during rollouts (B2 — not yet wired);
-    # sampled at reset for re-spawn (B3 — not yet wired). Capacity and
-    # n_obstacles come from the current stage / env so per-stage shape
-    # is fixed at construction.
+    # successful gate-pass events during rollouts; sampled at reset for
+    # re-spawn. Capacity and n_obstacles come from the current stage /
+    # env so per-stage shape is fixed at construction.
     phase2_buffer = _build_phase2_buffer(env, env.stage)
     target_gate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
     crash_rate_history: deque[float] = deque(maxlen=train_cfg.curriculum.promotion_window_rollouts)
@@ -415,10 +414,6 @@ def _collect_rollout(
         raise RuntimeError("Cannot collect a rollout before env construction.")
 
     static_cfg = _rollout_static_config(env, ppo_cfg, global_step)
-    # Track-perturbation placement buffers. Wrapper guarantees they're
-    # initialized after ``env.reset()`` even for non-level-3 stages; for
-    # those stages ``track_perturbation_enabled=False`` so the scan ignores
-    # them and they round-trip unchanged.
     scan_result = scan_rollout(
         env.env.data,
         actor_state.params,
@@ -431,9 +426,6 @@ def _collect_rollout(
         episode_returns,
         episode_lengths,
         source,
-        env.placed_gates_pos,
-        env.placed_gates_quat,
-        env.placed_obstacles_pos,
         phase2_buffer,
         env.env._step,
         env.env._reset,
@@ -445,9 +437,6 @@ def _collect_rollout(
     env.rng_key = scan_result.reset_rng_key
     env.current_env_obs = scan_result.next_env_obs
     env.prev_env_obs = scan_result.next_env_obs
-    env.placed_gates_pos = scan_result.placed_gates_pos
-    env.placed_gates_quat = scan_result.placed_gates_quat
-    env.placed_obstacles_pos = scan_result.placed_obstacles_pos
     metrics = _rollout_metrics(scan_result.outputs, scan_result.metrics)
     # Surface per-gate buffer fill for wandb. Slot 0 is unused; we still
     # log it (it stays at 0) so the histogram axis labels are consistent.
@@ -503,7 +492,6 @@ def _rollout_static_config(
     exactly one JIT re-trace.
     """
     thrust_min, thrust_max = env.get_thrust_bounds()
-    gate_pos_max, obstacle_pos_max = env.track_perturbation_bounds(env.stage)
     phase2_prob = env.stage.phase2_prob if global_step >= env.stage.phase2_warmup_steps else 0.0
     return RolloutStaticConfig(
         n_steps=ppo_cfg.n_steps,
@@ -515,9 +503,6 @@ def _rollout_static_config(
         reset_pos_perturb_m=env.stage.reset_pos_perturb_m,
         reset_vel_perturb_mps=env.stage.reset_vel_perturb_mps,
         reset_yaw_perturb_rad=env.stage.reset_yaw_perturb_rad,
-        track_perturbation_enabled=(env.stage.level in (2, 3)),
-        gate_pos_perturb_max=gate_pos_max,
-        obstacle_pos_perturb_max=obstacle_pos_max,
         segment_init_prob=env.stage.segment_init_prob,
         segment_init_perturb_m=env.stage.segment_init_perturb_m,
         segment_init_vel_mps=env.stage.segment_init_vel_mps,

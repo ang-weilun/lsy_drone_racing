@@ -15,14 +15,9 @@ from jax import Array
 
 from lsy_drone_racing.control.controller import Controller
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
-from lsy_drone_racing.control.rl_song.config import (
-    ENV_ACTION_DIM,
-)
+from lsy_drone_racing.control.rl_song.config import ENV_ACTION_DIM
 from lsy_drone_racing.control.rl_song.obs import NormalizerState
-from lsy_drone_racing.control.rl_song.policy import (
-    deterministic_raw_action,
-    raw_to_env_action,
-)
+from lsy_drone_racing.control.rl_song.policy import deterministic_raw_action, raw_to_env_action
 
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 CHECKPOINT_PREFIX: str = "step_"
@@ -32,12 +27,7 @@ TOTAL_THRUST_MULTIPLIER: float = 4.0
 class RLSongController(Controller):
     """Deterministic RL Song controller for simulated deployment."""
 
-    def __init__(
-        self,
-        obs: dict[str, npt.NDArray[np.floating]],
-        info: dict,
-        config: dict,
-    ):
+    def __init__(self, obs: dict[str, npt.NDArray[np.floating]], info: dict, config: dict):
         """Initialize the controller from an Orbax checkpoint.
 
         Parameters
@@ -85,9 +75,7 @@ class RLSongController(Controller):
         return False
 
     def compute_control(
-        self,
-        obs: dict[str, npt.NDArray[np.floating]],
-        info: dict | None = None,
+        self, obs: dict[str, npt.NDArray[np.floating]], info: dict | None = None
     ) -> npt.NDArray[np.floating]:
         """Compute the next attitude command.
 
@@ -105,25 +93,17 @@ class RLSongController(Controller):
         """
         _ = info
         actor_obs = obs_encoding.build_actor_obs(
-            _to_jax_obs(obs),
-            self.prev_action_env_4vec,
-            self.normalizer,
+            _to_jax_obs(obs), self.prev_action_env_4vec, self.normalizer
         )
         env_action = self._deterministic_inference(
-            self.actor_params,
-            actor_obs,
-            self.thrust_min,
-            self.thrust_max,
+            self.actor_params, actor_obs, self.thrust_min, self.thrust_max
         )
         self.prev_action_env_4vec = env_action
         return np.asarray(env_action, dtype=np.float32)
 
 
 def _deterministic_env_action(
-    actor_params: dict[str, Any],
-    actor_obs: Array,
-    thrust_min: float,
-    thrust_max: float,
+    actor_params: dict[str, Any], actor_obs: Array, thrust_min: float, thrust_max: float
 ) -> Array:
     """Run deterministic actor inference and raw-to-env projection."""
     raw_action = deterministic_raw_action(actor_params, actor_obs)
@@ -199,15 +179,9 @@ def _restore_checkpoint(path: Path) -> dict[str, Any]:
     restore_args = jax.tree_util.tree_map(
         lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), item_metadata
     )
-    return checkpointer.restore(
-        path, args=ocp.args.PyTreeRestore(restore_args=restore_args)
-    )
+    return checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
 
 
 def _normalizer_from_checkpoint(data: dict[str, Array]) -> NormalizerState:
     """Restore a frozen observation normalizer from checkpoint data."""
-    return NormalizerState(
-        mean=data["mean"],
-        var=data["var"],
-        count=data["count"],
-    )
+    return NormalizerState(mean=data["mean"], var=data["var"], count=data["count"])

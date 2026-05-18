@@ -150,9 +150,6 @@ def step_reward(
     true_gates_pos: Array | None = None,
     true_gates_quat: Array | None = None,
     true_obstacles_pos: Array | None = None,
-    placed_gates_pos: Array | None = None,
-    placed_gates_quat: Array | None = None,
-    placed_obstacles_pos: Array | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute one vectorized Song-style reward step.
 
@@ -185,15 +182,6 @@ def step_reward(
     true_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
         Unmasked obstacle positions. If omitted, ``env_obs["obstacles_pos"]``
         is used.
-    placed_gates_pos : Array, shape (n_envs, n_gates, 3), optional
-    placed_gates_quat : Array, shape (n_envs, n_gates, 4), optional
-    placed_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
-        v33 — Layer-1 placed poses (pre-wobble) used by the actor obs
-        for unvisited objects. ``r_obs`` and ``r_gate_frame`` blend
-        these with ``true_*`` via the per-object visited masks so the
-        actor is only graded on safety against poses it can actually
-        observe. When omitted, the function falls back to ``true_*``
-        unconditionally (v32a behaviour).
 
     Returns
     -------
@@ -203,36 +191,22 @@ def step_reward(
         Per-component rewards with keys ``r_prog``, ``r_omega``, ``r_obs``,
         ``r_gate_bonus``, ``r_exit_vel``, ``r_terminal``, ``r_time``,
         ``r_vel``, and ``r_guid``. Every value has shape ``(n_envs,)``.
+
+    Notes
+    -----
+    ``r_obs`` and ``r_gate_frame`` use the already-masked ``env_obs``
+    fields (post upstream PR #91, ``race_core.obs`` masks gate and
+    obstacle positions between the wobbled physics state and the
+    Layer-1 nominal snapshot via the visited flags), so the actor is
+    graded against the same poses it observes.
     """
-    _ = truncated
+    _ = truncated, true_obstacles_pos
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
     gates_quat = env_obs["gates_quat"] if true_gates_quat is None else true_gates_quat
-    obstacles_pos = env_obs["obstacles_pos"] if true_obstacles_pos is None else true_obstacles_pos
 
-    # v33: assemble the actor-visible safety poses by blending true (for
-    # visited objects, where the actor obs gets the true sensor read) with
-    # the placed (Layer-1) snapshot (for unvisited objects, where the
-    # actor obs sees the placed value). ``r_obs`` and ``r_gate_frame`` are
-    # then computed against these so the per-step avoidance gradient maps
-    # to features the policy can actually observe. Falls back to
-    # ``true_*`` when the placed snapshot wasn't passed, preserving v32a
-    # behaviour for callers that haven't been updated yet.
-    gates_visited_bool = env_obs["gates_visited"].astype(jnp.bool_)
-    obstacles_visited_bool = env_obs["obstacles_visited"].astype(jnp.bool_)
-    if placed_gates_pos is not None:
-        safety_gates_pos = jnp.where(gates_visited_bool[..., None], gates_pos, placed_gates_pos)
-    else:
-        safety_gates_pos = gates_pos
-    if placed_gates_quat is not None:
-        safety_gates_quat = jnp.where(gates_visited_bool[..., None], gates_quat, placed_gates_quat)
-    else:
-        safety_gates_quat = gates_quat
-    if placed_obstacles_pos is not None:
-        safety_obstacles_pos = jnp.where(
-            obstacles_visited_bool[..., None], obstacles_pos, placed_obstacles_pos
-        )
-    else:
-        safety_obstacles_pos = obstacles_pos
+    safety_gates_pos = env_obs["gates_pos"]
+    safety_gates_quat = env_obs["gates_quat"]
+    safety_obstacles_pos = env_obs["obstacles_pos"]
 
     prev_target = prev_env_obs["target_gate"]
     current_target = env_obs["target_gate"]

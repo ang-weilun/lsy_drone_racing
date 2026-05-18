@@ -592,14 +592,15 @@ class CurriculumStage:
     promote_target_gate_mean: float
     promote_crash_rate_max: float = float("inf")
     # v8: scales the gate_pos, gate_rpy, and obstacle_pos randomization ranges
-    # loaded from ``config/levelN.toml`` (and selected via
-    # ``TRACK_RANDOMIZATION_KEYS`` in the env wrapper). A value of 1.0 uses the
-    # full level-3 randomization budget (±0.15 m on gate_pos and obstacle_pos).
-    # Smaller values produce an easier near-fixed-track regime so the policy
-    # can first learn approach-to-nominal before adapting to noise; values
-    # below 1.0 are intended for the ``stage3a/b/c`` warm-up sub-stages. Has
-    # no effect on stages with ``level != 3`` (level 1 has no gate/obstacle
-    # randomization to scale).
+    # loaded from ``config/levelN.toml`` and forwarded to the framework via
+    # :meth:`RLSongVecEnv._stage_randomizations`. A value of 1.0 uses the
+    # full level-3 randomization budget (±0.15 m on gate_pos / obstacle_pos
+    # and ±0.05 / ±0.1 / ±0.2 rad on gate_rpy). Smaller values produce an
+    # easier near-fixed-track regime so the policy can first learn
+    # approach-to-nominal before adapting to noise; values below 1.0 are
+    # intended for the ``stage3a/b/c`` warm-up sub-stages. Has no effect on
+    # stages with ``level != 3`` (level 1 has no gate/obstacle randomization
+    # to scale).
     gate_rand_scale: float = 1.0
     # v9 (Song 2023 §III-B Phase 1): probability that an env is re-spawned
     # at the midpoint of a random path segment (hovering, vel=0, identity

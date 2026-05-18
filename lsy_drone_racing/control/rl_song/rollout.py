@@ -14,7 +14,8 @@ from lsy_drone_racing.control.rl_song import obs as obs_encoding
 from lsy_drone_racing.control.rl_song.config import ENV_ACTION_DIM, RewardConfig
 from lsy_drone_racing.control.rl_song.policy import Critic, raw_to_env_action, sample_and_log_prob
 from lsy_drone_racing.control.rl_song.reward import step_reward
-from lsy_drone_racing.envs.race_core import EnvData, _reset_env_data, obs as race_core_obs
+from lsy_drone_racing.envs.race_core import EnvData, _reset_env_data
+from lsy_drone_racing.envs.race_core import obs as race_core_obs
 
 SINGLE_DRONE_INDEX: int = 0
 RESET_RNG_SPLITS: int = 4
@@ -25,58 +26,6 @@ YAW_TO_HALF_ANGLE: float = 0.5  # quaternion half-angle factor
 SRC_TRUE_START: int = 0
 SRC_PHASE1_SEG: int = 1
 SRC_PHASE2_REPLAY: int = 2
-
-
-def _patch_env_obs_with_placed(
-    env_obs: dict[str, Array],
-    placed_gates_pos: Array,
-    placed_gates_quat: Array,
-    placed_obstacles_pos: Array,
-    track_perturbation_enabled: bool,
-) -> dict[str, Array]:
-    """Replace toml-nominal pose entries with the per-env Layer-1 placement.
-
-    The framework's ``race_core.obs`` masks ``gates_pos`` / ``gates_quat`` /
-    ``obstacles_pos`` between ``data.<field>`` (visited) and
-    ``data.nominal_<field>`` (not visited). On level-3 with
-    ``track.randomize=true`` the nominal fields stay at the toml's
-    ``(0, 0, z)`` placeholders, so the un-visited branch leaks dead info
-    instead of the actual placement. This helper rebuilds the masking using
-    the per-env ``placed_*`` snapshots (Layer-1 placement, pre-wobble) for
-    the un-visited branch.
-
-    No-op when ``track_perturbation_enabled`` is False (level 1 / 2 still
-    have informative nominal fields from the toml).
-
-    Parameters
-    ----------
-    env_obs : dict[str, Array]
-        Single-drone env observation from ``race_core.obs`` after
-        ``_single_drone_obs``. Mutated in-place is *not* required; a fresh
-        dict is returned.
-    placed_gates_pos : Array, shape (n_envs, n_gates, 3)
-    placed_gates_quat : Array, shape (n_envs, n_gates, 4)
-    placed_obstacles_pos : Array, shape (n_envs, n_obstacles, 3)
-    track_perturbation_enabled : bool
-        Static flag set by the wrapper. When False, returns ``env_obs``
-        unchanged.
-
-    Returns
-    -------
-    dict[str, Array]
-        Patched env observation. ``env_obs`` is not mutated.
-    """
-    if not track_perturbation_enabled:
-        return env_obs
-    patched = dict(env_obs)
-    gates_visited = env_obs["gates_visited"].astype(jnp.bool_)[..., None]
-    patched["gates_pos"] = jnp.where(gates_visited, env_obs["gates_pos"], placed_gates_pos)
-    patched["gates_quat"] = jnp.where(gates_visited, env_obs["gates_quat"], placed_gates_quat)
-    obstacles_visited = env_obs["obstacles_visited"].astype(jnp.bool_)[..., None]
-    patched["obstacles_pos"] = jnp.where(
-        obstacles_visited, env_obs["obstacles_pos"], placed_obstacles_pos
-    )
-    return patched
 
 
 EnvStepFn = Callable[
@@ -122,14 +71,6 @@ class RolloutStaticConfig:
     reset_pos_perturb_m: float = 0.0
     reset_vel_perturb_mps: float = 0.0
     reset_yaw_perturb_rad: float = 0.0
-    # Level-3 track perturbation. When enabled, each reset snaps
-    # ``nominal_*`` fields to the just-placed layout (so the controller's
-    # pre-visit observation matches placement) and then adds per-axis
-    # uniform wobble to the post-randomization ``gates_pos`` / ``obstacles_pos``
-    # within the half-widths below. See ``env_wrapper.track_perturbation_bounds``.
-    track_perturbation_enabled: bool = False
-    gate_pos_perturb_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    obstacle_pos_perturb_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # v9 (Song 2023 §III-B Phase 1) segment initialization. With probability
     # ``segment_init_prob``, an env that just reset is re-spawned hovering
     # at the midpoint of a uniformly-random path segment with target_gate
@@ -218,13 +159,14 @@ class Phase2Buffer(NamedTuple):
 #   [10:13]                ang_vel (body frame)
 #   [13:17]                prev_action (env-action 4-vec)
 #   [17 : 17+n_o]          obstacles_visited (bool stored as float)
-#   gates_pos        (Layer-2 post-wobble),  3 * n_g floats
-#   gates_quat       (no wobble; shared),    4 * n_g floats
-#   obstacles_pos    (Layer-2 post-wobble),  3 * n_o floats
-#   placed_gates_pos (Layer-1 pre-wobble),   3 * n_g floats
-#   placed_obstacles_pos (Layer-1),          3 * n_o floats
+#   gates_pos             (Layer-2 post-wobble),  3 * n_g floats
+#   gates_quat            (Layer-2 post-wobble),  4 * n_g floats
+#   obstacles_pos         (Layer-2 post-wobble),  3 * n_o floats
+#   nominal_gates_pos     (Layer-1 pre-wobble),   3 * n_g floats
+#   nominal_gates_quat    (Layer-1 pre-wobble),   4 * n_g floats
+#   nominal_obstacles_pos (Layer-1 pre-wobble),   3 * n_o floats
 #
-# Total = PHASE2_DRONE_DIM + 7 * n_obstacles + 10 * n_gates.
+# Total = PHASE2_DRONE_DIM + 7 * n_obstacles + 14 * n_gates.
 PHASE2_DRONE_DIM: int = 3 + 3 + 4 + 3 + 4  # pos, vel, quat, ang_vel, prev_action = 17
 
 
@@ -234,10 +176,11 @@ def phase2_state_dim(n_obstacles: int, n_gates: int) -> int:
         PHASE2_DRONE_DIM
         + n_obstacles  # obstacles_visited
         + 3 * n_gates  # gates_pos (Layer-2)
-        + 4 * n_gates  # gates_quat (no wobble; shared with placed)
+        + 4 * n_gates  # gates_quat (Layer-2)
         + 3 * n_obstacles  # obstacles_pos (Layer-2)
-        + 3 * n_gates  # placed_gates_pos (Layer-1)
-        + 3 * n_obstacles  # placed_obstacles_pos (Layer-1)
+        + 3 * n_gates  # nominal_gates_pos (Layer-1)
+        + 4 * n_gates  # nominal_gates_quat (Layer-1)
+        + 3 * n_obstacles  # nominal_obstacles_pos (Layer-1)
     )
 
 
@@ -253,9 +196,11 @@ def _phase2_offsets(n_obstacles: int, n_gates: int) -> dict[str, int]:
     cursor += 4 * n_gates
     offs["obstacles_pos"] = cursor
     cursor += 3 * n_obstacles
-    offs["placed_gates_pos"] = cursor
+    offs["nominal_gates_pos"] = cursor
     cursor += 3 * n_gates
-    offs["placed_obstacles_pos"] = cursor
+    offs["nominal_gates_quat"] = cursor
+    cursor += 4 * n_gates
+    offs["nominal_obstacles_pos"] = cursor
     cursor += 3 * n_obstacles
     offs["_end"] = cursor
     return offs
@@ -392,12 +337,6 @@ class RolloutScanResult(NamedTuple):
     next_obs: dict[str, Array]
     outputs: RolloutScanOutputs
     metrics: RolloutMetricSums
-    # Per-env Layer-1 placement (pre-wobble) after the rollout's resets.
-    # Plumbed back into the wrapper so the next rollout starts with
-    # ``placed_*`` consistent with the env data carried forward.
-    placed_gates_pos: Array
-    placed_gates_quat: Array
-    placed_obstacles_pos: Array
 
 
 class _ScanCarry(NamedTuple):
@@ -430,13 +369,6 @@ class _ScanCarry(NamedTuple):
     phase1_seg_finished_count: Array
     phase2_replay_completed_count: Array
     phase2_replay_finished_count: Array
-    # Per-env Layer-1 placement (pre-wobble), used to patch ``env_obs`` for
-    # non-visited gates / obstacles so the actor sees the placement instead
-    # of the framework's broken ``(0, 0, z)`` toml nominal. See
-    # ``_apply_reset_perturbation``.
-    placed_gates_pos: Array
-    placed_gates_quat: Array
-    placed_obstacles_pos: Array
     # Phase 2 successful-state buffer. Read by the reset path to sample
     # replay states; written once after the scan (in ``scan_rollout``,
     # not inside the scan body) using a masked-scatter pattern. Carrying
@@ -459,9 +391,6 @@ def scan_rollout(
     episode_returns: Array,
     episode_lengths: Array,
     source: Array,
-    placed_gates_pos: Array,
-    placed_gates_quat: Array,
-    placed_obstacles_pos: Array,
     phase2_buffer: Phase2Buffer,
     env_step_fn: EnvStepFn,
     env_reset_fn: EnvResetFn,
@@ -495,9 +424,8 @@ def scan_rollout(
         biasing every per-source ``finish_rate_*`` metric.
     phase2_buffer : Phase2Buffer
         Per-gate stratified buffer of past successful gate-pass states.
-        Read by the in-scan reset path for Phase 2 replay (B3 — not yet
-        wired) and written once after the scan (B2 — not yet wired).
-        Threaded through unchanged by the B1 plumbing.
+        Read by the in-scan reset path for Phase 2 replay and written
+        once after the scan via :func:`_apply_phase2_writes`.
     env_step_fn : callable
         JIT-compatible ``RaceCoreEnv._step`` function.
     env_reset_fn : callable
@@ -554,20 +482,11 @@ def scan_rollout(
         phase1_seg_finished_count=zero_scalar,
         phase2_replay_completed_count=zero_scalar,
         phase2_replay_finished_count=zero_scalar,
-        placed_gates_pos=placed_gates_pos,
-        placed_gates_quat=placed_gates_quat,
-        placed_obstacles_pos=placed_obstacles_pos,
         phase2_buffer=phase2_buffer,
     )
 
     def scan_step(carry: _ScanCarry, _: None) -> tuple[_ScanCarry, RolloutScanOutputs]:
-        env_obs = _patch_env_obs_with_placed(
-            _single_drone_obs(race_core_obs(carry.env_data)),
-            carry.placed_gates_pos,
-            carry.placed_gates_quat,
-            carry.placed_obstacles_pos,
-            static_cfg.track_perturbation_enabled,
-        )
+        env_obs = _single_drone_obs(race_core_obs(carry.env_data))
         actor_obs = obs_encoding.vmap_build_actor_obs(
             env_obs, carry.prev_action_env_4vec, normalizer
         )
@@ -611,14 +530,6 @@ def scan_rollout(
             true_gates_pos=stepped_data.gates_pos,
             true_gates_quat=stepped_data.gates_quat,
             true_obstacles_pos=stepped_data.obstacles_pos,
-            # v33: actor-visible safety reward. The scan body has the
-            # placed buffer in ``carry`` already; pass it through so
-            # ``r_obs`` / ``r_gate_frame`` blend visited (true) vs
-            # unvisited (placed) on a per-object basis. Mirrors the
-            # eager-path call in ``env_wrapper.py``.
-            placed_gates_pos=carry.placed_gates_pos,
-            placed_gates_quat=carry.placed_gates_quat,
-            placed_obstacles_pos=carry.placed_obstacles_pos,
         )
 
         done_bool = terminated | truncated
@@ -667,22 +578,10 @@ def scan_rollout(
             (phase2_replay_done & finished).astype(jnp.float32)
         )
 
-        (
-            reset_data,
-            reset_rng_key,
-            next_placed_gates_pos,
-            next_placed_gates_quat,
-            next_placed_obstacles_pos,
-            do_seg,
-            do_phase2,
-            replay_prev_action,
-        ) = _reset_done_worlds(
+        (reset_data, reset_rng_key, do_seg, do_phase2, replay_prev_action) = _reset_done_worlds(
             stepped_data,
             done_bool,
             carry.reset_rng_key,
-            carry.placed_gates_pos,
-            carry.placed_gates_quat,
-            carry.placed_obstacles_pos,
             carry.phase2_buffer,
             env_reset_fn,
             static_cfg,
@@ -733,9 +632,6 @@ def scan_rollout(
             phase1_seg_finished_count=phase1_seg_finished_count,
             phase2_replay_completed_count=phase2_replay_completed_count,
             phase2_replay_finished_count=phase2_replay_finished_count,
-            placed_gates_pos=next_placed_gates_pos,
-            placed_gates_quat=next_placed_gates_quat,
-            placed_obstacles_pos=next_placed_obstacles_pos,
             # Buffer round-trips unchanged in B1 — writes land after the
             # scan in B2. In-scan reads for Phase 2 replay land in B3.
             phase2_buffer=carry.phase2_buffer,
@@ -744,8 +640,6 @@ def scan_rollout(
             stepped_data=stepped_data,
             next_env_obs=next_env_obs,
             env_action=env_action,
-            placed_gates_pos=carry.placed_gates_pos,
-            placed_obstacles_pos=carry.placed_obstacles_pos,
             current_target=current_target,
             gate_just_passed=gate_just_passed,
             done_bool=done_bool,
@@ -782,13 +676,7 @@ def scan_rollout(
         n_gates_for_writes,
     )
     final_carry = final_carry._replace(phase2_buffer=updated_phase2_buffer)
-    next_env_obs = _patch_env_obs_with_placed(
-        _single_drone_obs(race_core_obs(final_carry.env_data)),
-        final_carry.placed_gates_pos,
-        final_carry.placed_gates_quat,
-        final_carry.placed_obstacles_pos,
-        static_cfg.track_perturbation_enabled,
-    )
+    next_env_obs = _single_drone_obs(race_core_obs(final_carry.env_data))
     next_actor_obs = obs_encoding.vmap_build_actor_obs(
         next_env_obs, final_carry.prev_action_env_4vec, normalizer
     )
@@ -826,9 +714,6 @@ def scan_rollout(
         next_obs={"actor_obs": next_actor_obs, "critic_obs": next_critic_obs},
         outputs=outputs,
         metrics=metric_sums,
-        placed_gates_pos=final_carry.placed_gates_pos,
-        placed_gates_quat=final_carry.placed_gates_quat,
-        placed_obstacles_pos=final_carry.placed_obstacles_pos,
     )
 
 
@@ -861,19 +746,13 @@ def _reset_done_worlds(
     env_data: EnvData,
     done: Array,
     reset_rng_key: Array,
-    placed_gates_pos: Array,
-    placed_gates_quat: Array,
-    placed_obstacles_pos: Array,
     phase2_buffer: Phase2Buffer,
     env_reset_fn: EnvResetFn,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
+) -> tuple[EnvData, Array, Array, Array, Array]:
     """Reset completed worlds and apply curriculum perturbations.
 
-    Returns ``(env_data, rng_key, placed_gates_pos, placed_gates_quat,
-    placed_obstacles_pos, do_seg, do_phase2, replay_prev_action)``. The
-    placed snapshots reflect the Layer-1 placement (pre-wobble) for envs
-    that were just reset and the previous values for envs that were not.
+    Returns ``(env_data, rng_key, do_seg, do_phase2, replay_prev_action)``.
     ``do_seg`` / ``do_phase2`` are per-env bool masks identifying which
     envs had their state replaced by each respawn source. ``replay_prev_action``
     is the env-action 4-vec from each Phase 2-replayed entry — the scan
@@ -882,20 +761,9 @@ def _reset_done_worlds(
     """
     n_envs_local = done.shape[0]
 
-    def reset_branch(
-        data: EnvData,
-    ) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
+    def reset_branch(data: EnvData) -> tuple[EnvData, Array, Array, Array, Array]:
         reset_data, _ = env_reset_fn(data, None, done)
-        return _apply_reset_perturbation(
-            reset_data,
-            done,
-            reset_rng_key,
-            placed_gates_pos,
-            placed_gates_quat,
-            placed_obstacles_pos,
-            phase2_buffer,
-            static_cfg,
-        )
+        return _apply_reset_perturbation(reset_data, done, reset_rng_key, phase2_buffer, static_cfg)
 
     return jax.lax.cond(
         jnp.any(done),
@@ -903,9 +771,6 @@ def _reset_done_worlds(
         lambda data: (
             data,
             reset_rng_key,
-            placed_gates_pos,
-            placed_gates_quat,
-            placed_obstacles_pos,
             jnp.zeros_like(done, dtype=jnp.bool_),
             jnp.zeros_like(done, dtype=jnp.bool_),
             jnp.zeros((n_envs_local, ENV_ACTION_DIM), dtype=jnp.float32),
@@ -918,34 +783,32 @@ def _apply_reset_perturbation(
     env_data: EnvData,
     mask: Array,
     rng_key: Array,
-    placed_gates_pos: Array,
-    placed_gates_quat: Array,
-    placed_obstacles_pos: Array,
     phase2_buffer: Phase2Buffer,
     static_cfg: RolloutStaticConfig,
-) -> tuple[EnvData, Array, Array, Array, Array, Array, Array, Array]:
-    """Apply curriculum drone-state and track perturbations in pure JAX.
+) -> tuple[EnvData, Array, Array, Array, Array]:
+    """Apply curriculum drone-state perturbations in pure JAX.
 
-    Returns the updated env data, RNG key, per-env ``placed_*`` snapshots
-    (Layer-1 layout, *before* the Layer-2 wobble is added), and the two
-    masks ``do_seg`` / ``do_phase2`` identifying which envs were
-    respawned by which path, plus ``replay_prev_action`` (the env-action
-    4-vec from each Phase 2-replayed entry, used to overwrite
-    ``prev_action_env_4vec`` on respawn so the policy's autoregressive
-    input is consistent with the replayed state).
+    Returns the updated env data, RNG key, and the two masks ``do_seg`` /
+    ``do_phase2`` identifying which envs were respawned by which path,
+    plus ``replay_prev_action`` (the env-action 4-vec from each Phase 2-
+    replayed entry, used to overwrite ``prev_action_env_4vec`` on respawn
+    so the policy's autoregressive input is consistent with the replayed
+    state).
+
+    The framework's gate / obstacle randomization (toml-driven
+    ``gate_pos`` and ``obstacle_pos`` randomize fns invoked inside
+    ``env_reset_fn``) already wobbles ``gates_pos`` / ``obstacles_pos``
+    while leaving ``nominal_*`` at the placed layout (upstream PR #91),
+    so this routine only handles drone-state perturbation and Phase 1 /
+    Phase 2 respawn dispatch.
 
     Order of operations:
 
     1. Drone state perturbation (position, velocity, yaw) when
        ``reset_perturbation_enabled``.
-    2. Track perturbation: snapshot ``env_data.gates_pos`` / quat /
-       ``obstacles_pos`` into ``placed_*`` (Layer-1 placement, before wobble),
-       then add per-axis uniform wobble to the env-data positions
-       (Layer-2 ±max ``static_cfg.gate_pos_perturb_max``). Only when
-       ``track_perturbation_enabled``.
-    3. ``_reset_env_data`` to recompute ``gates_visited`` etc. with the
-       final (Layer-1+2) positions.
-    4. Three-way categorical: assign each just-reset env to Phase 2
+    2. ``_reset_env_data`` to recompute ``gates_visited`` etc. against
+       the framework-wobbled layout.
+    3. Three-way categorical: assign each just-reset env to Phase 2
        replay, Phase 1 seg-init, or true start. Apply each branch on
        its mask.
     """
@@ -985,29 +848,6 @@ def _apply_reset_perturbation(
         sim_data = env_data.sim_data.replace(states=states)
         env_data = env_data.replace(sim_data=sim_data)
 
-    if static_cfg.track_perturbation_enabled:
-        rng_key, gate_key, obs_key = jax.random.split(rng_key, 3)
-        gate_pos_max = jnp.asarray(static_cfg.gate_pos_perturb_max, dtype=jnp.float32)
-        obs_pos_max = jnp.asarray(static_cfg.obstacle_pos_perturb_max, dtype=jnp.float32)
-        gate_delta = jax.random.uniform(
-            gate_key, shape=env_data.gates_pos.shape, minval=-gate_pos_max, maxval=gate_pos_max
-        )
-        obs_delta = jax.random.uniform(
-            obs_key, shape=env_data.obstacles_pos.shape, minval=-obs_pos_max, maxval=obs_pos_max
-        )
-        mask_b = mask[:, None, None]
-        # Snapshot Layer-1 placement (before wobble) for envs being reset.
-        placed_gates_pos = jnp.where(mask_b, env_data.gates_pos, placed_gates_pos)
-        placed_gates_quat = jnp.where(mask_b, env_data.gates_quat, placed_gates_quat)
-        placed_obstacles_pos = jnp.where(mask_b, env_data.obstacles_pos, placed_obstacles_pos)
-        # Apply Layer-2 wobble.
-        env_data = env_data.replace(
-            gates_pos=jnp.where(mask_b, env_data.gates_pos + gate_delta, env_data.gates_pos),
-            obstacles_pos=jnp.where(
-                mask_b, env_data.obstacles_pos + obs_delta, env_data.obstacles_pos
-            ),
-        )
-
     env_data = _reset_env_data(env_data, mask)
 
     # Three-way categorical reset partition. A single uniform draw
@@ -1033,64 +873,36 @@ def _apply_reset_perturbation(
     # be a strict subset of ``do_phase2_desired`` if the buffer has no
     # non-empty slots yet (the envs that wanted replay fall back to
     # true-start, not to Phase 1, to keep the categorical interpretable).
-    # v31: replay also restores the layout the entry came from, returning
-    # updated placed_* snapshots that the caller threads back into the
-    # carry.
+    # v31: replay also restores the layout the entry came from.
     if static_cfg.phase2_prob > 0.0:
-        (
-            env_data,
-            rng_key,
-            do_phase2,
-            replay_prev_action,
-            placed_gates_pos,
-            placed_gates_quat,
-            placed_obstacles_pos,
-        ) = _apply_phase2_replay(
-            env_data,
-            do_phase2_desired,
-            rng_key,
-            phase2_buffer,
-            placed_gates_pos,
-            placed_gates_quat,
-            placed_obstacles_pos,
+        env_data, rng_key, do_phase2, replay_prev_action = _apply_phase2_replay(
+            env_data, do_phase2_desired, rng_key, phase2_buffer
         )
     else:
         do_phase2 = jnp.zeros_like(mask, dtype=jnp.bool_)
         replay_prev_action = jnp.zeros((n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
 
     # Phase 1: seg-init on the precomputed mask (independent of buffer state).
+    # Uses ``env_data.nominal_gates_pos`` (Layer-1 pre-wobble) for the
+    # segment anchors, which the framework sets to the placed layout in
+    # ``build_full_track_randomization_fn`` (upstream PR #91).
     if static_cfg.segment_init_prob > 0.0:
         env_data, rng_key = _apply_segment_init(
-            env_data, do_seg_desired, rng_key, placed_gates_pos, start_pos, static_cfg
+            env_data, do_seg_desired, rng_key, start_pos, static_cfg
         )
         do_seg = do_seg_desired
     else:
         do_seg = jnp.zeros_like(mask, dtype=jnp.bool_)
-    return (
-        env_data,
-        rng_key,
-        placed_gates_pos,
-        placed_gates_quat,
-        placed_obstacles_pos,
-        do_seg,
-        do_phase2,
-        replay_prev_action,
-    )
+    return env_data, rng_key, do_seg, do_phase2, replay_prev_action
 
 
 def _apply_phase2_replay(
-    env_data: EnvData,
-    do_phase2_desired: Array,
-    rng_key: Array,
-    buffer: Phase2Buffer,
-    placed_gates_pos: Array,
-    placed_gates_quat: Array,
-    placed_obstacles_pos: Array,
-) -> tuple[EnvData, Array, Array, Array, Array, Array, Array]:
+    env_data: EnvData, do_phase2_desired: Array, rng_key: Array, buffer: Phase2Buffer
+) -> tuple[EnvData, Array, Array, Array]:
     """Re-spawn selected envs from the Phase 2 successful-state buffer.
 
     v31 layout-restoring design: each buffer entry packs the absolute
-    drone state AND the full layout (Layer-1 placed + Layer-2 wobbled)
+    drone state AND the full layout (Layer-1 nominal + Layer-2 wobbled)
     the state came from. On replay we override BOTH the drone state and
     the env layout so the respawn is geometrically self-consistent with
     everything the actor observes.
@@ -1102,9 +914,9 @@ def _apply_phase2_replay(
     2. Sample an entry index uniformly in ``[0, fill[g])``.
     3. Unpack the absolute drone state and stored layout from the entry.
     4. Override ``sim_data.states.pos / vel / quat / ang_vel``,
-       ``target_gate``, and ``env_data.gates_pos / gates_quat /
-       obstacles_pos`` for the selected envs; refresh aux fields via
-       :func:`_refresh_aux_fields_after_respawn`.
+       ``target_gate``, and ``env_data.{gates_pos,gates_quat,obstacles_pos,
+       nominal_gates_pos,nominal_obstacles_pos}`` for the selected envs;
+       refresh aux fields via :func:`_refresh_aux_fields_after_respawn`.
 
     Returns
     -------
@@ -1118,9 +930,6 @@ def _apply_phase2_replay(
         Per-env env-action 4-vec from the replayed entry. Caller uses
         it to override ``prev_action_env_4vec`` so the policy's
         autoregressive input matches the replayed state.
-    placed_gates_pos, placed_gates_quat, placed_obstacles_pos : Array
-        Updated Layer-1 placement snapshots (replayed envs get the
-        stored Layer-1; non-replayed envs keep what was passed in).
     """
     n_envs = env_data.gates_pos.shape[0]
     n_gates = env_data.gates_pos.shape[1]
@@ -1168,11 +977,14 @@ def _apply_phase2_replay(
     stored_obstacles_pos = entry[
         ..., offs["obstacles_pos"] : offs["obstacles_pos"] + 3 * n_obstacles
     ].reshape(n_envs, n_obstacles, 3)
-    stored_placed_gates_pos = entry[
-        ..., offs["placed_gates_pos"] : offs["placed_gates_pos"] + 3 * n_gates
+    stored_nominal_gates_pos = entry[
+        ..., offs["nominal_gates_pos"] : offs["nominal_gates_pos"] + 3 * n_gates
     ].reshape(n_envs, n_gates, 3)
-    stored_placed_obstacles_pos = entry[
-        ..., offs["placed_obstacles_pos"] : offs["placed_obstacles_pos"] + 3 * n_obstacles
+    stored_nominal_gates_quat = entry[
+        ..., offs["nominal_gates_quat"] : offs["nominal_gates_quat"] + 4 * n_gates
+    ].reshape(n_envs, n_gates, 4)
+    stored_nominal_obstacles_pos = entry[
+        ..., offs["nominal_obstacles_pos"] : offs["nominal_obstacles_pos"] + 3 * n_obstacles
     ].reshape(n_envs, n_obstacles, 3)
 
     # Effective mask: desired AND buffer has at least one usable entry.
@@ -1195,13 +1007,20 @@ def _apply_phase2_replay(
     )
 
     # Override env layout for replayed envs. Both Layer-2 wobbled fields
-    # (env_data.{gates_pos,gates_quat,obstacles_pos}) and the carry's
-    # Layer-1 placed_* snapshots are restored so the actor obs (which
-    # mixes both layers via ``_patch_env_obs_with_placed``) sees the
-    # exact layout the entry came from.
+    # (env_data.{gates_pos,gates_quat,obstacles_pos}) and the Layer-1
+    # nominal_* fields are restored so the actor obs (which the framework
+    # masks between gates_pos visited / nominal_gates_pos unvisited) sees
+    # the exact layout the entry came from.
     new_gates_pos = jnp.where(mask_b3, stored_gates_pos, env_data.gates_pos)
     new_gates_quat = jnp.where(mask_b3, stored_gates_quat, env_data.gates_quat)
     new_obstacles_pos = jnp.where(mask_b3, stored_obstacles_pos, env_data.obstacles_pos)
+    new_nominal_gates_pos = jnp.where(mask_b3, stored_nominal_gates_pos, env_data.nominal_gates_pos)
+    new_nominal_gates_quat = jnp.where(
+        mask_b3, stored_nominal_gates_quat, env_data.nominal_gates_quat
+    )
+    new_nominal_obstacles_pos = jnp.where(
+        mask_b3, stored_nominal_obstacles_pos, env_data.nominal_obstacles_pos
+    )
     sim_data = env_data.sim_data.replace(states=new_states)
     env_data = env_data.replace(
         sim_data=sim_data,
@@ -1209,6 +1028,9 @@ def _apply_phase2_replay(
         gates_pos=new_gates_pos,
         gates_quat=new_gates_quat,
         obstacles_pos=new_obstacles_pos,
+        nominal_gates_pos=new_nominal_gates_pos,
+        nominal_gates_quat=new_nominal_gates_quat,
+        nominal_obstacles_pos=new_nominal_obstacles_pos,
     )
     env_data = _refresh_aux_fields_after_respawn(
         env_data, do_phase2_effective, pos_world_clipped, g_safe
@@ -1224,31 +1046,17 @@ def _apply_phase2_replay(
     )
     env_data = env_data.replace(obstacles_visited=new_obstacles_visited)
 
-    # Update Layer-1 placed_* snapshots so the carry stays consistent.
-    new_placed_gates_pos = jnp.where(mask_b3, stored_placed_gates_pos, placed_gates_pos)
-    new_placed_gates_quat = jnp.where(mask_b3, stored_gates_quat, placed_gates_quat)
-    new_placed_obstacles_pos = jnp.where(mask_b3, stored_placed_obstacles_pos, placed_obstacles_pos)
-
     # Mask prev_action to zero for envs that did NOT replay (the gather
     # produced arbitrary bytes for those lanes).
     replay_prev_action = jnp.where(do_phase2_effective[:, None], prev_action, 0.0)
 
-    return (
-        env_data,
-        rng_key,
-        do_phase2_effective,
-        replay_prev_action,
-        new_placed_gates_pos,
-        new_placed_gates_quat,
-        new_placed_obstacles_pos,
-    )
+    return env_data, rng_key, do_phase2_effective, replay_prev_action
 
 
 def _apply_segment_init(
     env_data: EnvData,
     do_seg: Array,
     rng_key: Array,
-    placed_gates_pos: Array,
     start_pos: Array,
     static_cfg: RolloutStaticConfig,
 ) -> tuple[EnvData, Array]:
@@ -1258,6 +1066,10 @@ def _apply_segment_init(
     the scanned rollout path. Both branches must produce the same
     state-distribution semantics for the policy. Implements Song 2023
     §III-B Phase 1 (state-coverage initial-state distribution).
+
+    Segment anchors come from ``env_data.nominal_gates_pos`` (Layer-1
+    pre-wobble), set by the framework's full-track randomization in
+    ``build_full_track_randomization_fn`` (upstream PR #91).
 
     Selection is now done by the caller (``_apply_reset_perturbation``)
     via a three-way categorical that also dispatches Phase 2 replay; this
@@ -1280,9 +1092,6 @@ def _apply_segment_init(
         ``SRC_PHASE1_SEG`` in the source enum.
     rng_key : Array
         PRNG key; consumed and returned.
-    placed_gates_pos : Array, shape (n_envs, n_gates, 3)
-        Layer-1 placed gate positions (pre-wobble) used to anchor segment
-        midpoints.
     start_pos : Array, shape (n_envs, n_drones, 3)
         Pre-perturbation drone position used as the segment-0 anchor.
     static_cfg : RolloutStaticConfig
@@ -1299,12 +1108,13 @@ def _apply_segment_init(
     rng_key, seg_key, jit_key = jax.random.split(rng_key, 3)
     n_envs = env_data.gates_pos.shape[0]
     n_gates = env_data.gates_pos.shape[1]
+    nominal_gates_pos = env_data.nominal_gates_pos
     segment_idx = jax.random.randint(seg_key, shape=(n_envs,), minval=0, maxval=n_gates)
     env_arange = jnp.arange(n_envs)
     prev_idx = jnp.clip(segment_idx - 1, 0, n_gates - 1)
-    prev_gate = placed_gates_pos[env_arange, prev_idx]
+    prev_gate = nominal_gates_pos[env_arange, prev_idx]
     prev_anchor = jnp.where((segment_idx == 0)[:, None], start_pos[:, 0, :], prev_gate)
-    next_gate = placed_gates_pos[env_arange, segment_idx]
+    next_gate = nominal_gates_pos[env_arange, segment_idx]
     midpoint = 0.5 * (prev_anchor + next_gate)
     jitter = jax.random.uniform(
         jit_key,
@@ -1422,8 +1232,6 @@ def _compute_phase2_event(
     stepped_data: EnvData,
     next_env_obs: dict[str, Array],
     env_action: Array,
-    placed_gates_pos: Array,
-    placed_obstacles_pos: Array,
     current_target: Array,
     gate_just_passed: Array,
     done_bool: Array,
@@ -1433,12 +1241,12 @@ def _compute_phase2_event(
 
     For every env that just passed a gate (and meets the storage filters),
     packs the post-step drone state (absolute world coords) and the
-    full layout the state came from (Layer-1 ``placed_*`` and Layer-2
-    wobbled ``env_data.*``) into the per-gate buffer state layout. The
-    layout-restoring design (v31) replaces v30's gate-frame transform:
-    on replay we restore the exact layout the entry came from, so the
-    drone state stays geometrically consistent with everything it
-    observes.
+    full layout the state came from (Layer-1 ``nominal_*`` and Layer-2
+    wobbled ``stepped_data.{gates_pos,gates_quat,obstacles_pos}``) into
+    the per-gate buffer state layout. The layout-restoring design (v31)
+    replaces v30's gate-frame transform: on replay we restore the exact
+    layout the entry came from, so the drone state stays geometrically
+    consistent with everything it observes.
 
     Filters (codex): valid iff
     * ``gate_just_passed`` this step,
@@ -1470,8 +1278,9 @@ def _compute_phase2_event(
     gates_pos_flat = stepped_data.gates_pos.reshape(n_envs, -1)
     gates_quat_flat = stepped_data.gates_quat.reshape(n_envs, -1)
     obstacles_pos_flat = stepped_data.obstacles_pos.reshape(n_envs, -1)
-    placed_gates_pos_flat = placed_gates_pos.reshape(n_envs, -1)
-    placed_obstacles_pos_flat = placed_obstacles_pos.reshape(n_envs, -1)
+    nominal_gates_pos_flat = stepped_data.nominal_gates_pos.reshape(n_envs, -1)
+    nominal_gates_quat_flat = stepped_data.nominal_gates_quat.reshape(n_envs, -1)
+    nominal_obstacles_pos_flat = stepped_data.nominal_obstacles_pos.reshape(n_envs, -1)
 
     event_data = jnp.concatenate(
         [
@@ -1484,8 +1293,9 @@ def _compute_phase2_event(
             gates_pos_flat,
             gates_quat_flat,
             obstacles_pos_flat,
-            placed_gates_pos_flat,
-            placed_obstacles_pos_flat,
+            nominal_gates_pos_flat,
+            nominal_gates_quat_flat,
+            nominal_obstacles_pos_flat,
         ],
         axis=-1,
     )

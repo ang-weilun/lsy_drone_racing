@@ -21,7 +21,6 @@ from lsy_drone_racing.control.rl_song.config import (
     RAW_ACTION_DIM,
     CurriculumConfig,
     CurriculumStage,
-    RewardConfig,
     TrainConfig,
     default_curriculum,
 )
@@ -37,17 +36,6 @@ REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 LEVEL_CONFIG_NAME: str = "level{level}.toml"
 N_DRONES: int = 1
 TOTAL_THRUST_MULTIPLIER: float = 4.0
-TRACK_RANDOMIZATION_KEYS: frozenset[str] = frozenset({"gate_pos", "gate_rpy", "obstacle_pos"})
-# Per-axis half-widths of the level-3 gate / obstacle position randomization,
-# in meters. Mirrored from ``config/level3.toml`` so the wrapper can apply the
-# perturbation itself (and update ``nominal_gates_pos`` to match the placed
-# layout) without modifying upstream framework code. The framework's
-# ``build_full_track_randomization_fn`` still runs (it is triggered by
-# ``track.randomize=true``) and sets ``gates_pos`` to a fresh per-episode
-# layout; the wrapper then snaps the nominals onto that layout and adds the
-# ±max wobble below — keeping nominal ≠ actual, like level 2.
-LEVEL3_GATE_POS_PERTURB_MAX: tuple[float, float, float] = (0.15, 0.15, 0.10)
-LEVEL3_OBSTACLE_POS_PERTURB_MAX: tuple[float, float, float] = (0.15, 0.15, 0.05)
 
 
 class RLSongVecEnv:
@@ -107,14 +95,6 @@ class RLSongVecEnv:
         )
         self.current_env_obs: dict[str, Array] | None = None
         self.prev_env_obs: dict[str, Array] | None = None
-        # Wrapper-side per-env "placed" buffers (Layer-1 layout, pre-wobble).
-        # Filled by ``_apply_track_perturbation`` at every reset on level-3
-        # stages. Stay ``None`` for stages where there is no track-side
-        # randomization (the framework's ``nominal_gates_pos`` is then
-        # already correct).
-        self.placed_gates_pos: Array | None = None
-        self.placed_gates_quat: Array | None = None
-        self.placed_obstacles_pos: Array | None = None
         self.set_stage(self.curriculum.stages.index(self.stage))
 
     def reset(self, seed: int | None = None) -> tuple[dict[str, Array], dict[str, Any]]:
@@ -141,13 +121,6 @@ class RLSongVecEnv:
 
         env_obs, info = self.env.reset(seed=seed)
         self.current_env_obs = _to_jax_obs(env_obs)
-        # Snapshot the Layer-1 placement BEFORE our wobble is applied. This
-        # ensures ``placed_*`` are always valid arrays even on non-level-3
-        # stages (where ``_apply_track_perturbation`` is a no-op); the
-        # scanned rollout path always reads these, regardless of stage.
-        self.placed_gates_pos = jnp.asarray(self.env.data.gates_pos)
-        self.placed_gates_quat = jnp.asarray(self.env.data.gates_quat)
-        self.placed_obstacles_pos = jnp.asarray(self.env.data.obstacles_pos)
         reset_mask = jnp.ones((self.n_envs,), dtype=bool)
         self._apply_reset_perturbation(reset_mask)
         self.prev_action_env_4vec = jnp.zeros((self.n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
@@ -212,12 +185,6 @@ class RLSongVecEnv:
             true_gates_pos=self.true_gates_pos(),
             true_gates_quat=self.true_gates_quat(),
             true_obstacles_pos=self.true_obstacles_pos(),
-            # v33: actor-visible safety reward. Falls back to ``true_*``
-            # inside ``step_reward`` when these are ``None`` (e.g. on
-            # non-level-3 stages that don't populate the placed buffer).
-            placed_gates_pos=self.placed_gates_pos,
-            placed_gates_quat=self.placed_gates_quat,
-            placed_obstacles_pos=self.placed_obstacles_pos,
         )
 
         done = terminated | truncated
@@ -256,40 +223,11 @@ class RLSongVecEnv:
         """
         if self.current_env_obs is None:
             raise RuntimeError("No current env observation is available.")
-        actor_env_obs = self._patch_env_obs_with_placed(self.current_env_obs)
         actor_obs = obs_encoding.vmap_build_actor_obs(
-            actor_env_obs, self.prev_action_env_4vec, self.normalizer
+            self.current_env_obs, self.prev_action_env_4vec, self.normalizer
         )
         critic_obs = self._build_critic_obs(self.current_env_obs)
         return {"actor_obs": actor_obs, "critic_obs": critic_obs}
-
-    def _patch_env_obs_with_placed(self, env_obs: dict[str, Array]) -> dict[str, Array]:
-        """Replace toml-nominal pose entries with per-env Layer-1 placement.
-
-        Mirrors ``rollout._patch_env_obs_with_placed`` for the eager path.
-        See that helper for the motivation; this version short-circuits when
-        the stage applies no wrapper-side wobble (level 1) and the framework's
-        nominal fields are already informative.
-        """
-        if self.stage.level not in (2, 3):
-            return env_obs
-        if (
-            self.placed_gates_pos is None
-            or self.placed_gates_quat is None
-            or self.placed_obstacles_pos is None
-        ):
-            return env_obs
-        patched = dict(env_obs)
-        gates_visited = env_obs["gates_visited"].astype(jnp.bool_)[..., None]
-        patched["gates_pos"] = jnp.where(gates_visited, env_obs["gates_pos"], self.placed_gates_pos)
-        patched["gates_quat"] = jnp.where(
-            gates_visited, env_obs["gates_quat"], self.placed_gates_quat
-        )
-        obstacles_visited = env_obs["obstacles_visited"].astype(jnp.bool_)[..., None]
-        patched["obstacles_pos"] = jnp.where(
-            obstacles_visited, env_obs["obstacles_pos"], self.placed_obstacles_pos
-        )
-        return patched
 
     def update_normalizer_from_batch(self, normalized_actor_obs: Array) -> None:
         """Update the running observation normalizer from a rollout batch.
@@ -393,45 +331,38 @@ class RLSongVecEnv:
     def _stage_randomizations(
         self, race_cfg: ConfigDict, stage: CurriculumStage
     ) -> ConfigDict | None:
-        """Return env randomizations that belong to the course track, not DR.
+        """Return per-stage track-side randomizations (gate_pos, gate_rpy, obstacle_pos).
 
-        We deliberately return ``None`` even for level 3. The framework's
-        ``build_full_track_randomization_fn`` (triggered by
-        ``track.randomize=true`` in ``level3.toml``) still runs — it
-        regenerates the per-episode gate / obstacle XY layout. But we skip the
-        ``gate_pos`` / ``gate_rpy`` / ``obstacle_pos`` perturbation steps that
-        the framework would otherwise apply, because those mutate
-        ``gates_pos`` without touching ``nominal_gates_pos``, leaving the
-        controller's pre-visit observation stuck at the toml's ``(0, 0, z)``
-        placeholder. Instead, ``_apply_reset_perturbation`` (eager) and
-        ``rollout._apply_track_perturbation`` (scanned) apply the same
-        per-axis perturbation *after* snapping nominal to the just-placed
-        layout, so the pre-visit observation is the placement and the
-        post-visit observation is placement+wobble — the level-2 convention.
-        """
-        _ = (race_cfg, stage)  # framework randomizations are intentionally not used.
-        # TODO(stage4): translate DRSchedule mass, inertia, thrust-scale, motor
-        # delay, drag, sensing-noise, latency, and wind channels into Crazyflow
-        # reset/step hooks when curriculum stage 4 is enabled.
-        return None
+        Levels 2 / 3 use the toml's ``gate_pos`` / ``gate_rpy`` / ``obstacle_pos``
+        bounds scaled by ``stage.gate_rand_scale``. The framework's
+        randomize fns (post-upstream PR #91) populate ``nominal_*`` from
+        the placed layout and apply the wobble on top of ``gates_pos`` /
+        ``gates_quat`` / ``obstacles_pos`` so the pre-visit obs reports
+        the placed layout and the post-visit obs reports placement + wobble.
 
-    @staticmethod
-    def track_perturbation_bounds(
-        stage: CurriculumStage,
-    ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        """Return per-axis gate-pos and obstacle-pos perturbation half-widths.
-
-        Returns ``((0, 0, 0), (0, 0, 0))`` on level 1. Otherwise returns the
-        level-2/3 toml bounds (identical: ``[0.15, 0.15, 0.10]`` for gates,
-        ``[0.15, 0.15, 0.05]`` for obstacles) scaled by ``stage.gate_rand_scale``.
+        Drone-pose randomizations are excluded because
+        ``_apply_reset_perturbation`` applies stage-specific drone perturbations
+        itself. ``gate_rpy`` matches the eval-time distribution applied by
+        ``scripts/sim.py`` on level 3.
         """
         if stage.level not in (2, 3):
-            zero: tuple[float, float, float] = (0.0, 0.0, 0.0)
-            return zero, zero
+            return None
         scale = float(stage.gate_rand_scale)
-        gx, gy, gz = LEVEL3_GATE_POS_PERTURB_MAX
-        ox, oy, oz = LEVEL3_OBSTACLE_POS_PERTURB_MAX
-        return ((gx * scale, gy * scale, gz * scale), (ox * scale, oy * scale, oz * scale))
+        if scale <= 0.0:
+            return None
+        cfg = ConfigDict()
+        for key in ("gate_pos", "gate_rpy", "obstacle_pos"):
+            if key not in race_cfg.env.randomizations:
+                continue
+            src = race_cfg.env.randomizations[key]
+            entry = ConfigDict()
+            entry.fn = src.fn
+            kwargs = ConfigDict()
+            kwargs.minval = [float(v) * scale for v in src.kwargs.minval]
+            kwargs.maxval = [float(v) * scale for v in src.kwargs.maxval]
+            entry.kwargs = kwargs
+            cfg[key] = entry
+        return cfg if len(cfg) else None
 
     def _stage_disturbances(self, stage: CurriculumStage) -> ConfigDict | None:
         """Return disturbances for a curriculum stage."""
@@ -495,7 +426,6 @@ class RLSongVecEnv:
         )
         sim_data = self.env.data.sim_data.replace(states=states)
         self.env.data = self.env.data.replace(sim_data=sim_data)
-        self._apply_track_perturbation(mask)
         self.env.data = _reset_env_data(self.env.data, mask)
         self._apply_segment_init(mask, start_pos)
 
@@ -523,8 +453,6 @@ class RLSongVecEnv:
             raise RuntimeError("Env is not constructed.")
         if self.stage.segment_init_prob <= 0.0:
             return
-        if self.placed_gates_pos is None:
-            return
         mask = jnp.asarray(mask, dtype=bool)
         if not bool(np.asarray(jnp.any(mask))):
             return
@@ -532,7 +460,13 @@ class RLSongVecEnv:
         self.rng_key, bern_key, seg_key, jit_key = jax.random.split(self.rng_key, 4)
         data = self.env.data
         states = data.sim_data.states
-        n_gates = data.gates_pos.shape[1]
+        # Pre-wobble layout. ``nominal_gates_pos`` is set by the framework's
+        # ``build_full_track_randomization_fn`` to the just-placed layout
+        # (upstream PR #91) and is not mutated by the per-axis gate_pos
+        # randomization that follows, so segment anchors use the placed
+        # geometry rather than the post-wobble physics.
+        nominal_gates_pos = data.nominal_gates_pos
+        n_gates = nominal_gates_pos.shape[1]
 
         do_seg = (
             jax.random.bernoulli(bern_key, p=self.stage.segment_init_prob, shape=(self.n_envs,))
@@ -544,9 +478,9 @@ class RLSongVecEnv:
         segment_idx = jax.random.randint(seg_key, shape=(self.n_envs,), minval=0, maxval=n_gates)
         env_arange = jnp.arange(self.n_envs)
         prev_idx = jnp.clip(segment_idx - 1, 0, n_gates - 1)
-        prev_gate = self.placed_gates_pos[env_arange, prev_idx]
+        prev_gate = nominal_gates_pos[env_arange, prev_idx]
         prev_anchor = jnp.where((segment_idx == 0)[:, None], start_pos[:, 0, :], prev_gate)
-        next_gate = self.placed_gates_pos[env_arange, segment_idx]
+        next_gate = nominal_gates_pos[env_arange, segment_idx]
         midpoint = 0.5 * (prev_anchor + next_gate)
 
         jitter = jax.random.uniform(
@@ -586,63 +520,6 @@ class RLSongVecEnv:
         self.env.data = _refresh_aux_fields_after_respawn(
             self.env.data, do_seg, new_pos, segment_idx
         )
-
-    def _apply_track_perturbation(self, mask: Array) -> None:
-        """Snap per-env placed buffer to current layout, then add ±max wobble.
-
-        Runs only on level-3 stages. Mirrors the JAX-traceable update in
-        ``rollout._apply_reset_perturbation`` used inside the scanned rollout
-        path; this eager version is invoked once per :meth:`reset` at the
-        start of training (and on stage promotion). Updates two pieces of
-        state for envs selected by ``mask``:
-
-        * ``self.placed_gates_pos / quat`` and ``self.placed_obstacles_pos``:
-          snapshot of the just-placed layout *before* wobble is added. These
-          replace the framework's ``nominal_*`` for the actor observation
-          (the framework keeps the toml's ``(0, 0, z)`` placeholder there).
-        * ``env_data.gates_pos`` and ``env_data.obstacles_pos`` += wobble.
-
-        Wobble half-widths come from :meth:`track_perturbation_bounds`,
-        derived from ``level3.toml`` and scaled by ``stage.gate_rand_scale``.
-        """
-        if self.env is None:
-            raise RuntimeError("Env is not constructed.")
-        if self.stage.level not in (2, 3):
-            return
-        mask = jnp.asarray(mask, dtype=bool)
-        if not bool(np.asarray(jnp.any(mask))):
-            return
-        gate_pos_max, obstacle_pos_max = self.track_perturbation_bounds(self.stage)
-        gate_pos_max_arr = jnp.asarray(gate_pos_max, dtype=jnp.float32)
-        obstacle_pos_max_arr = jnp.asarray(obstacle_pos_max, dtype=jnp.float32)
-
-        self.rng_key, gate_key, obs_key = jax.random.split(self.rng_key, 3)
-        data = self.env.data
-        gate_delta = jax.random.uniform(
-            gate_key, shape=data.gates_pos.shape, minval=-gate_pos_max_arr, maxval=gate_pos_max_arr
-        )
-        obs_delta = jax.random.uniform(
-            obs_key,
-            shape=data.obstacles_pos.shape,
-            minval=-obstacle_pos_max_arr,
-            maxval=obstacle_pos_max_arr,
-        )
-        mask_b = mask[:, None, None]
-        # Snapshot the placed (pre-wobble) layout into the wrapper-side buffer.
-        if self.placed_gates_pos is None:
-            self.placed_gates_pos = data.gates_pos
-            self.placed_gates_quat = data.gates_quat
-            self.placed_obstacles_pos = data.obstacles_pos
-        else:
-            self.placed_gates_pos = jnp.where(mask_b, data.gates_pos, self.placed_gates_pos)
-            self.placed_gates_quat = jnp.where(mask_b, data.gates_quat, self.placed_gates_quat)
-            self.placed_obstacles_pos = jnp.where(
-                mask_b, data.obstacles_pos, self.placed_obstacles_pos
-            )
-        # Apply Layer-2 wobble to gates_pos and obstacles_pos.
-        new_gates_pos = jnp.where(mask_b, data.gates_pos + gate_delta, data.gates_pos)
-        new_obstacles_pos = jnp.where(mask_b, data.obstacles_pos + obs_delta, data.obstacles_pos)
-        self.env.data = data.replace(gates_pos=new_gates_pos, obstacles_pos=new_obstacles_pos)
 
     def _reset_done_worlds(self, mask: Array) -> None:
         """Reset completed worlds after terminal rewards have been computed."""

@@ -1,26 +1,13 @@
-r"""Sim eval for the Song-2023 RL controller with the level-3 dead-obs patch.
+r"""Sim eval for the Song-2023 RL controller with render-friendly extras.
 
-``scripts/sim.py`` is the upstream eval entrypoint, but on level 3 it feeds
-the controller an observation where ``obs["gates_pos"]`` /
-``obs["obstacles_pos"]`` return the toml-nominal ``(0, 0, z)`` placeholders
-for any gate/obstacle not yet within sensor range. The framework's
-``build_full_track_randomization_fn`` regenerates ``env.data.gates_pos`` per
-episode but leaves ``env.data.nominal_gates_pos`` unchanged, so the
-un-visited branch leaks dead info instead of the true placement.
-
-The training wrapper :class:`RLSongVecEnv` substitutes the truth from
-``env.data.gates_pos`` for the un-visited branch, so the trained policy
-sees the placement and never the placeholder. ``scripts/sim.py`` does not
-apply that patch, which is why level-3 sim eval shows the drone reacting
-to phantom ``(0, 0, z)`` gates instead of the real layout.
-
-This script wraps the env in :class:`TruePoseObsWrapper` to re-apply the
-``gates_visited`` / ``obstacles_visited`` mask with ``env.unwrapped.data``
-as the truth source. On real hardware the issue does not arise because
-Mocap populates ``nominal_*_pos`` with the true measured positions at
-reset (see :mod:`lsy_drone_racing.envs.real_race_env`), so this wrapper
-is a no-op there. The base ``envs/``, ``scripts/sim.py``, and config files
-are intentionally untouched so the competition code-check sees no diff.
+Mirrors ``scripts/sim.py`` but adds two affordances specific to the RL
+Song controller: a video recording path (``--record path.mp4``) that
+captures one frame per env step, and a per-gate colour override on the
+MuJoCo model so each gate is visually distinguishable in renders. The
+underlying env construction is identical to ``scripts/sim.py``; this
+file does not patch the observation any more (upstream PR #91 fixed the
+level-3 ``nominal_*`` masking that previously made the un-visited branch
+return the toml ``(0, 0, z)`` placeholders).
 
 Usage
 -----
@@ -30,7 +17,7 @@ Usage
         --config level3.toml \\
         --checkpoint <path-to-step_NNNNNNNNNNNN-or-run-dir> \\
         --control_mode attitude \\
-        --record renders/v24_level3_patched.mp4 \\
+        --record renders/level3_eval.mp4 \\
         --n_runs 8
 """
 
@@ -93,41 +80,6 @@ GATE_ACCENT_GEOMS = (
 )
 
 
-class TruePoseObsWrapper(gymnasium.ObservationWrapper):
-    """Patch the un-visited branch of the per-step obs with the placed truth.
-
-    Re-applies the ``gates_visited`` / ``obstacles_visited`` mask using
-    ``env.unwrapped.data`` as the truth source for the un-visited branch.
-
-    See module docstring for the bug this works around. Apply *after*
-    :class:`JaxToNumpy` so the obs is numpy; the truth is read from
-    ``env.unwrapped.data`` (JAX arrays) and converted on the fly.
-
-    Notes
-    -----
-    ``env.unwrapped.data.gates_pos`` has shape ``(n_drones, n_gates, 3)``.
-    The single-drone env this script targets has ``n_drones = 1``, so the
-    ``[0]`` slice matches the unbatched per-drone obs layout.
-    """
-
-    def observation(self, observation: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Return an obs dict with the un-visited branch sourced from truth."""
-        data = self.unwrapped.data
-        truth_gates_pos = np.asarray(data.gates_pos[0])
-        truth_gates_quat = np.asarray(data.gates_quat[0])
-        truth_obstacles_pos = np.asarray(data.obstacles_pos[0])
-
-        out = dict(observation)
-        gates_visited = np.asarray(out["gates_visited"]).astype(bool)
-        mask_g = gates_visited[..., None]
-        out["gates_pos"] = np.where(mask_g, out["gates_pos"], truth_gates_pos)
-        out["gates_quat"] = np.where(mask_g, out["gates_quat"], truth_gates_quat)
-        obstacles_visited = np.asarray(out["obstacles_visited"]).astype(bool)
-        mask_o = obstacles_visited[..., None]
-        out["obstacles_pos"] = np.where(mask_o, out["obstacles_pos"], truth_obstacles_pos)
-        return out
-
-
 def simulate(
     config: str = "level3.toml",
     controller: str | None = None,
@@ -141,11 +93,11 @@ def simulate(
     checkpoint: str | None = None,
     control_mode: str | None = None,
 ) -> list[float | None]:
-    """Run the RL Song controller in sim with the dead-obs patch.
+    """Run the RL Song controller in sim with recording / render extras.
 
     Mirrors ``scripts.sim.simulate`` so the recording / CLI behaviour is
-    identical; the only functional difference is the
-    :class:`TruePoseObsWrapper` inserted after :class:`JaxToNumpy`.
+    identical; the differences are the gate colour override and the
+    offscreen video recording path.
 
     Parameters
     ----------
@@ -214,7 +166,6 @@ def simulate(
     )
     _color_code_gates(env)
     env = JaxToNumpy(env)
-    env = TruePoseObsWrapper(env)
 
     video_writer = _open_video_writer(record, fps) if record else None
     ep_times: list[float | None] = []
