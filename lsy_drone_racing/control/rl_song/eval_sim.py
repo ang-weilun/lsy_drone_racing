@@ -371,19 +371,19 @@ def _run_episode(
             )
 
             if trace_writer is not None:
-                n_gates = len(cfg.env.track.gates)
-                n_obstacles = len(cfg.env.track.obstacles)
+                sim_data = env.unwrapped.data
+                true_gates_pos = np.asarray(sim_data.gates_pos)[0]
+                true_gates_quat = np.asarray(sim_data.gates_quat)[0]
+                true_obstacles_pos = np.asarray(sim_data.obstacles_pos)[0]
                 row = _build_trace_row(
                     i=i,
                     t=curr_time,
                     obs=obs,
                     action_applied=np.asarray(action, dtype=np.float32),
                     action_policy_mean=getattr(controller, "_last_policy_mean", None),
-                    true_gates_pos=np.zeros((n_gates, 3), dtype=np.float32),  # placeholder, B4
-                    true_gates_quat=np.zeros((n_gates, 4), dtype=np.float32),  # placeholder, B4
-                    true_obstacles_pos=np.zeros(
-                        (n_obstacles, 3), dtype=np.float32
-                    ),  # placeholder, B4
+                    true_gates_pos=true_gates_pos,
+                    true_gates_quat=true_gates_quat,
+                    true_obstacles_pos=true_obstacles_pos,
                     reward_total=None,  # placeholder, B5
                     reward_terms=None,  # placeholder, B5
                     terminated=terminated,
