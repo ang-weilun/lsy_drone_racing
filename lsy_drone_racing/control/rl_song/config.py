@@ -21,20 +21,26 @@ RAW_ACTION_DIM: int = 7
 # Env-side action interface is 4-vec [roll, pitch, yaw, thrust].
 ENV_ACTION_DIM: int = 4
 
-# Actor obs decomposition (cf. design doc §6). Total 59 floats.
+# Actor obs decomposition (cf. design doc §6). Total 61 floats.
 ACTOR_OBS_DRONE_DIM: int = 13  # 6D rot + body-vel + body-omega + z
 ACTOR_OBS_GATE_DIM: int = 24  # 2 gates * 4 corners * 3 coords
 ACTOR_OBS_VISITED_DIM: int = 2  # visited flags for the 2 future gates
 ACTOR_OBS_PREV_ACTION_DIM: int = ENV_ACTION_DIM
 ACTOR_OBS_OBSTACLE_DIM: int = 16  # 4 obstacles * (3 body-frame xyz + 1 visited)
+# v35: pre-computed obstacle-danger scalars to short-circuit a cross-channel
+# interaction the policy was failing to learn from the raw obstacle channel.
+# Layout: [min_clearance_xy_m, closing_speed_to_nearest_obs_mps]. See
+# ``obs.build_actor_obs`` for the construction.
+ACTOR_OBS_PROXIMITY_DIM: int = 2
 ACTOR_OBS_DIM: int = (
     ACTOR_OBS_DRONE_DIM
     + ACTOR_OBS_GATE_DIM
     + ACTOR_OBS_VISITED_DIM
     + ACTOR_OBS_PREV_ACTION_DIM
     + ACTOR_OBS_OBSTACLE_DIM
+    + ACTOR_OBS_PROXIMITY_DIM
 )
-assert ACTOR_OBS_DIM == 59, "Actor obs layout drifted from design doc §6"
+assert ACTOR_OBS_DIM == 61, "Actor obs layout drifted from design doc §6"
 
 
 @dataclass(frozen=True)
@@ -678,6 +684,25 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
+    v35: proximity-obs warm-start on top of v34 (which tied v33b within
+    noise — 6/32 finishes vs 7/32, same obstacle:0 dominant failure mode).
+    The v34 eval traces showed the policy is generating near-zero roll
+    commands as it approaches obstacles (e.g. episode 6: drone distance to
+    obstacle dropped 0.39 m → 0.16 m while roll stayed in [-0.05, +0.16]).
+    The raw obstacle channel contains the information in principle, but
+    PPO did not learn the cross-channel multiplicative interaction
+    (self_velocity · obstacle_direction → roll command) from sparse
+    reward across 300M v33b + 300M v34 steps.
+
+    v35 pre-computes that interaction as two scalar obs features —
+    ``min_clearance_xy_m`` and ``closing_speed_to_nearest_obs_mps`` —
+    appended to the actor / critic obs (dim 59 → 61). Rewards inherit
+    v34 unchanged (``obstacle_sigma=0.5``, ``time_penalty=0.15``,
+    ``crash_penalty=100``). Warm-start from v34 with zero-padded first-
+    layer kernels so the existing 59 features keep their learned weights
+    and the two new features start with no influence; PPO retrains the
+    new input weights from zero over the 300M-step run.
+
     v34: obstacle-pricing fix on top of v33b (current SOTA, 7/32 finishes).
     Eval traces of v33b on level 3 (``renders/plan-D1-smoke/``) showed
     3/8 episodes crashing into obstacle 0 within 0.84 s of takeoff, on
@@ -845,7 +870,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v34_obstacle_pricing",
+                name="level3_v35_proximity_obs",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,

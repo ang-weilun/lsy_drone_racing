@@ -1,12 +1,13 @@
 """Observation encoding for the Song-2023 RL prototype.
 
-Builds the 59-dimensional actor observation and the (Week-1-equivalent)
+Builds the 61-dimensional actor observation and the (Week-1-equivalent)
 critic observation from the racing env's observation dict. Pure JAX, designed
 to be ``jit``- and ``vmap``-friendly.
 
 Layout
 ------
-The actor observation is ``[drone | gates | visited | prev_action | obstacles]``:
+The actor observation is
+``[drone | gates | visited | prev_action | obstacles | proximity]``:
 
 * drone (13): 6D rotation rep (first two columns of ``R_wb``), body-frame
   linear velocity (3), body-frame angular velocity (3), drone z (1).
@@ -19,6 +20,11 @@ The actor observation is ``[drone | gates | visited | prev_action | obstacles]``
 * prev_action (4): the previous env-action 4-vec ``[roll, pitch, yaw, thrust]``.
 * obstacles (16): four obstacles' body-frame relative positions (3 each) and
   visited flags (1 each).
+* proximity (2): scalar danger features — XY clearance to the nearest
+  obstacle, and the signed closing speed along the direction to that
+  obstacle (positive when approaching). Pre-computes the cross-channel
+  interaction that v33b / v34 evaluations showed the policy was failing
+  to learn from the raw obstacle channel alone.
 
 Cyclic shift: the gate list is rotated so that ``gates[0]`` is always the
 current target. The target-gate index is therefore not encoded explicitly.
@@ -190,7 +196,7 @@ def _gate_corners_world(gate_pos: Array, gate_quat: Array) -> Array:
 def build_actor_obs(
     env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
 ) -> Array:
-    """Encode one (un-batched) env observation as the 59-d actor tensor.
+    """Encode one (un-batched) env observation as the 61-d actor tensor.
 
     Parameters
     ----------
@@ -281,7 +287,37 @@ def build_actor_obs(
         [obstacles_rel_body, obstacles_visited.astype(jnp.float32)[..., None]], axis=-1
     ).reshape(-1)
 
-    raw = jnp.concatenate([drone_chan, gate_chan, visited_chan, prev_action_chan, obstacle_chan])
+    # v35: scalar proximity features. The raw obstacle channel already
+    # contains the body-frame relative positions, so in principle the
+    # network could infer ``min over obstacles of |Δxy|`` and the closing
+    # speed itself. v33b / v34 evaluations showed that does not happen:
+    # the policy generates near-zero roll commands as it approaches an
+    # obstacle on the spawn→gate-0 line. Pre-computing two scalars gives
+    # PPO a direct gradient on the danger signal instead of requiring it
+    # to learn the multiplicative cross-channel interaction
+    # (self_velocity · obstacle_direction) from sparse reward.
+    obstacle_delta_xy = obstacles_pos[:, :2] - pos[:2]  # (N_OBSTACLES, 2), world XY
+    obstacle_dist_xy = jnp.linalg.norm(obstacle_delta_xy, axis=-1)  # (N_OBSTACLES,)
+    min_clearance_xy = jnp.min(obstacle_dist_xy)
+    nearest_idx = jnp.argmin(obstacle_dist_xy)
+    # Unit vector from drone XY to nearest obstacle, in world frame. Guarded
+    # for the (numerically negligible) co-located case so the dot product
+    # below is well-defined.
+    dir_to_nearest = obstacle_delta_xy[nearest_idx]
+    dir_norm = jnp.linalg.norm(dir_to_nearest)
+    safe_norm = jnp.maximum(dir_norm, 1e-6)
+    unit_to_nearest = dir_to_nearest / safe_norm
+    # Closing speed: positive when drone XY velocity has a component pointing
+    # toward the nearest obstacle. Built from world-frame velocity, not body
+    # frame, since the unit vector is in world frame.
+    closing_speed = jnp.dot(vel[:2], unit_to_nearest)
+    proximity_chan = jnp.stack(
+        [min_clearance_xy.astype(jnp.float32), closing_speed.astype(jnp.float32)]
+    )
+
+    raw = jnp.concatenate(
+        [drone_chan, gate_chan, visited_chan, prev_action_chan, obstacle_chan, proximity_chan]
+    )
     return apply_normalizer(normalizer, raw)
 
 

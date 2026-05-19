@@ -179,9 +179,13 @@ def train(args: CLIArgs) -> None:
         env_sim_rng_key = restored["env_sim_rng_key"]
     elif args.init_from is not None:
         init_data = _load_init_checkpoint(args.init_from)
-        actor_state = actor_state.replace(params=init_data["actor_params"])
-        critic_state = critic_state.replace(params=init_data["critic_params"])
-        normalizer = _normalizer_from_checkpoint(init_data["normalizer"])
+        actor_params = _pad_first_dense_for_obs_grow(init_data["actor_params"], ACTOR_OBS_DIM)
+        critic_params = _pad_first_dense_for_obs_grow(init_data["critic_params"], ACTOR_OBS_DIM)
+        actor_state = actor_state.replace(params=actor_params)
+        critic_state = critic_state.replace(params=critic_params)
+        normalizer = _extend_normalizer_for_obs_grow(
+            _normalizer_from_checkpoint(init_data["normalizer"]), ACTOR_OBS_DIM
+        )
 
     env = RLSongVecEnv(train_cfg, stage_idx=start_stage_idx, seed=train_cfg.seed, device="gpu")
 
@@ -899,6 +903,116 @@ def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
     if checkpoint_path is None:
         raise FileNotFoundError(f"No Orbax checkpoint found under {init_run_dir}")
     return ocp.PyTreeCheckpointer().restore(checkpoint_path)
+
+
+def _pad_first_dense_for_obs_grow(params: dict, target_in_dim: int) -> dict:
+    """Zero-pad the first Dense layer's input axis when the obs dim grew.
+
+    When warm-starting under an extended observation dimensionality
+    (e.g. v35 added two proximity scalars, 59 → 61), the first hidden
+    layer's kernel must be expanded along its input axis so the new
+    feature weights start at zero — preserving the prior policy's
+    behaviour exactly and letting PPO learn the new feature weights
+    over training.
+
+    Flax stores the modules' parameters in insertion order under
+    ``params['Dense_0']``, the first ``nn.Dense`` in :class:`Actor` /
+    :class:`Critic`. Only that layer's input axis depends on the obs
+    dimensionality; subsequent layers and the network's output heads
+    are unaffected. The function is a no-op when the loaded kernel
+    already matches ``target_in_dim``.
+
+    Parameters
+    ----------
+    params : dict
+        Restored Flax parameter pytree (per-network, top-level dict).
+    target_in_dim : int
+        Current model's obs dimensionality (``ACTOR_OBS_DIM``).
+
+    Returns
+    -------
+    dict
+        Shallow-copy of ``params`` with ``Dense_0/kernel`` zero-padded
+        along axis 0 if needed.
+
+    Raises
+    ------
+    KeyError
+        If ``Dense_0`` is absent from ``params`` — a no-op return is
+        unsafe because it would silently skip the expected first layer.
+    ValueError
+        If the loaded kernel's input axis is larger than
+        ``target_in_dim`` (shrinking obs dim is not supported here).
+    """
+    if "Dense_0" not in params:
+        raise KeyError(
+            "Expected 'Dense_0' in warm-start params; the actor / critic "
+            "first layer is missing or has been renamed."
+        )
+    kernel = params["Dense_0"]["kernel"]
+    current_in_dim = kernel.shape[0]
+    if current_in_dim == target_in_dim:
+        return params
+    if current_in_dim > target_in_dim:
+        raise ValueError(
+            f"Warm-start kernel input axis {current_in_dim} is larger than "
+            f"target {target_in_dim}; obs dim shrink not supported."
+        )
+    pad_rows = target_in_dim - current_in_dim
+    zero_rows = jnp.zeros((pad_rows, kernel.shape[1]), dtype=kernel.dtype)
+    new_kernel = jnp.concatenate([kernel, zero_rows], axis=0)
+    return {**params, "Dense_0": {**params["Dense_0"], "kernel": new_kernel}}
+
+
+def _extend_normalizer_for_obs_grow(
+    normalizer: NormalizerState, target_dim: int
+) -> NormalizerState:
+    """Extend a warm-start normalizer to the current obs dim.
+
+    The Welford running statistics are sized to the observation
+    dimensionality. When the obs grows, the prior checkpoint's
+    normalizer is shorter than the current one; the new entries are
+    initialised to the CleanRL warm-start defaults (mean=0, var=1) so
+    the new features pass through the affine normalizer unchanged on
+    step 0, then converge to their true running statistics as rollouts
+    accumulate.
+
+    The scalar ``count`` is carried over so post-warm-start updates
+    weight the new-feature statistics correctly relative to the
+    accumulated history of the preserved features.
+
+    Parameters
+    ----------
+    normalizer : NormalizerState
+        Restored normalizer from the warm-start checkpoint.
+    target_dim : int
+        Current model's obs dimensionality.
+
+    Returns
+    -------
+    NormalizerState
+        Extended normalizer. No-op when the input is already at
+        ``target_dim``.
+
+    Raises
+    ------
+    ValueError
+        If the loaded normalizer is wider than ``target_dim``.
+    """
+    current_dim = int(normalizer.mean.shape[0])
+    if current_dim == target_dim:
+        return normalizer
+    if current_dim > target_dim:
+        raise ValueError(
+            f"Warm-start normalizer dim {current_dim} is larger than "
+            f"target {target_dim}; obs dim shrink not supported."
+        )
+    pad = target_dim - current_dim
+    return NormalizerState(
+        mean=jnp.concatenate([normalizer.mean, jnp.zeros((pad,), dtype=normalizer.mean.dtype)]),
+        var=jnp.concatenate([normalizer.var, jnp.ones((pad,), dtype=normalizer.var.dtype)]),
+        count=normalizer.count,
+    )
 
 
 def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
