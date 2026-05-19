@@ -120,6 +120,14 @@ def create_corridor_ocp_solver(
     ocp.constraints.ubx = np.array([0.8, 0.8, 0.5])
     ocp.constraints.idxbx = np.array([3, 4, 5])
 
+    # Soften attitude constraints to prevent infeasibility
+    ocp.constraints.idxsbx = np.array([0, 1, 2])
+    ns = 3
+    ocp.cost.Zl = 1000.0 * np.ones(ns)
+    ocp.cost.Zu = 1000.0 * np.ones(ns)
+    ocp.cost.zl = 100.0 * np.ones(ns)
+    ocp.cost.zu = 100.0 * np.ones(ns)
+
     # Thrust constraints
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4])
@@ -133,10 +141,10 @@ def create_corridor_ocp_solver(
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
     ocp.solver_options.nlp_solver_type = "SQP"
-    ocp.solver_options.nlp_solver_max_iter = 30  # Reduced for stability
-    ocp.solver_options.tol = 1e-4  # Relaxed tolerance
+    ocp.solver_options.nlp_solver_max_iter = 100
+    ocp.solver_options.tol = 1e-3
     ocp.solver_options.qp_solver_cond_N = N
-    ocp.solver_options.qp_solver_iter_max = 15  # Reduced to avoid numerical issues
+    ocp.solver_options.qp_solver_iter_max = 50
     ocp.solver_options.qp_solver_warm_start = 1
     ocp.solver_options.qp_solver_tol_stat = 1e-2  # Relaxed
     ocp.solver_options.qp_solver_tol_eq = 1e-2  # Relaxed
@@ -175,7 +183,7 @@ class SfcMpcCorridorController(Controller):
         super().__init__(obs, info, config)
 
         self._dt = 1.0 / config.env.freq
-        self._N = 50
+        self._N = 25
         self._T_horizon = self._N * self._dt
 
         # Initialize planner
