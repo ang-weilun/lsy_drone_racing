@@ -811,6 +811,29 @@ def default_curriculum() -> CurriculumConfig:
     warmup (phase-2 buffer of past gate-pass states). These are training
     curriculum, not reward, and are preserved from v33-v35.
 
+    v37b update (2026-05-19): the v36 cold-train collapsed (eval@500M:
+    0/32 gates, 29/32 floor crashes, median ep_len 0.24 s). With
+    ``use_guide``, ``time_penalty``, ``use_gate_pass_bonus``,
+    ``use_exit_vel_bonus``, and ``gate_frame_weight`` all stripped, there
+    is no ``f(p_t)`` position-based reward left to break the cold-start
+    exploration trap — exactly the v15-v19 failure mode our prior
+    iteration documented. The above "warm-start unhelpful" rationale
+    applies only to value miscalibration; it does not address the
+    cold-start gradient problem, which dominated.
+
+    v37b inverts the warm-start decision: same reward and curriculum
+    as v36, but ``--init-from`` the v35 checkpoint
+    (``level3_v35_proximity_obs_warmstart_from_v34_seed0_300M``) which
+    is already a competent gate-passing policy at the matching 61-dim
+    obs. Critic miscalibration risk is accepted; PPO value clipping
+    plus ~50M steps of re-alignment is expected to handle it. CLI:
+    ``--init-from`` parent run dir, ``--ent_coef_start 0.001``
+    (matches ``ent_coef_final=0.001`` → flat schedule, preserves v35's
+    low-entropy commitment), ``--total_timesteps 300_000_000``,
+    ``--seed 0``, ``--stage 1``. Tests whether the stripped Gate-Progress
+    reward preserves a competent policy (orthogonal question to whether
+    it can bootstrap one).
+
     v35: proximity-obs warm-start on top of v34 (which tied v33b within
     noise — 6/32 finishes vs 7/32, same obstacle:0 dominant failure mode).
     The v34 eval traces showed the policy is generating near-zero roll
@@ -997,7 +1020,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v36_song_stripped_cold",
+                name="level3_v37b_song_stripped_warm_from_v35",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
