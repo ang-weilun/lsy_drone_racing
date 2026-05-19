@@ -73,16 +73,16 @@ def create_corridor_ocp_solver(
         [
             50.0,  # pos_x
             50.0,  # pos_y
-            200.0,  # pos_z
-            0.2,    # roll
-            0.2,    # pitch
-            0.2,    # yaw
-            3.0,   # vel_x
-            3.0,   # vel_y
-            3.0,   # vel_z
-            1.0,    # roll_rate
-            1.0,    # pitch_rate
-            1.0,    # yaw_rate
+            400.0,  # pos_z
+            1.0,    # roll
+            1.0,    # pitch
+            1.0,    # yaw
+            10.0,   # vel_x
+            10.0,   # vel_y
+            10.0,   # vel_z
+            5.0,    # roll_rate
+            5.0,    # pitch_rate
+            5.0,    # yaw_rate
         ]
     )
 
@@ -92,41 +92,34 @@ def create_corridor_ocp_solver(
             1.0,   # roll_cmd
             1.0,   # pitch_cmd
             1.0,   # yaw_cmd
-            10.0,  # thrust_cmd
+            50.0,  # thrust_cmd
         ]
     )
 
     Q_e = Q.copy()
-    ocp.cost.W = np.eye(ny)
-    ocp.cost.W[:nx, :nx] = Q
-    ocp.cost.W[nx:, nx:] = R
-    ocp.cost.W_e = np.eye(ny_e) * Q_e
+    import scipy.linalg
+    ocp.cost.W = scipy.linalg.block_diag(Q, R)
+    ocp.cost.W_e = Q_e
 
-    Vx = np.eye(ny, nx)
+    Vx = np.zeros((ny, nx))
+    Vx[0:nx, 0:nx] = np.eye(nx)
     ocp.cost.Vx = Vx
 
     Vu = np.zeros((ny, nu))
-    Vu[nx:, :] = np.eye(nu)
+    Vu[nx : nx + nu, :] = np.eye(nu)
     ocp.cost.Vu = Vu
 
-    Vx_e = np.eye(ny_e, nx)
+    Vx_e = np.zeros((ny_e, nx))
+    Vx_e[0:nx, 0:nx] = np.eye(nx)
     ocp.cost.Vx_e = Vx_e
 
     ocp.cost.yref = np.zeros(ny)
     ocp.cost.yref_e = np.zeros(ny_e)
 
     # Attitude constraints: ±30 degrees roll/pitch
-    ocp.constraints.lbx = np.array([-0.8, -0.8, -0.5])
-    ocp.constraints.ubx = np.array([0.8, 0.8, 0.5])
-    ocp.constraints.idxbx = np.array([3, 4, 5])
-
-    # Soften attitude constraints to prevent infeasibility
-    ocp.constraints.idxsbx = np.array([0, 1, 2])
-    ns = 3
-    ocp.cost.Zl = 1000.0 * np.ones(ns)
-    ocp.cost.Zu = 1000.0 * np.ones(ns)
-    ocp.cost.zl = 100.0 * np.ones(ns)
-    ocp.cost.zu = 100.0 * np.ones(ns)
+    ocp.constraints.lbx = np.array([-0.5, -0.5])
+    ocp.constraints.ubx = np.array([0.5, 0.5])
+    ocp.constraints.idxbx = np.array([3, 4])
 
     # Thrust constraints
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
@@ -136,19 +129,19 @@ def create_corridor_ocp_solver(
     # Initial state
     ocp.constraints.x0 = np.zeros(nx)
 
-    # Solver options: improved numerical stability
+    # Solver options
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
     ocp.solver_options.nlp_solver_type = "SQP"
-    ocp.solver_options.nlp_solver_max_iter = 100
-    ocp.solver_options.tol = 1e-3
+    ocp.solver_options.tol = 1e-6
+
     ocp.solver_options.qp_solver_cond_N = N
-    ocp.solver_options.qp_solver_iter_max = 50
     ocp.solver_options.qp_solver_warm_start = 1
-    ocp.solver_options.qp_solver_tol_stat = 1e-2  # Relaxed
-    ocp.solver_options.qp_solver_tol_eq = 1e-2  # Relaxed
-    ocp.solver_options.qp_solver_tol_ineq = 1e-2  # Relaxed
+
+    ocp.solver_options.qp_solver_iter_max = 20
+    ocp.solver_options.nlp_solver_max_iter = 50
+
     ocp.solver_options.tf = Tf
 
     solver = AcadosOcpSolver(
