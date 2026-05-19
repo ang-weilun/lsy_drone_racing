@@ -194,7 +194,14 @@ class RewardConfig:
     # over a successful trajectory — matched by finish_bonus = 100 below
     # and 20x the v17 crash_penalty (5), restoring the positive/negative
     # balance v11 trained under.
-    progress_coef: float = 10.0
+    # v36: 10.0 -> 1.0. Strip back to Song 2023's literal gate-progress
+    # coefficient. v9-v35 used 10× scaling (so r_prog could be matched
+    # against scaled crash_penalty / finish_bonus / gate_pass_bonus
+    # event signals); v36 also strips those events back to Song's ±10
+    # values, so the 10× scaling no longer serves a purpose. Per-step
+    # r_prog at 5 m/s is now ~0.1, vs finish_bonus +10 and crash -10 —
+    # the same proportions Song trained under.
+    progress_coef: float = 1.0
     # v20: switch r_prog from the legacy distance-delta formulation
     # (||g - p_prev|| - ||g - p||) to the Song-2023 / Kaufmann-2023
     # velocity-projection variant: project the world-frame displacement
@@ -236,7 +243,17 @@ class RewardConfig:
     # but no longer dominates the speed economics. Song's b=0.01 was
     # justified for the lighter quad in his paper; our cf21B at this
     # control rate hits higher peak rates routinely.
-    omega_coef: float = 0.003
+    # v36: 0.003 -> 0.01. Codex pre-launch review flagged 0.02 (literal
+    # Song-at-50Hz) as too punitive at the v36 reward scale: with the
+    # L1 norm in reward.py at L1(ω) ≈ 5 (modest cornering) the per-step
+    # omega penalty is -0.1, exactly cancelling r_prog at 5 m/s; at
+    # L1(ω) ≈ 10 (aggressive racing) the penalty dwarfs the +10 finish.
+    # 0.01 keeps the term active as a smoothness prior (integrated
+    # -3 to -5 / episode at racing rates, comparable to +6 r_prog over
+    # a clean lap) without cancelling forward motion. v33's 0.003 was
+    # effectively zero (-1 / episode in eval), too weak to discourage
+    # thrashing.
+    omega_coef: float = 0.01
     # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0.
     # v17: back to 5.0. The v15 raise to 10.0 (combined with progress_coef
     # = 1) made the per-episode crash penalty dominate the per-episode
@@ -263,7 +280,13 @@ class RewardConfig:
     # next gate (+120 + ~50 + further events) dominates. crash_penalty=50
     # (an earlier v33 draft) still netted +170 after two gates and was
     # caught as too weak in the codex pre-launch review.
-    crash_penalty: float = 100.0
+    # v36: 100.0 -> 10.0. Strip back to Song 2023's literal crash penalty.
+    # v33 had bumped to 100 because the v33 gate_pass + exit_vel events
+    # totaled ~+200 over a successful trajectory and needed a matching-
+    # magnitude crash penalty to make bank-and-crash unprofitable. With
+    # those event bonuses removed in v36, +10 finish vs -10 crash matches
+    # Song's proportions and Song's value-function dynamics.
+    crash_penalty: float = 10.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
@@ -277,7 +300,9 @@ class RewardConfig:
     # produced learnable signal. With finish_bonus = 10 + progress_coef
     # = 1 (v15 scale) the value function targets were too small for PPO
     # to make meaningful updates (value_loss collapsed to 0.012).
-    finish_bonus: float = 100.0
+    # v36: 100.0 -> 10.0. Strip back to Song 2023's literal finish bonus.
+    # Matched 1:1 with crash_penalty above.
+    finish_bonus: float = 10.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     # v32: bump sigma from 0.2 → 0.3 m so the penalty has a meaningful
     # avoidance gradient at safe-but-close distances (old 0.2 m gave
@@ -328,7 +353,16 @@ class RewardConfig:
     # opening). 1.2× lifts the same close-graze to -0.25/step, and a
     # full second of grazing (~50 steps) costs -12.6 — outweighs the
     # marginal r_prog gain from a tighter line.
-    gate_frame_weight: float = 1.2
+    # v36: 1.2 -> 0.0. Strip the gate-frame Gaussian barrier entirely. Song
+    # 2023 has no equivalent term and explicitly relies on the value
+    # function learning that grazing-near-frame states have low value
+    # because they lead to crashes. Keeping the barrier was over-pricing
+    # tight gate-pass lines and pushing the policy onto wide approaches
+    # that brought it closer to obstacles next to the gates. Removed.
+    # The constant ``gate_frame_sigma`` is left at 0.08 in case a future
+    # version re-enables the term, but with weight=0 the barrier
+    # contribution is zero regardless of sigma.
+    gate_frame_weight: float = 0.0
     gate_frame_sigma: float = 0.08  # m
     # v9: shrink gate jackpot from 20 to 2. The v7/v8 jackpot of 20×(idx+1)
     # paid 20/40/60/80 per gate, dominating r_prog (~+0.17/step ≈ +8.5 per
@@ -349,7 +383,14 @@ class RewardConfig:
     # exact recipe + no r_guid + no seg-init) solved level-1 to 100%
     # finish from cold start in 100M steps.
     gate_pass_bonus: float = 40.0
-    use_gate_pass_bonus: bool = True
+    # v36: True -> False. Strip the per-gate jackpot. Song 2023 has no
+    # gate-pass event bonus and explicitly relies on the gate-progress
+    # term alone to drive gate-by-gate behaviour (once a gate is passed,
+    # the target switches, so the next step's progress is suddenly large
+    # — that's the implicit "bonus"). The v18 jackpot was a v15-v17
+    # cold-start scaffold; we don't need it once the value function has
+    # learned the gate sequence.
+    use_gate_pass_bonus: bool = False
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
     # jackpot. The dense progress reward already pulls the policy through
@@ -395,7 +436,13 @@ class RewardConfig:
     # arbitrary outliers (e.g. brief 10+ m/s body-frame artifacts after
     # a hard pitch) from minting one-shot rewards that destabilize the
     # value function.
-    use_exit_vel_bonus: bool = True
+    # v36: True -> False. Strip the exit-velocity bonus. Song 2023 does
+    # not use one; v33's bump to coef=10 + clip 5 m/s never produced a
+    # net-positive integrated value in eval (averaged -3 / episode in
+    # v33b, -2.3 / episode in v34, -8.6 / episode in v35) — the policy
+    # was passing gates at velocities that didn't reliably point at the
+    # next gate, so the term was a small *negative* on average. Removed.
+    use_exit_vel_bonus: bool = False
     exit_vel_coef: float = 10.0
     # Hard cap on the velocity scalar fed into the exit-velocity bonus.
     # See ``reward.step_reward``: ``r_exit_vel = exit_vel_coef *
@@ -454,15 +501,17 @@ class RewardConfig:
     # but the v33 crash_penalty=50 still makes any crash strictly
     # worse than do-nothing, so policy escape from a hover attractor
     # remains via forward motion, not suicide.
-    # v34: 0.10 -> 0.15. v33b eval traces show mean max-speed 2.2 m/s and
-    # ~6 s flight time on clean 4-gate laps; the policy is still cautious.
-    # The v33 jump from 0.05 to 0.10 widened the fast/slow lap differential
-    # to 30 reward; bumping to 0.15 widens it to 45, on the order of one
-    # gate bonus. Paired with sigma=0.5 obstacle widening to keep "fly
-    # fast through clean lines" net-positive — both terms push toward
-    # cleaner faster flight, not toward suicide (crash_penalty=100 still
-    # dominates a 500-step timeout's -75).
-    time_penalty: float = 0.15
+    # v36: 0.15 -> 0.0. Strip the explicit time penalty. Song 2023 does
+    # not use one and relies on the finish_bonus (+10) plus the discount
+    # factor γ=0.997 to bias the policy toward faster laps (earlier
+    # finish = less discounted bonus). At γ=0.997 a 200-step lap pays
+    # 10·γ^200 ≈ 5.49 while a 500-step lap pays 10·γ^500 ≈ 2.23 — a
+    # 3.26 reward differential, much larger than the v34 time_penalty's
+    # 0.15·300 = 45 *only if the policy actually finishes*. Without a
+    # time penalty, the do-nothing baseline is 0 instead of -75; combined
+    # with crash_penalty=-10 the policy still has a clear bias toward
+    # forward motion (any positive r_prog) over standing still.
+    time_penalty: float = 0.0
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -498,7 +547,17 @@ class RewardConfig:
     # of the cold-start basin. Re-enabling with the static Liu eq. 6-7
     # field (use_guide_delta_phi=False) and a bumped coefficient (see
     # ``guide_coef`` below).
-    use_guide: bool = True
+    # v36: True -> False. The Liu loiter penalty was a v15-v17 cold-start
+    # scaffold that supplied a position-dependent gradient when r_prog
+    # alone could not escape the do-nothing basin. v36 strips back to
+    # Song 2023's pure gate-progress reward, which does not have a
+    # spatial guidance term. Cold-start risk is mitigated instead by
+    # segment_init (mid-track spawn) and the Phase 2 buffer (past gate-
+    # pass replay). The codex pre-launch review caught that this default
+    # was still True after v33-v35; under the v36 stripped reward, an
+    # active r_guid would dominate the per-step magnitude and totally
+    # undermine the "strip to Song" hypothesis.
+    use_guide: bool = False
     # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
     # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
     # r_guid over a perfectly centered pass is approximately guide_coef,
@@ -683,6 +742,74 @@ class CurriculumConfig:
 
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
+
+    v36: cold-train under a Song-2023-stripped reward + the proximity-obs
+    additions from v35. v33b/v34/v35 each demonstrated that the accumulated
+    reward complexity (gate_pass jackpot, exit-vel bonus, gate-frame
+    Gaussian barrier, time penalty, 10× crash/finish events) had us in a
+    local optimum that further tuning could not escape — v35 broke the
+    obstacle:0 dominance via obs engineering but introduced new mid-track
+    failures, and tied v33b on finish_rate (6/32 vs 7/32). The hypothesis
+    for v36: our reward additions are net-negative and the cleanest path
+    forward is to revert to Song's minimal gate-progress reward and trust
+    the value function to do the safe-state work.
+
+    Per Song 2023 §"Gate Progress" (Scaramuzza et al., Science Robotics):
+    ``r(k) = ||g_k - p_{k-1}|| - ||g_k - p_k|| - b·||ω_k||`` with
+    ``b=0.01`` at 100 Hz (doubled to ``0.02`` at our 50 Hz), plus +10 on
+    finish / -10 on collision. **Nothing else.** The paper explicitly
+    argues that the value function alone learns to assign low values to
+    risky states (near gate borders), which removes the need for explicit
+    barrier penalties.
+
+    Our level-3 tracks have obstacles that Song's did not, so we keep the
+    Gaussian obstacle barrier from v33-v35 (``obstacle_weight=0.8``,
+    ``obstacle_sigma=0.5``) as our minimal addition. We also keep the v35
+    proximity obs features (dim 61) because they are observation
+    engineering, not reward — and v35 demonstrably broke the obstacle:0
+    blindness via those features.
+
+    Reward terms removed for v36:
+
+    * ``gate_pass_bonus`` (was +40 to +160 per gate; v18 cold-start
+      scaffold no longer needed).
+    * ``exit_vel_bonus`` (was up to +50 per gate; integrated *negative*
+      in every v33b / v34 / v35 eval, was paying for nothing).
+    * ``gate_frame_weight`` (was 1.2; Song uses value-function bonuses
+      not per-step barriers; this was over-pricing tight gate lines and
+      pushing the policy onto wide approaches that brought it closer to
+      obstacles next to the gates).
+    * ``time_penalty`` (was 0.15; Song relies on γ-discounted
+      finish_bonus to drive speed; explicit time penalty made the
+      do-nothing baseline negative which created suicide attractor under
+      a cold-train).
+
+    Magnitudes rescaled 10× down:
+
+    * ``progress_coef`` 10.0 -> 1.0 (Song's literal).
+    * ``crash_penalty`` 100 -> 10 (Song's literal).
+    * ``finish_bonus`` 100 -> 10 (Song's literal).
+    * ``omega_coef`` 0.003 -> 0.01. Song's literal at 50 Hz would be
+      0.02 (b=0.01 at 100 Hz, doubled for the half step rate), but
+      codex's pre-launch review flagged 0.02 as too punitive at the
+      stripped-reward scale (per-step omega penalty cancels r_prog at
+      L1(ω)=5). 0.01 keeps the term active as a smoothness prior
+      without overpowering forward motion.
+
+    Loiter penalty (Liu r_guid) explicitly disabled (``use_guide=False``).
+    Song 2023 has no spatial guidance term; cold-start risk is mitigated
+    via ``segment_init_prob=0.30`` (mid-track spawn) and
+    ``phase2_prob=0.30`` (past-gate-pass replay buffer) instead.
+
+    Cold-train (no ``--init-from``) for 500M timesteps. The reward
+    landscape is too different from v33-v35 to warm-start usefully — the
+    value function trained on +160 gate-jackpots will mispredict the
+    return distribution under +10 finish-only events. Cold-train risk
+    mitigations: keep ``segment_init_prob=0.30`` with ``segment_init_vel_mps
+    =2.5`` (v29-v33 default — phase-1 seg-init that exposed the policy
+    to mid-track approach states), keep ``phase2_prob=0.30`` with 50 M
+    warmup (phase-2 buffer of past gate-pass states). These are training
+    curriculum, not reward, and are preserved from v33-v35.
 
     v35: proximity-obs warm-start on top of v34 (which tied v33b within
     noise — 6/32 finishes vs 7/32, same obstacle:0 dominant failure mode).
@@ -870,7 +997,7 @@ def default_curriculum() -> CurriculumConfig:
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="level3_v35_proximity_obs",
+                name="level3_v36_song_stripped_cold",
                 level=3,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.2,
