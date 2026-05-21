@@ -10,7 +10,9 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+import scipy.linalg
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+from crazyflow.sim.visualize import draw_capsule, draw_line, draw_points
 from drone_models.core import load_params
 from drone_models.so_rpy import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
@@ -71,33 +73,32 @@ def create_corridor_ocp_solver(
     # State weights: prioritize position and velocity tracking (scaled down)
     Q = np.diag(
         [
-            50.0,  # pos_x
-            50.0,  # pos_y
+            200.0,  # pos_x
+            200.0,  # pos_y
             400.0,  # pos_z
-            1.0,    # roll
-            1.0,    # pitch
-            1.0,    # yaw
-            10.0,   # vel_x
-            10.0,   # vel_y
-            10.0,   # vel_z
-            5.0,    # roll_rate
-            5.0,    # pitch_rate
-            5.0,    # yaw_rate
+            1.0,  # roll
+            1.0,  # pitch
+            1.0,  # yaw
+            10.0,  # vel_x
+            10.0,  # vel_y
+            10.0,  # vel_z
+            5.0,  # roll_rate
+            5.0,  # pitch_rate
+            5.0,  # yaw_rate
         ]
     )
 
     # Input weights: smooth attitude and thrust changes (increased for smoothness)
     R = np.diag(
         [
-            1.0,   # roll_cmd
-            1.0,   # pitch_cmd
-            1.0,   # yaw_cmd
+            1.0,  # roll_cmd
+            1.0,  # pitch_cmd
+            1.0,  # yaw_cmd
             50.0,  # thrust_cmd
         ]
     )
 
     Q_e = Q.copy()
-    import scipy.linalg
     ocp.cost.W = scipy.linalg.block_diag(Q, R)
     ocp.cost.W_e = Q_e
 
@@ -290,7 +291,45 @@ class SfcMpcCorridorController(Controller):
         Args:
             sim: The simulator object.
         """
-        from crazyflow.sim.visualize import draw_line, draw_points
+        # Draw capsules (obstacles + gate boundaries)
+        if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
+            safety_margin = getattr(self.planner, "safety_margin", 0.0)
+            for cap in self.planner.capsules:
+                rgba = (
+                    np.array([1.0, 0.0, 0.0, 0.3])
+                    if cap.is_gate
+                    else np.array([0.5, 0.5, 0.5, 0.5])
+                )
+                draw_capsule(
+                    sim, cap.p1, cap.p2, radius=max(0.01, cap.radius - safety_margin), rgba=rgba
+                )
+
+        # Draw skeleton path
+        if hasattr(self.planner, "skeleton_path") and self.planner.skeleton_path is not None:
+            skeleton_pts = np.array([pt.pos for pt in self.planner.skeleton_path])
+            if len(skeleton_pts) > 1:
+                draw_line(
+                    sim,
+                    skeleton_pts,
+                    rgba=np.array([0.0, 1.0, 1.0, 0.5]),
+                    start_size=0.005,
+                    end_size=0.005,
+                )
+                draw_points(sim, skeleton_pts, rgba=np.array([0.0, 1.0, 1.0, 0.8]), size=0.01)
+
+        # Draw control points (corridor constraint optimization)
+        if hasattr(self.planner, "control_points") and self.planner.control_points is not None:
+            if len(self.planner.control_points) > 0:
+                draw_points(
+                    sim, self.planner.control_points, rgba=np.array([1.0, 0.0, 1.0, 0.8]), size=0.02
+                )
+                draw_line(
+                    sim,
+                    self.planner.control_points,
+                    rgba=np.array([1.0, 0.0, 1.0, 0.3]),
+                    start_size=0.002,
+                    end_size=0.002,
+                )
 
         # Draw full planned trajectory (100 steps into future = ~2 seconds at 50 Hz)
         full_horizon = 100
