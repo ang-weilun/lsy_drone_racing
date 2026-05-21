@@ -117,18 +117,24 @@ class SfcCorridorPlanner:
     W_JERK = 10.0
     W_CENTER = 0.01
     W_GATE_ALIGN = 30.0  # Soft cost weight on P[i±1] lateral offset from gate-normal axis.
-    GATE_TUBE_RADIUS = 0.18       # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
-    GATE_TUBE_HALF_LENGTH = 0.5   # m. Axial fence on P[i±1] from gate centre (max).
-    GATE_TUBE_AXIAL_MIN = 0.0     # m. Min axial distance, signed by side. 0 = no min (just sign convention).
-    GATE_TUBE_N_FACETS = 8        # Polyhedral facets approximating the lateral cylinder.
+    GATE_TUBE_RADIUS = 0.18  # m. Inscribed lateral fence on P[i±1] from gate-normal axis.
+    GATE_TUBE_HALF_LENGTH = 0.5  # m. Axial fence on P[i±1] from gate centre (max).
+    GATE_TUBE_AXIAL_MIN = (
+        0.0  # m. Min axial distance, signed by side. 0 = no min (just sign convention).
+    )
+    GATE_TUBE_N_FACETS = 8  # Polyhedral facets approximating the lateral cylinder.
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 2.4        # m/s. Speed ceiling on straights.
+    V_MAX_GLOBAL = 2.4  # m/s. Speed ceiling on straights.
     TILT_LIMIT_PLANNER = 0.5  # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
-    A_LONG_MAX_FACTOR = 0.53    # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
-    V_FLOOR = 0.2               # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
-    N_TOPP_SAMPLES = 200        # Number of points to sample u ∈ [0, 1] when building the schedule.
+    A_LONG_MAX_FACTOR = (
+        0.53  # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
+    )
+    V_FLOOR = (
+        0.2  # m/s. Floor on scheduled speed (avoid divide-by-near-zero in pathological curvature).
+    )
+    N_TOPP_SAMPLES = 200  # Number of points to sample u ∈ [0, 1] when building the schedule.
 
     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
         self._freq = freq
@@ -202,7 +208,7 @@ class SfcCorridorPlanner:
         pts = self._des_pos_spline(u_samples)
         dists = np.linalg.norm(pts - pos, axis=1)
         u_closest = float(u_samples[np.argmin(dists)])
-        
+
         if self._t_to_u is not None:
             roots = self._t_to_u.solve(y=u_closest, extrapolate=False)
             if len(roots) > 0:
@@ -280,7 +286,9 @@ class SfcCorridorPlanner:
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
         capsules = self._get_all_obstacle_capsules()
+        self.capsules = capsules
         corridors = self._generate_flight_corridors(skeleton_path, capsules)
+        self.corridors = corridors
 
         control_points = self._optimize_control_points(skeleton_path, corridors, current_vel)
         self._control_points = control_points
@@ -304,17 +312,13 @@ class SfcCorridorPlanner:
 
         v_start = float(np.linalg.norm(current_vel))
         try:
-            self._t_to_u, self._t_total = self._compute_time_schedule(
-                self._des_pos_spline, v_start
-            )
+            self._t_to_u, self._t_total = self._compute_time_schedule(self._des_pos_spline, v_start)
         except Exception as exc:  # noqa: BLE001 — fallback path
             logger.warning("TOPP scheduling failed (%s); falling back to uniform schedule.", exc)
             self._t_to_u = None
             self._t_total = float(np.sum(cp_dists) / self.base_speed)
 
-    def _compute_time_schedule(
-        self, spline: BSpline, v_start: float
-    ) -> tuple[CubicSpline, float]:
+    def _compute_time_schedule(self, spline: BSpline, v_start: float) -> tuple[CubicSpline, float]:
         """TOPP-style time parameterization: build a t→u cubic spline.
 
         Given a fixed-geometry BSpline over u ∈ [0, 1] and the drone's current
@@ -337,10 +341,10 @@ class SfcCorridorPlanner:
         u_k = np.linspace(0.0, 1.0, N)
 
         # --- Step 1: sample geometry at each u_k ---
-        d1 = spline.derivative(nu=1)(u_k)        # shape (N, 3)
-        d2 = spline.derivative(nu=2)(u_k)        # shape (N, 3)
-        ds_du = np.linalg.norm(d1, axis=1)       # shape (N,)
-        cross = np.cross(d1, d2)                 # shape (N, 3)
+        d1 = spline.derivative(nu=1)(u_k)  # shape (N, 3)
+        d2 = spline.derivative(nu=2)(u_k)  # shape (N, 3)
+        ds_du = np.linalg.norm(d1, axis=1)  # shape (N,)
+        cross = np.cross(d1, d2)  # shape (N, 3)
         kappa = np.linalg.norm(cross, axis=1) / np.maximum(ds_du**3, eps)
 
         # --- Step 2: lateral-accel envelope + global cap ---
@@ -694,9 +698,7 @@ class SfcCorridorPlanner:
         # the perpendicular exit_swing detour, which over-commits when the
         # drone has already started its turn.
         prev_gate_idx = self.target_gate_idx - 1
-        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(
-            self.gates_pos
-        ):
+        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(self.gates_pos):
             prev_pos = self.gates_pos[prev_gate_idx]
             prev_normal = gate_normals[prev_gate_idx]
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
@@ -855,7 +857,6 @@ class SfcCorridorPlanner:
         self.replan_events.append(evt)
         self.last_replan_event = evt
 
-
     @property
     def current_pos_ref(self) -> NDArray:
         if hasattr(self, "_t_total") and self._t_total > 0:
@@ -873,13 +874,13 @@ class SfcCorridorPlanner:
     def get_mpc_horizon_trajectory(self, N: int, dt: float) -> NDArray:
         if not hasattr(self, "_t_total") or self._t_total <= 0:
             return np.zeros((N + 1, 3))
-        
+
         traj = []
         for k in range(N + 1):
             t_k = k * dt
             pos_ref, _, _ = self.evaluate(t_k)
             traj.append(pos_ref)
-        
+
         return np.array(traj)
 
     def add_trajectory_point(self, pos: NDArray) -> None:
