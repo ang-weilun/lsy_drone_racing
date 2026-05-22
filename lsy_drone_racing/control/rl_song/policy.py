@@ -1,9 +1,20 @@
 """Flax actor/critic networks and raw-action projection utilities.
 
-PPO samples in the raw 7-dimensional action space
-``[T_raw, a1_x, a1_y, a1_z, a2_x, a2_y, a2_z]``. The downstream projection to
-the racing environment's ``[roll, pitch, yaw, thrust]`` command is deliberately
-kept out of the log-probability path.
+PPO samples in the raw 4-dimensional action space
+``[T_raw, tau_x, tau_y, tau_z]`` where ``tau`` is a local-tangent vector
+``ˢτ ∈ ℝ³`` (axis-angle increment per Schuck et al. 2025). The downstream
+projection — α_max scaling, exp to ``ΔR``, composition
+``R_target = R_current @ ΔR``, and conversion to ``[roll, pitch, yaw,
+thrust]`` — is deterministic and deliberately kept out of the
+log-probability path. ``R_current`` is read from the env's
+unnormalized drone quaternion at the time the action is applied. All
+SO(3) primitives go through :class:`jax.scipy.spatial.transform.Rotation`
+per CLAUDE.md "default to the ecosystem".
+
+References:
+----------
+Schuck, J. et al. (2025). A Primer on SO(3) Action Representations
+    in Deep RL. arXiv:2510.11103.
 """
 
 from __future__ import annotations
@@ -12,29 +23,46 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from jax import Array
+from jax.scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.rl_song.config import (
     ACTOR_OBS_DIM,
     ENV_ACTION_DIM,
     RAW_ACTION_DIM,
+    TANGENT_ALPHA_MAX_RAD,
     PPOConfig,
 )
 
 HIDDEN_SIZE: int = 256
 N_HIDDEN_LAYERS: int = 2
 THRUST_RAW_DIM: int = 1
-ROTATION_RAW_DIM: int = 6
-ROTATION_VECTOR_DIM: int = 3
+TANGENT_RAW_DIM: int = 3
 DEFAULT_INIT_LOG_STD: float = PPOConfig().init_log_std
-ROTATION_NORM_EPS: float = 1e-8
-GIMBAL_LOCK_EPS: float = 1e-6
+# Hard floor on the learned log-std parameter. v43 (Codex review): -2.0 ->
+# -2.5. σ_min = exp(-2.5) ≈ 0.082; with α_max = 0.16, the floored tangent
+# action has ‖τ_scaled‖ ≈ tanh(σ_min·√3)·α_max ≈ 0.023 rad/step (≈1.3°/step
+# ≈ 1.1 rad/s) of stochastic exploration. The previous -2.0 floor (~2 rad/s
+# residual noise) injected too much attitude dithering after the policy
+# committed to a gate-passing line — useful as a cold-start anti-collapse
+# guarantee, but precision-flight-hostile late in training. The v43 ent_coef
+# anneal (0.02 -> 0.005) and the new KL early-stop already manage early-
+# stage exploration, so the std floor's role narrows to "prevent total
+# determinism for late-stage gradient flow" — a lower magnitude suffices.
+LOG_STD_MIN: float = -2.5
+TANGENT_NORM_EPS: float = 1e-8
 LOG_TWO_PI: float = 1.8378770664093453
 LOG_TWO_PI_E: float = 2.8378770664093453
-ROT6D_IDENTITY_BIAS: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
 
 class Actor(nn.Module):
-    """Outputs ``(mu_raw, log_std_raw)`` for the 7-d action distribution."""
+    """Outputs ``(mu_raw, log_std_raw)`` for the 4-d action distribution.
+
+    The tangent head's output bias is left at zero so the initial Gaussian
+    is centered on ``ΔR = I`` (identity rotation, "command the current
+    attitude"). Zhou-2019's 6D head needed a non-zero identity bias
+    ``[1, 0, 0, 0, 1, 0]`` to land on identity after Gram-Schmidt; the
+    tangent head has ``τ = 0 ↔ I`` natively.
+    """
 
     init_log_std: float = DEFAULT_INIT_LOG_STD
 
@@ -47,10 +75,10 @@ class Actor(nn.Module):
         obs : Array, shape (..., ACTOR_OBS_DIM)
             Normalized actor observation.
 
-        Returns
+        Returns:
         -------
         mu_raw : Array, shape (..., RAW_ACTION_DIM)
-            Mean of the Gaussian over raw actions.
+            Mean of the Gaussian over raw actions ``[T_raw, tau]``.
         log_std_raw : Array, shape (..., RAW_ACTION_DIM)
             Broadcast state-independent log standard deviation.
         """
@@ -60,20 +88,17 @@ class Actor(nn.Module):
             x = nn.tanh(x)
 
         thrust_mean = nn.Dense(THRUST_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
-        rotation_mean = nn.Dense(
-            ROTATION_RAW_DIM,
-            kernel_init=nn.initializers.orthogonal(0.01),
-            bias_init=nn.initializers.constant(jnp.asarray(ROT6D_IDENTITY_BIAS)),
-        )(x)
-        mu_raw = jnp.concatenate([thrust_mean, rotation_mean], axis=-1)
+        tangent_mean = nn.Dense(TANGENT_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
+        mu_raw = jnp.concatenate([thrust_mean, tangent_mean], axis=-1)
 
         thrust_log_std = self.param(
             "log_std_thrust", nn.initializers.constant(self.init_log_std), (THRUST_RAW_DIM,)
         )
-        rotation_log_std = self.param(
-            "log_std_rotation", nn.initializers.constant(self.init_log_std), (ROTATION_RAW_DIM,)
+        tangent_log_std = self.param(
+            "log_std_tangent", nn.initializers.constant(self.init_log_std), (TANGENT_RAW_DIM,)
         )
-        log_std_raw = jnp.concatenate([thrust_log_std, rotation_log_std], axis=-1)
+        log_std_raw = jnp.concatenate([thrust_log_std, tangent_log_std], axis=-1)
+        log_std_raw = jnp.maximum(log_std_raw, LOG_STD_MIN)
         return mu_raw, jnp.broadcast_to(log_std_raw, mu_raw.shape)
 
 
@@ -89,7 +114,7 @@ class Critic(nn.Module):
         obs : Array, shape (..., ACTOR_OBS_DIM)
             Normalized critic observation.
 
-        Returns
+        Returns:
         -------
         value : Array, shape (...)
             Scalar value estimate for each leading sample.
@@ -114,11 +139,11 @@ def sample_and_log_prob(actor_params: dict, obs: Array, key: jax.Array) -> tuple
     key : jax.Array
         PRNG key for Gaussian sampling.
 
-    Returns
+    Returns:
     -------
     raw_action : Array, shape (..., RAW_ACTION_DIM)
-        Sampled raw action. This is the tensor PPO stores in the rollout
-        buffer.
+        Sampled raw action ``[T_raw, tau]``. This is the tensor PPO stores
+        in the rollout buffer.
     log_prob : Array, shape (...)
         ``Normal(mu_raw, sigma_raw).log_prob(raw_action).sum(-1)``.
     """
@@ -139,9 +164,9 @@ def log_prob_of(actor_params: dict, obs: Array, raw_action: Array) -> tuple[Arra
     obs : Array, shape (..., ACTOR_OBS_DIM)
         Normalized actor observation.
     raw_action : Array, shape (..., RAW_ACTION_DIM)
-        Action sampled from the raw 7-d Gaussian during rollout.
+        Action sampled from the raw 4-d Gaussian during rollout.
 
-    Returns
+    Returns:
     -------
     log_prob : Array, shape (...)
         Raw-space log probability.
@@ -165,7 +190,7 @@ def deterministic_raw_action(actor_params: dict, obs: Array) -> Array:
     obs : Array, shape (..., ACTOR_OBS_DIM)
         Normalized actor observation.
 
-    Returns
+    Returns:
     -------
     raw_action : Array, shape (..., RAW_ACTION_DIM)
         Deterministic raw action equal to the Gaussian mean.
@@ -175,46 +200,87 @@ def deterministic_raw_action(actor_params: dict, obs: Array) -> Array:
     return mu_raw
 
 
-def raw_to_env_action(raw_action: Array, thrust_min: float, thrust_max: float) -> Array:
-    """Project a raw 7-vector to the env's attitude command.
+def raw_to_env_action(
+    raw_action: Array,
+    quat_xyzw: Array,
+    thrust_min: float,
+    thrust_max: float,
+    alpha_max: float = TANGENT_ALPHA_MAX_RAD,
+) -> Array:
+    """Project a raw 4-vector + current quaternion to the env's attitude command.
 
     Parameters
     ----------
     raw_action : Array, shape (..., RAW_ACTION_DIM)
-        Raw policy action ``[T_raw, a1, a2]``.
+        Raw policy action ``[T_raw, tau_x, tau_y, tau_z]``.
+    quat_xyzw : Array, shape (..., 4)
+        Current drone body orientation as an xyzw quaternion. Read from
+        the env state at the same step the action is applied, so the
+        composed target ``R_t · ΔR`` tracks the realized attitude.
     thrust_min : float
         Minimum total thrust in newtons.
     thrust_max : float
         Maximum total thrust in newtons.
+    alpha_max : float, optional
+        Per-step rotation budget (rad) on ``‖τ_scaled‖``. Defaults to
+        :data:`TANGENT_ALPHA_MAX_RAD`.
 
-    Returns
+    Returns:
     -------
     env_action : Array, shape (..., ENV_ACTION_DIM)
         Environment command ``[roll, pitch, yaw, thrust]``.
 
-    Notes
+    Notes:
     -----
-    The Gram-Schmidt and Euler conversion are deterministic transforms outside
-    PPO's log-probability computation.
+    All SO(3) primitives — exp from the tangent vector, composition with
+    the current orientation, and conversion to extrinsic xyz Euler — go
+    through :class:`jax.scipy.spatial.transform.Rotation`. The α_max
+    scaling and thrust squash are pure JAX. Everything here is
+    deterministic and outside PPO's log-probability computation.
     """
     _validate_last_dim(raw_action, RAW_ACTION_DIM, "raw_action")
+    _validate_last_dim(quat_xyzw, 4, "quat_xyzw")
+
     thrust_raw = raw_action[..., :THRUST_RAW_DIM]
-    rotation_raw = raw_action[..., THRUST_RAW_DIM:]
-    a1 = rotation_raw[..., :ROTATION_VECTOR_DIM]
-    a2 = rotation_raw[..., ROTATION_VECTOR_DIM:]
+    tangent_raw = raw_action[..., THRUST_RAW_DIM:]
 
     thrust_range = thrust_max - thrust_min
     thrust = thrust_min + thrust_range * 0.5 * (jnp.tanh(thrust_raw) + 1.0)
 
-    r1 = a1 / (jnp.linalg.norm(a1, axis=-1, keepdims=True) + ROTATION_NORM_EPS)
-    r2_unscaled = a2 - jnp.sum(r1 * a2, axis=-1, keepdims=True) * r1
-    r2 = r2_unscaled / (jnp.linalg.norm(r2_unscaled, axis=-1, keepdims=True) + ROTATION_NORM_EPS)
-    r3 = jnp.cross(r1, r2, axis=-1)
-    rotation_matrix = jnp.stack([r1, r2, r3], axis=-1)
-    euler_xyz = _matrix_to_euler_xyz(rotation_matrix)
+    tau_scaled = scale_tangent(tangent_raw, alpha_max)
+    delta_rotation = Rotation.from_rotvec(tau_scaled).as_matrix()
+    rotation_current = Rotation.from_quat(quat_xyzw).as_matrix()
+    rotation_target = jnp.einsum("...ij,...jk->...ik", rotation_current, delta_rotation)
+    euler_xyz = Rotation.from_matrix(rotation_target).as_euler("xyz")
+
     env_action = jnp.concatenate([euler_xyz, thrust], axis=-1)
     _validate_last_dim(env_action, ENV_ACTION_DIM, "env_action")
     return env_action
+
+
+def scale_tangent(tangent_raw: Array, alpha_max: float) -> Array:
+    """Squash ``tangent_raw`` so ``‖τ_scaled‖ ≤ alpha_max``.
+
+    Parameters
+    ----------
+    tangent_raw : Array, shape (..., 3)
+        Unbounded network output for the tangent vector.
+    alpha_max : float
+        Per-step rotation budget in radians.
+
+    Returns:
+    -------
+    Array, shape (..., 3)
+        Tangent vector with norm bounded by ``alpha_max`` and direction
+        preserved. Saturates smoothly via ``tanh(‖τ_raw‖)``; per Schuck
+        2025 Hypothesis 5 this removes the wrap-around degeneracy where
+        ``‖τ‖`` larger than ``α_max`` maps to the same rotation as
+        ``α_max · τ̂``.
+    """
+    norm = jnp.linalg.norm(tangent_raw, axis=-1, keepdims=True)
+    safe_norm = jnp.maximum(norm, TANGENT_NORM_EPS)
+    scale = jnp.tanh(norm) * alpha_max / safe_norm
+    return tangent_raw * scale
 
 
 def _normal_log_prob(mu: Array, log_std: Array, action: Array) -> Array:
@@ -222,50 +288,6 @@ def _normal_log_prob(mu: Array, log_std: Array, action: Array) -> Array:
     variance_scaled = jnp.square((action - mu) / jnp.exp(log_std))
     per_dim_log_prob = -0.5 * (variance_scaled + 2.0 * log_std + LOG_TWO_PI)
     return jnp.sum(per_dim_log_prob, axis=-1)
-
-
-def _matrix_to_euler_xyz(rotation_matrix: Array) -> Array:
-    """Convert a 3x3 rotation matrix to extrinsic xyz Euler angles in pure JAX.
-
-    Parameters
-    ----------
-    rotation_matrix : Array, shape (..., 3, 3)
-        Orthonormal matrix produced by Gram-Schmidt of the 6D rotation head.
-
-    Returns
-    -------
-    Array, shape (..., 3)
-        Extrinsic xyz Euler angles ``[roll, pitch, yaw]``. Matches the
-        convention of
-        ``scipy.spatial.transform.Rotation.from_matrix(R).as_euler('xyz')``
-        and therefore the env's
-        ``Rotation.from_euler('xyz', rpy).as_quat()`` round-trip.
-
-    Notes
-    -----
-    Hand-rolled rather than calling
-    ``jax.scipy.spatial.transform.Rotation.from_matrix`` then ``.as_euler``
-    because the scipy wrapper goes through ``np.vectorize`` and adds ~70 s of
-    overhead per training run in the PPO rollout's hot path. Per CLAUDE.md
-    "Reimplement only when the library is incompatible with our constraints
-    (real-time budget)" — cProfile data justifies the exemption.
-
-    The gimbal-lock branch follows scipy's convention: when
-    ``|cos(pitch)| < GIMBAL_LOCK_EPS`` we set ``roll = 0`` and absorb the
-    residual rotation into ``yaw``.
-    """
-    sin_beta = -rotation_matrix[..., 2, 0]
-    cos_beta = jnp.sqrt(
-        jnp.square(rotation_matrix[..., 0, 0]) + jnp.square(rotation_matrix[..., 1, 0])
-    )
-    beta = jnp.arctan2(sin_beta, cos_beta)
-    alpha = jnp.arctan2(rotation_matrix[..., 2, 1], rotation_matrix[..., 2, 2])
-    gamma = jnp.arctan2(rotation_matrix[..., 1, 0], rotation_matrix[..., 0, 0])
-    gimbal_lock = cos_beta < GIMBAL_LOCK_EPS
-    alpha = jnp.where(gimbal_lock, jnp.zeros_like(alpha), alpha)
-    gamma_locked = jnp.arctan2(-rotation_matrix[..., 0, 1], rotation_matrix[..., 1, 1])
-    gamma = jnp.where(gimbal_lock, gamma_locked, gamma)
-    return jnp.stack([alpha, beta, gamma], axis=-1)
 
 
 def _validate_last_dim(array: Array, expected_dim: int, name: str) -> None:

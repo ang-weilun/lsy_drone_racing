@@ -9,10 +9,20 @@ from typing import Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
-from lsy_drone_racing.control.rl_song.config import ENV_ACTION_DIM, RewardConfig
-from lsy_drone_racing.control.rl_song.policy import Critic, raw_to_env_action, sample_and_log_prob
+from lsy_drone_racing.control.rl_song.config import (
+    ENV_ACTION_DIM,
+    TANGENT_ALPHA_MAX_RAD,
+    RewardConfig,
+)
+from lsy_drone_racing.control.rl_song.policy import (
+    Critic,
+    raw_to_env_action,
+    sample_and_log_prob,
+    scale_tangent,
+)
 from lsy_drone_racing.control.rl_song.reward import step_reward
 from lsy_drone_racing.envs.race_core import EnvData, _reset_env_data
 from lsy_drone_racing.envs.race_core import obs as race_core_obs
@@ -60,6 +70,11 @@ class RolloutStaticConfig:
         Uniform reset-velocity perturbation half-width in meters per second.
     reset_yaw_perturb_rad : float
         Uniform reset-yaw perturbation half-width in radians.
+    tangent_alpha_max_rad : float
+        Per-step rotation budget on ``‖τ_scaled‖`` (rad). One source of
+        truth for both the env-action projection inside ``scan_step`` and
+        the diagnostic tangent-norm logging. See
+        :data:`lsy_drone_racing.control.rl_song.config.TANGENT_ALPHA_MAX_RAD`.
     """
 
     n_steps: int
@@ -71,6 +86,7 @@ class RolloutStaticConfig:
     reset_pos_perturb_m: float = 0.0
     reset_vel_perturb_mps: float = 0.0
     reset_yaw_perturb_rad: float = 0.0
+    tangent_alpha_max_rad: float = TANGENT_ALPHA_MAX_RAD
     # v9 (Song 2023 §III-B Phase 1) segment initialization. With probability
     # ``segment_init_prob``, an env that just reset is re-spawned hovering
     # at the midpoint of a uniformly-random path segment with target_gate
@@ -226,7 +242,7 @@ class RolloutScanOutputs(NamedTuple):
     Fields
     ------
     actor_obs, critic_obs : Array, shape (n_steps, n_envs, obs_dim)
-    raw_actions : Array, shape (n_steps, n_envs, 7)
+    raw_actions : Array, shape (n_steps, n_envs, RAW_ACTION_DIM)
     logprobs, rewards, dones, values : Array, shape (n_steps, n_envs)
     reward_components : dict[str, Array]
         Per-component reward arrays, each shaped ``(n_steps, n_envs)``.
@@ -238,6 +254,17 @@ class RolloutScanOutputs(NamedTuple):
         Per-step Phase 2 buffer-write candidates. Folded into the buffer
         once after the scan in ``_apply_phase2_writes``; the in-scan body
         only emits them so the write itself doesn't run ``n_steps`` times.
+    tangent_raw_norm : Array, shape (n_steps, n_envs)
+        ``‖raw_action[..., 1:]‖``. Diagnostic for whether the network
+        output is saturating against ``tanh``: a mean ≫ 1 means the
+        scaling's ``tanh`` is near its asymptote and the policy gradient
+        on the tangent direction is attenuated.
+    tangent_scaled_norm : Array, shape (n_steps, n_envs)
+        ``‖scale_tangent(raw_action[..., 1:], α_max)‖`` ∈ ``[0, α_max]``.
+        Diagnostic for the per-step rotation budget the policy is
+        actually using. Mean ≪ α_max means the budget is over-sized
+        (too conservative); peak near α_max means saturation against
+        the budget — the α_max sweep should bump the cap.
     """
 
     actor_obs: Array
@@ -254,6 +281,8 @@ class RolloutScanOutputs(NamedTuple):
     p2_event_valid: Array
     p2_event_slot: Array
     p2_event_data: Array
+    tangent_raw_norm: Array
+    tangent_scaled_norm: Array
 
 
 class RolloutMetricSums(NamedTuple):
@@ -502,7 +531,20 @@ def scan_rollout(
         rng_key, action_key = jax.random.split(carry.rng_key)
         raw_action, logprob = sample_and_log_prob(actor_params, actor_obs, action_key)
         value = Critic().apply({"params": critic_params}, critic_obs)
-        env_action = raw_to_env_action(raw_action, static_cfg.thrust_min, static_cfg.thrust_max)
+        env_action = raw_to_env_action(
+            raw_action,
+            env_obs["quat"],
+            static_cfg.thrust_min,
+            static_cfg.thrust_max,
+            alpha_max=static_cfg.tangent_alpha_max_rad,
+        )
+        # Tangent-norm diagnostics. Kept here (rather than computed
+        # post-hoc from ``raw_actions``) so the scaled-norm reuses the
+        # same ``alpha_max`` the env action was projected with.
+        tangent_raw = raw_action[..., 1:]
+        tangent_scaled = scale_tangent(tangent_raw, static_cfg.tangent_alpha_max_rad)
+        tangent_raw_norm = jnp.linalg.norm(tangent_raw, axis=-1)
+        tangent_scaled_norm = jnp.linalg.norm(tangent_scaled, axis=-1)
 
         stepped_data, (next_obs_full, _, terminated_full, truncated_full, _) = env_step_fn(
             carry.env_data, env_action
@@ -660,6 +702,8 @@ def scan_rollout(
             p2_event_valid=p2_event_valid,
             p2_event_slot=p2_event_slot,
             p2_event_data=p2_event_data,
+            tangent_raw_norm=tangent_raw_norm,
+            tangent_scaled_norm=tangent_scaled_norm,
         )
         return next_carry, transition
 
@@ -812,10 +856,9 @@ def _apply_reset_perturbation(
        replay, Phase 1 seg-init, or true start. Apply each branch on
        its mask.
     """
-    # Snapshot the toml start position before any perturbation is applied.
-    # ``_apply_segment_init`` consumes this as the segment-0 anchor.
-    start_pos = env_data.sim_data.states.pos
-
+    # v41: dropped ``start_pos`` snapshot — seg-init now uses the target
+    # gate's pose as the only anchor for spawn geometry, not the spawn
+    # position. See ``_apply_segment_init`` docstring.
     if static_cfg.reset_perturbation_enabled:
         rng_key, pos_key, vel_key, yaw_key = jax.random.split(rng_key, RESET_RNG_SPLITS)
         states = env_data.sim_data.states
@@ -888,7 +931,7 @@ def _apply_reset_perturbation(
     # ``build_full_track_randomization_fn`` (upstream PR #91).
     if static_cfg.segment_init_prob > 0.0:
         env_data, rng_key = _apply_segment_init(
-            env_data, do_seg_desired, rng_key, start_pos, static_cfg
+            env_data, do_seg_desired, rng_key, static_cfg
         )
         do_seg = do_seg_desired
     else:
@@ -1057,30 +1100,32 @@ def _apply_segment_init(
     env_data: EnvData,
     do_seg: Array,
     rng_key: Array,
-    start_pos: Array,
     static_cfg: RolloutStaticConfig,
 ) -> tuple[EnvData, Array]:
-    """Re-spawn the envs identified by ``do_seg`` at random segment centers.
+    """Re-spawn the envs identified by ``do_seg`` at the target gate's entry waypoint.
 
     Pure-JAX counterpart of ``RLSongVecEnv._apply_segment_init`` used inside
     the scanned rollout path. Both branches must produce the same
     state-distribution semantics for the policy. Implements Song 2023
     §III-B Phase 1 (state-coverage initial-state distribution).
 
-    Segment anchors come from ``env_data.nominal_gates_pos`` (Layer-1
-    pre-wobble), set by the framework's full-track randomization in
+    Segment anchors come from ``env_data.nominal_gates_pos`` /
+    ``env_data.nominal_gates_quat`` (Layer-1 pre-wobble), set by the
+    framework's full-track randomization in
     ``build_full_track_randomization_fn`` (upstream PR #91).
 
-    Selection is now done by the caller (``_apply_reset_perturbation``)
-    via a three-way categorical that also dispatches Phase 2 replay; this
-    function only applies the override on the envs the caller pre-selected.
+    Selection is done by the caller (``_apply_reset_perturbation``) via a
+    three-way categorical that also dispatches Phase 2 replay; this function
+    only applies the override on the envs the caller pre-selected.
 
-    v29: when ``static_cfg.segment_init_vel_mps > 0`` the seg-init re-spawn
-    velocity is set to ``segment_init_vel_mps * unit(next_gate -
-    prev_anchor)`` instead of zero. Removes the trivially-exploitable
-    "spawned hovering at a convenient midpoint" state distribution that
-    caused v24's lucky-zone collapse, while still putting the policy at
-    later-gate approach poses.
+    v41: spawn at the target gate's entry waypoint
+    ``nominal_gate_pos - lookahead_entry_offset_m * gate_+x_local_world``
+    with velocity ``segment_init_vel_mps * gate_+x_local_world``. Replaces
+    v29's "midpoint of (prev_gate, next_gate) with velocity along the
+    straight line between them," which was correct by accident for gates
+    whose traversal axis happens to align with the line from the previous
+    gate (segments 0, 2, 3 on level 1) and ~90° wrong for the U-turn gate
+    (segment 1). See full diagnosis in the inline comment below.
 
     Parameters
     ----------
@@ -1092,10 +1137,9 @@ def _apply_segment_init(
         ``SRC_PHASE1_SEG`` in the source enum.
     rng_key : Array
         PRNG key; consumed and returned.
-    start_pos : Array, shape (n_envs, n_drones, 3)
-        Pre-perturbation drone position used as the segment-0 anchor.
     static_cfg : RolloutStaticConfig
-        Provides ``segment_init_perturb_m`` and ``segment_init_vel_mps``.
+        Provides ``segment_init_perturb_m``, ``segment_init_vel_mps``,
+        and ``reward_cfg.lookahead_entry_offset_m``.
 
     Returns
     -------
@@ -1109,28 +1153,57 @@ def _apply_segment_init(
     n_envs = env_data.gates_pos.shape[0]
     n_gates = env_data.gates_pos.shape[1]
     nominal_gates_pos = env_data.nominal_gates_pos
+    nominal_gates_quat = env_data.nominal_gates_quat
     segment_idx = jax.random.randint(seg_key, shape=(n_envs,), minval=0, maxval=n_gates)
     env_arange = jnp.arange(n_envs)
-    prev_idx = jnp.clip(segment_idx - 1, 0, n_gates - 1)
-    prev_gate = nominal_gates_pos[env_arange, prev_idx]
-    prev_anchor = jnp.where((segment_idx == 0)[:, None], start_pos[:, 0, :], prev_gate)
     next_gate = nominal_gates_pos[env_arange, segment_idx]
-    midpoint = 0.5 * (prev_anchor + next_gate)
+    next_gate_quat = nominal_gates_quat[env_arange, segment_idx]
+
+    # v41: replace straight-line midpoint+direction geometry with gate-frame
+    # entry geometry. The legacy seg-init placed the drone at
+    # ``midpoint(prev_gate, next_gate)`` with velocity in
+    # ``unit(next_gate - prev_gate)`` — but the straight-line direction
+    # between consecutive nominal gate positions is only coincidentally
+    # aligned with the gate's traversal axis. For level 1's U-turn,
+    # gate 1's ``+x_local`` axis points world (-0.70, +0.71, 0) while
+    # ``unit(g0 -> g1)`` points world (+0.62, +0.56, +0.56) — cos angle
+    # ≈ -0.04 (92° off). Segment-1 seg-init spawns the drone perpendicular
+    # to gate 1's traversal axis, so the drone almost never passes through
+    # gate 1 from a segment-1 spawn (Phase 2 buffer slot 2 stayed empty
+    # across all 14 v38 runs at 200M+ steps each, while slot 3 saturated
+    # at 4096 within 40M because segment-2's direction happens to align
+    # well with gate 2's traversal axis).
+    # The fix replicates segment-2's accidentally-correct behaviour for
+    # every gate: spawn at the gate's *entry waypoint*
+    # ``next_gate_pos - entry_offset · gate_+x_local_world`` with
+    # velocity ``vel_mps · gate_+x_local_world``. The drone now arrives
+    # at the entry side of every target gate with velocity aimed through
+    # the aperture in the traversal direction, so a competent policy
+    # passes the gate naturally (and the Phase 2 buffer slot for the
+    # PRE-gate state gets fed).
+    # The ``prev_anchor`` / ``prev_idx`` machinery is no longer needed —
+    # the entry geometry depends only on the next gate's pose, not on the
+    # previous one. The ``start_pos`` parameter was removed from the
+    # signature alongside this change.
+    # ``Rotation.apply`` rotates the +x_local unit vector into world frame
+    # without materializing the full 3x3 matrix — equivalent to ``R[:, 0]``
+    # but reads only what's needed. Per [[feedback-jax-scipy-rotation]] use
+    # jax.scipy in new code rather than the hot-path ``obs._quat_to_matrix``
+    # exemption (this fires once per env reset, not per env step).
+    gate_xaxis_world = Rotation.from_quat(next_gate_quat).apply(
+        jnp.array([1.0, 0.0, 0.0])
+    )  # (n_envs, 3); gate's traversal axis in world
+    entry_offset_m = static_cfg.reward_cfg.lookahead_entry_offset_m
+    entry_waypoint = next_gate - entry_offset_m * gate_xaxis_world
     jitter = jax.random.uniform(
         jit_key,
         shape=(n_envs, 3),
         minval=-static_cfg.segment_init_perturb_m,
         maxval=static_cfg.segment_init_perturb_m,
     )
-    new_pos = jnp.clip(midpoint + jitter, env_data.pos_limit_low, env_data.pos_limit_high)
+    new_pos = jnp.clip(entry_waypoint + jitter, env_data.pos_limit_low, env_data.pos_limit_high)
 
-    # v29: velocity-aware seg-init. Compute unit direction from prev anchor
-    # to next gate; scale by segment_init_vel_mps. Falls back to zero
-    # velocity when the speed is 0 (original Song §III-B behavior).
-    direction = next_gate - prev_anchor
-    direction_norm = jnp.linalg.norm(direction, axis=-1, keepdims=True)
-    unit_direction = direction / jnp.maximum(direction_norm, 1e-6)
-    seg_vel = static_cfg.segment_init_vel_mps * unit_direction  # (n_envs, 3)
+    seg_vel = static_cfg.segment_init_vel_mps * gate_xaxis_world  # (n_envs, 3)
 
     states = env_data.sim_data.states
     mask_b3 = do_seg[:, None, None]

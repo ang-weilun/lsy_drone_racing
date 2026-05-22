@@ -1,10 +1,11 @@
 """Train the Song-2023 JAX PPO drone-racing controller.
 
 This module follows CleanRL's single-file PPO style, adapted to the racing
-controller's raw 7-dimensional action distribution and asymmetric actor/critic
+controller's raw 4-dimensional action distribution (thrust scalar + 3-vec
+local-tangent rotation per Schuck 2025) and asymmetric actor/critic
 observation interface.
 
-References
+References:
 ----------
 Huang, S. et al. CleanRL ``ppo_continuous_action_jax.py``.
 Song, Y. et al. (2023). Reaching the limit in autonomous racing.
@@ -30,9 +31,20 @@ import wandb
 from flax.training.train_state import TrainState
 from jax import Array
 
+# v40: enable TensorFloat-32 matmuls. The Blackwell tensor cores on the RTX
+# PRO 6000 WS run TF32 ~1.5-2x faster than FP32 with no impact on PPO
+# numerics: TF32 keeps the FP32 exponent (10 bits) and truncates the mantissa
+# to 10 bits, giving ~3 decimal digits of precision — well above the
+# clip_coef=0.2 ratio resolution and the value-loss epsilon. Set before any
+# tracing so all jitted matmuls inherit it. JAX's
+# ``jax_default_matmul_precision`` covers Dense, attention, and the rotation
+# matrix einsums in the action head; non-matmul ops stay at FP32.
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+
 from lsy_drone_racing.control.rl_song.config import (
     ACTOR_OBS_DIM,
     RAW_ACTION_DIM,
+    TANGENT_ALPHA_MAX_RAD,
     PPOConfig,
     TrainConfig,
 )
@@ -88,6 +100,13 @@ class CLIArgs:
     # re-bloom entropy by ~10 units before annealing back down, wasting
     # 100-200M steps. Set 0.001 to keep the policy committed.
     ent_coef_start: float | None = None
+    # Override the per-step rotation budget ``‖τ_scaled‖ ≤ α_max`` (rad). The
+    # default (``TrainConfig.tangent_alpha_max_rad`` = :data:`TANGENT_ALPHA_MAX_RAD`)
+    # is 0.04 rad ≈ 2.3°/step at 50 Hz — conservative per Schuck 2025 Hyp. 1.
+    # Sweep ``{0.04, 0.08, 0.16}`` to find the cornering-vs-precision sweet
+    # spot for the active track; ``tangent/saturation_fraction`` rising past
+    # ~0.5 is the wandb signal to bump α_max.
+    alpha_max_rad: float | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -338,11 +357,15 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         ppo_cfg = replace(ppo_cfg, gamma=args.gamma)
     if args.ent_coef_start is not None:
         ppo_cfg = replace(ppo_cfg, ent_coef=args.ent_coef_start)
+    alpha_max = cfg.tangent_alpha_max_rad if args.alpha_max_rad is None else args.alpha_max_rad
+    if alpha_max <= 0.0:
+        raise ValueError(f"alpha_max_rad must be positive; got {alpha_max}")
     return replace(
         cfg,
         ppo=ppo_cfg,
         seed=args.seed,
         initial_stage_index=args.stage - 1,
+        tangent_alpha_max_rad=alpha_max,
         wandb_project=args.wandb_project or cfg.wandb_project,
         wandb_entity=args.wandb_entity,
         run_name=args.run_name,
@@ -443,7 +466,9 @@ def _collect_rollout(
     env.rng_key = scan_result.reset_rng_key
     env.current_env_obs = scan_result.next_env_obs
     env.prev_env_obs = scan_result.next_env_obs
-    metrics = _rollout_metrics(scan_result.outputs, scan_result.metrics)
+    metrics = _rollout_metrics(
+        scan_result.outputs, scan_result.metrics, env.train_cfg.tangent_alpha_max_rad
+    )
     # Surface per-gate buffer fill for wandb. Slot 0 is unused; we still
     # log it (it stays at 0) so the histogram axis labels are consistent.
     phase2_fill = np.asarray(scan_result.phase2_buffer.fill)
@@ -514,11 +539,14 @@ def _rollout_static_config(
         segment_init_vel_mps=env.stage.segment_init_vel_mps,
         phase2_prob=phase2_prob,
         phase2_capacity_per_gate=env.stage.phase2_capacity_per_gate,
+        tangent_alpha_max_rad=env.train_cfg.tangent_alpha_max_rad,
     )
 
 
 def _rollout_metrics(
-    outputs: RolloutScanOutputs, metric_sums: RolloutMetricSums
+    outputs: RolloutScanOutputs,
+    metric_sums: RolloutMetricSums,
+    tangent_alpha_max_rad: float = TANGENT_ALPHA_MAX_RAD,
 ) -> dict[str, float]:
     """Convert scanned rollout tensors into Python logging metrics."""
     completed_count = metric_sums.completed_count
@@ -545,6 +573,29 @@ def _rollout_metrics(
         metrics[f"finish_rate_{src}"] = float(np.asarray(src_finished / src_denominator))
     for key, value_component in outputs.reward_components.items():
         metrics[key] = float(np.asarray(jnp.mean(value_component)))
+    # Tangent-norm diagnostics for the Schuck-2025 ˢτ action head.
+    # ``tangent_raw_norm_mean``     — mean of ``‖raw_action[..., 1:]‖`` over the
+    #     rollout. Below ~1 means the post-``tanh`` scaling is in its linear
+    #     regime and the policy gradient on the tangent direction is intact;
+    #     well above 1 means saturation against ``tanh`` and the network is
+    #     producing the same scaled vector for very different raw vectors.
+    # ``tangent_scaled_norm_mean``  — mean rotation budget actually used per
+    #     step (radians). Compare against ``α_max``; ratio near 1 means the
+    #     policy wants more budget, ratio ≪ 1 means α_max is over-sized for
+    #     the task and the precision/exploration trade-off favours shrinking
+    #     it (or letting the policy commit faster).
+    # ``tangent_saturation_fraction`` — fraction of steps with
+    #     ``‖τ_scaled‖ > 0.95·α_max``. Crosses ~0.5 → bump α_max in the
+    #     follow-up sweep (handoff §7.5 + §5.2).
+    saturation_threshold = 0.95 * tangent_alpha_max_rad
+    metrics["tangent_raw_norm_mean"] = float(np.asarray(jnp.mean(outputs.tangent_raw_norm)))
+    metrics["tangent_scaled_norm_mean"] = float(np.asarray(jnp.mean(outputs.tangent_scaled_norm)))
+    metrics["tangent_saturation_fraction"] = float(
+        np.asarray(
+            jnp.mean((outputs.tangent_scaled_norm > saturation_threshold).astype(jnp.float32))
+        )
+    )
+    metrics["tangent_alpha_max_rad"] = tangent_alpha_max_rad
     return metrics
 
 
@@ -576,7 +627,7 @@ def _compute_gae(
     gamma, gae_lambda : float
         PPO discount and GAE lambda.
 
-    Returns
+    Returns:
     -------
     advantages, returns : tuple[Array, Array]
         Arrays shaped ``(n_steps, n_envs)``.
@@ -621,7 +672,7 @@ def _current_ent_coef(ppo_cfg: PPOConfig, iteration: int) -> float:
     iteration : int
         One-indexed PPO iteration number.
 
-    Returns
+    Returns:
     -------
     float
         Entropy coefficient for this iteration.
@@ -654,8 +705,22 @@ def _update_policy(
         "updates": 0.0,
     }
     ent_coef_jax = jnp.asarray(ent_coef, dtype=jnp.float32)
+    # v43 (Codex review): SB3-style KL early-stop. After each epoch, compare
+    # the per-epoch mean of the Schulman unbiased KL estimator
+    # ``mean((r - 1) - log(r))`` against ``1.5 · target_kl``; if exceeded,
+    # break out before running further epochs. Directly attacks the
+    # v38-v42 failure mode where a single iteration's full 5-epoch update
+    # confidently moved the policy away from gate-1 attempts. Disabled
+    # when ``target_kl <= 0``. The 1.5× multiplier matches the SB3
+    # convention; raising the multiplier loosens, lowering tightens.
+    kl_stop_threshold = 1.5 * ppo_cfg.target_kl
+    kl_stop_enabled = ppo_cfg.target_kl > 0.0
+    epochs_run = 0
+    kl_stopped = False
 
     for _ in range(ppo_cfg.update_epochs):
+        epoch_kl_sum = 0.0
+        epoch_kl_count = 0
         rng.shuffle(batch_indices)
         for start in range(0, batch_size, ppo_cfg.minibatch_size):
             end = start + ppo_cfg.minibatch_size
@@ -668,13 +733,22 @@ def _update_policy(
                 if key != "updates":
                     metrics_accum[key] += float(np.asarray(metrics[key]))
             metrics_accum["updates"] += 1.0
+            epoch_kl_sum += float(np.asarray(metrics["approx_kl"]))
+            epoch_kl_count += 1
+        epochs_run += 1
+        if kl_stop_enabled and epoch_kl_count > 0:
+            epoch_kl_mean = epoch_kl_sum / epoch_kl_count
+            if epoch_kl_mean > kl_stop_threshold:
+                kl_stopped = True
+                break
 
     update_count = max(metrics_accum["updates"], 1.0)
-    return (
-        actor_state,
-        critic_state,
-        {key: value / update_count for key, value in metrics_accum.items() if key != "updates"},
-    )
+    averaged = {
+        key: value / update_count for key, value in metrics_accum.items() if key != "updates"
+    }
+    averaged["epochs_run"] = float(epochs_run)
+    averaged["kl_stopped"] = float(kl_stopped)
+    return (actor_state, critic_state, averaged)
 
 
 @partial(jax.jit, static_argnums=4)
@@ -825,6 +899,8 @@ def _log_iteration(
         "losses/old_approx_kl": train_metrics["old_approx_kl"],
         "losses/approx_kl": train_metrics["approx_kl"],
         "losses/clip_fraction": train_metrics["clip_fraction"],
+        "losses/epochs_run": train_metrics.get("epochs_run", ppo_cfg.update_epochs),
+        "losses/kl_stopped": train_metrics.get("kl_stopped", 0.0),
         "charts/ent_coef": train_metrics.get("ent_coef", ppo_cfg.ent_coef),
         "rollout/ep_ret": rollout_metrics["ep_ret"],
         "rollout/ep_len": rollout_metrics["ep_len"],
@@ -833,6 +909,10 @@ def _log_iteration(
         "rollout/max_gate": rollout_metrics["max_gate_mean"],
         "rollout/crash_rate": rollout_metrics["crash_rate"],
         "rollout/finish_rate": rollout_metrics["finish_rate"],
+        "tangent/raw_norm_mean": rollout_metrics["tangent_raw_norm_mean"],
+        "tangent/scaled_norm_mean": rollout_metrics["tangent_scaled_norm_mean"],
+        "tangent/saturation_fraction": rollout_metrics["tangent_saturation_fraction"],
+        "tangent/alpha_max_rad": rollout_metrics["tangent_alpha_max_rad"],
     }
     for src in ("true_start", "phase1_seg", "phase2_replay"):
         log_data[f"rollout/finish_rate_{src}"] = rollout_metrics[f"finish_rate_{src}"]
@@ -883,7 +963,7 @@ def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
         ``step_NNNNNNNNNNNN`` Orbax checkpoint subdirectories. The latest
         checkpoint in the directory is loaded.
 
-    Returns
+    Returns:
     -------
     dict[str, Any]
         Restored checkpoint mapping (full pytree). Callers should pick out
@@ -891,7 +971,7 @@ def _load_init_checkpoint(init_from: str) -> dict[str, Any]:
         the keys (opt state, stage index, RNG keys, step counters) are
         ignored on purpose so warm-start runs begin with a fresh schedule.
 
-    Raises
+    Raises:
     ------
     FileNotFoundError
         If ``init_from`` does not exist or contains no checkpoints.
@@ -929,13 +1009,13 @@ def _pad_first_dense_for_obs_grow(params: dict, target_in_dim: int) -> dict:
     target_in_dim : int
         Current model's obs dimensionality (``ACTOR_OBS_DIM``).
 
-    Returns
+    Returns:
     -------
     dict
         Shallow-copy of ``params`` with ``Dense_0/kernel`` zero-padded
         along axis 0 if needed.
 
-    Raises
+    Raises:
     ------
     KeyError
         If ``Dense_0`` is absent from ``params`` — a no-op return is
@@ -988,13 +1068,13 @@ def _extend_normalizer_for_obs_grow(
     target_dim : int
         Current model's obs dimensionality.
 
-    Returns
+    Returns:
     -------
     NormalizerState
         Extended normalizer. No-op when the input is already at
         ``target_dim``.
 
-    Raises
+    Raises:
     ------
     ValueError
         If the loaded normalizer is wider than ``target_dim``.
@@ -1022,6 +1102,12 @@ def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
     refuses to overwrite a config that does not match the current one —
     a silent overwrite would mislabel every checkpoint produced by the
     prior run under the stale config.
+
+    Also writes a ``policy_config.json`` containing the projection-side
+    parameters (currently ``tangent_alpha_max_rad``). The controller
+    reads this at deployment so a non-default ``--alpha-max-rad`` from
+    training propagates to inference without manual plumbing. Missing
+    file → controller falls back to :data:`TANGENT_ALPHA_MAX_RAD`.
     """
     import json
 
@@ -1035,8 +1121,21 @@ def _write_reward_config(run_dir: Path, train_cfg: TrainConfig) -> None:
                 f"train_cfg.reward; delete the file to overwrite "
                 f"intentionally or fix train_cfg.reward."
             )
+    else:
+        target.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+
+    policy_target = run_dir / "policy_config.json"
+    policy_current = {"tangent_alpha_max_rad": float(train_cfg.tangent_alpha_max_rad)}
+    if policy_target.exists():
+        existing_policy = json.loads(policy_target.read_text(encoding="utf-8"))
+        if existing_policy != policy_current:
+            raise RuntimeError(
+                f"policy_config.json at {policy_target} disagrees with current "
+                f"train_cfg.tangent_alpha_max_rad; delete the file to overwrite "
+                f"intentionally."
+            )
         return
-    target.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+    policy_target.write_text(json.dumps(policy_current, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _save_checkpoint(

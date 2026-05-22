@@ -12,6 +12,7 @@ import numpy as np
 from drone_models.core import load_params
 from jax import Array
 from ml_collections import ConfigDict
+from jax.scipy.spatial.transform import Rotation as JaxRotation
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
@@ -136,8 +137,9 @@ class RLSongVecEnv:
         Parameters
         ----------
         raw_action : Array, shape (n_envs, RAW_ACTION_DIM)
-            Raw 7-vector sampled by the policy. The log probability must have
-            already been computed before this call.
+            Raw 4-vector ``[T_raw, tau_x, tau_y, tau_z]`` sampled by the
+            policy. The log probability must have already been computed
+            before this call.
 
         Returns
         -------
@@ -158,7 +160,9 @@ class RLSongVecEnv:
 
         prev_env_obs = self.current_env_obs
         thrust_min, thrust_max = self.get_thrust_bounds()
-        env_action = raw_to_env_action(jnp.asarray(raw_action), thrust_min, thrust_max)
+        env_action = raw_to_env_action(
+            jnp.asarray(raw_action), jnp.asarray(prev_env_obs["quat"]), thrust_min, thrust_max
+        )
         _validate_action_shape(env_action, self.n_envs, ENV_ACTION_DIM, "env_action")
 
         env_obs, _, terminated, truncated, env_info = self.env.step(env_action)
@@ -391,10 +395,9 @@ class RLSongVecEnv:
 
         self.rng_key, pos_key, vel_key, yaw_key = jax.random.split(self.rng_key, 4)
         states = self.env.data.sim_data.states
-        # Snapshot the toml start position before the small jitter on top is
-        # applied. ``_apply_segment_init`` uses this as the segment-0 anchor
-        # (the prev_anchor for the start → gate-0 segment).
-        start_pos = states.pos
+        # v41: dropped ``start_pos`` snapshot — seg-init no longer needs the
+        # spawn position as a segment-0 anchor. Entry geometry is computed
+        # from the next gate's pose only.
         pos_delta = jax.random.uniform(
             pos_key,
             shape=states.pos.shape,
@@ -427,27 +430,25 @@ class RLSongVecEnv:
         sim_data = self.env.data.sim_data.replace(states=states)
         self.env.data = self.env.data.replace(sim_data=sim_data)
         self.env.data = _reset_env_data(self.env.data, mask)
-        self._apply_segment_init(mask, start_pos)
+        self._apply_segment_init(mask)
 
-    def _apply_segment_init(self, mask: Array, start_pos: Array) -> None:
-        """Re-spawn a Bernoulli-selected subset of envs at random segment centers.
+    def _apply_segment_init(self, mask: Array) -> None:
+        """Re-spawn a Bernoulli-selected subset of envs at the target gate's entry waypoint.
 
         Implements Phase 1 of Song et al. 2023 §III-B: with probability
         ``stage.segment_init_prob``, override the just-reset drone state so
-        the drone hovers at the midpoint of a uniformly-random path segment
-        with ``target_gate`` advanced to match. The Phase-2 successful-state
-        buffer is not implemented yet — the segment midpoint plus jitter is
-        the only initial-state distribution.
+        the drone arrives at the entry side of a uniformly-random target
+        gate with velocity in that gate's traversal direction, and
+        ``target_gate`` advanced to match.
+
+        v41: see ``rollout._apply_segment_init`` docstring for the diagnosis
+        that motivated dropping v29's midpoint+straight-line geometry.
 
         Parameters
         ----------
         mask : Array, shape (n_envs,)
             Boolean mask of envs that just reset (and are eligible for
             segment-init). Envs outside this mask are untouched.
-        start_pos : Array, shape (n_envs, n_drones, 3)
-            Per-env start position snapshotted *before* any reset
-            perturbation. Used as the segment-0 anchor (prev gate for the
-            "start → gate 0" segment).
         """
         if self.env is None:
             raise RuntimeError("Env is not constructed.")
@@ -466,6 +467,7 @@ class RLSongVecEnv:
         # randomization that follows, so segment anchors use the placed
         # geometry rather than the post-wobble physics.
         nominal_gates_pos = data.nominal_gates_pos
+        nominal_gates_quat = data.nominal_gates_quat
         n_gates = nominal_gates_pos.shape[1]
 
         do_seg = (
@@ -477,11 +479,22 @@ class RLSongVecEnv:
 
         segment_idx = jax.random.randint(seg_key, shape=(self.n_envs,), minval=0, maxval=n_gates)
         env_arange = jnp.arange(self.n_envs)
-        prev_idx = jnp.clip(segment_idx - 1, 0, n_gates - 1)
-        prev_gate = nominal_gates_pos[env_arange, prev_idx]
-        prev_anchor = jnp.where((segment_idx == 0)[:, None], start_pos[:, 0, :], prev_gate)
         next_gate = nominal_gates_pos[env_arange, segment_idx]
-        midpoint = 0.5 * (prev_anchor + next_gate)
+        next_gate_quat = nominal_gates_quat[env_arange, segment_idx]
+
+        # v41: spawn at the target gate's entry waypoint on its -x_local
+        # side with velocity in the gate's +x_local direction. Replaces
+        # v29's midpoint(prev_gate, next_gate) + unit(next-prev) geometry
+        # — which was ~90 deg off the U-turn gate's traversal axis and
+        # left Phase 2 buffer slot 2 essentially empty across the v38
+        # series. Mirrors ``rollout._apply_segment_init`` exactly so the
+        # eager and JIT branches share the same state distribution. See
+        # the full diagnosis in that function's inline comment.
+        gate_xaxis_world = JaxRotation.from_quat(next_gate_quat).apply(
+            jnp.array([1.0, 0.0, 0.0])
+        )  # (n_envs, 3); gate's traversal axis in world
+        entry_offset_m = self.reward_cfg.lookahead_entry_offset_m
+        entry_waypoint = next_gate - entry_offset_m * gate_xaxis_world
 
         jitter = jax.random.uniform(
             jit_key,
@@ -489,14 +502,9 @@ class RLSongVecEnv:
             minval=-self.stage.segment_init_perturb_m,
             maxval=self.stage.segment_init_perturb_m,
         )
-        new_pos = jnp.clip(midpoint + jitter, data.pos_limit_low, data.pos_limit_high)
+        new_pos = jnp.clip(entry_waypoint + jitter, data.pos_limit_low, data.pos_limit_high)
 
-        # v29: velocity-aware seg-init. Matches ``rollout._apply_segment_init``;
-        # see ``CurriculumStage.segment_init_vel_mps`` for motivation.
-        direction = next_gate - prev_anchor
-        direction_norm = jnp.linalg.norm(direction, axis=-1, keepdims=True)
-        unit_direction = direction / jnp.maximum(direction_norm, 1e-6)
-        seg_vel = self.stage.segment_init_vel_mps * unit_direction  # (n_envs, 3)
+        seg_vel = self.stage.segment_init_vel_mps * gate_xaxis_world  # (n_envs, 3)
 
         mask_b3 = do_seg[:, None, None]
         new_pos_b = new_pos[:, None, :]

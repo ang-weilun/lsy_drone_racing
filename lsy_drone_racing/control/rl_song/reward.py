@@ -5,7 +5,7 @@ The function in this module replaces the sparse reward emitted by
 observation, and terminal flags after ``VecDroneRaceEnv`` has squeezed the
 single-drone axis, so every array has a leading ``n_envs`` dimension.
 
-Notes
+Notes:
 -----
 ``env_obs["gates_pos"]`` is intentionally insufficient for the progress term:
 the racing env reports nominal gate poses until a gate is revealed by the
@@ -70,7 +70,7 @@ def _gate_frame_edge_dist_sq(pos: Array, gates_pos: Array, gates_quat: Array) ->
     gates_quat : Array, shape (n_envs, n_gates, 4)
         xyzw quaternions.
 
-    Returns
+    Returns:
     -------
     Array, shape (n_envs, n_gates, 4)
         Squared distance per edge.
@@ -115,7 +115,7 @@ def _gate_phi(pos: Array, gate_pos: Array, gate_quat: Array, reward_cfg: RewardC
         Source of ``guide_k2`` (aperture spread base) and ``guide_kx``
         (traversal sigmoid scale).
 
-    Returns
+    Returns:
     -------
     phi : Array, shape (n_envs,)
         Scalar potential in ``[0, 1]``.
@@ -183,7 +183,7 @@ def step_reward(
         Unmasked obstacle positions. If omitted, ``env_obs["obstacles_pos"]``
         is used.
 
-    Returns
+    Returns:
     -------
     reward : Array, shape (n_envs,)
         Total replacement reward.
@@ -192,7 +192,7 @@ def step_reward(
         ``r_gate_bonus``, ``r_exit_vel``, ``r_terminal``, ``r_time``,
         ``r_vel``, and ``r_guid``. Every value has shape ``(n_envs,)``.
 
-    Notes
+    Notes:
     -----
     ``r_obs`` and ``r_gate_frame`` use the already-masked ``env_obs``
     fields (post upstream PR #91, ``race_core.obs`` masks gate and
@@ -234,10 +234,64 @@ def step_reward(
         delta_local = jnp.einsum("nji,nj->ni", rot_gw, pos - prev_pos)
         r_prog = reward_cfg.progress_coef * delta_local[..., 0]
     else:
+        # v41: reverted to gate-center distance-delta. The v40 exit-waypoint
+        # variant was diagnosed as counter-productive on this layout: the
+        # gate-1 exit waypoint sits in world (-x, +y) from gate 1's center,
+        # which means a drone exiting gate 0 with +x momentum (the natural
+        # gate-0 traversal direction) receives *negative* r_prog after the
+        # target_idx flips to 1 — actively training the policy to suppress
+        # the +x overshoot that is required to set up the U-turn entry.
+        # The post-gate-0 plateau is now addressed structurally via
+        # ``phase2_prob=0.10`` (replay from successful post-gate-K states)
+        # and the v41 seg-init fix in ``rollout._apply_segment_init`` (spawn
+        # at gate's entry waypoint, velocity in gate's +x_local direction).
+        # Both attack the value-function-baseline trap rather than trying
+        # to shape it away via dense reward.
         r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
         r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
-    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], ord=1, axis=-1)
+    # v38k: pre-gate-0 entry-position shaping. v38j tried distance-
+    # closing to gate 1's *center* and failed: as the drone coasts +x
+    # past gate 0, the Euclidean distance to gate 1's center naturally
+    # decreases, so look-ahead at gate-1-center paid positive reward
+    # for the wrong behaviour. The Oct-2025 gate-frame standardization
+    # (``Update gate orientation and pass check``, commit ``23415dc``)
+    # makes gate 1's +x_local axis point world (-0.70, +0.71); gate 1
+    # is geometrically reachable only from x_local_g1 > 0 with motion
+    # in the +x_local direction (= world (-x, +y)). The natural +x
+    # coast after gate 0 lands the drone on x_local_g1 < 0 and OOBs
+    # there. v38k aims look-ahead at the *entry waypoint*
+    # ``gate_pos - lookahead_entry_offset_m * gate_xaxis_world``,
+    # which sits ~0.5 m on the -x_local side of gate 1 (i.e., on the
+    # +x side of gate 1 in world). Reward gradient biases the gate-0
+    # approach to exit gate 0 with momentum already pointed at that
+    # apex, after which the base ``r_prog`` distance-closing to gate
+    # 1's center can complete the U-turn. Masked to ``target_idx == 0``
+    # only (pre-gate-0 + the gate-0 pass step); after that, base r_prog
+    # handles gate 1. This is *entry-position shaping*, not a post-
+    # gate-0 overshoot brake — the bootstrap problem post-gate-0 is
+    # still left to the base reward gradient.
+    # ``_quat_to_matrix`` returns the body->world rotation, so its
+    # first column is the gate-local +x axis expressed in world coords
+    # (see ``obs._quat_to_matrix``).
+    if reward_cfg.lookahead_coef > 0.0:
+        n_gates_lk = gates_pos.shape[1]
+        next_idx = jnp.minimum(target_idx + 1, n_gates_lk - 1)
+        next_gate_pos = gates_pos[env_idx, next_idx]
+        next_gate_quat = gates_quat[env_idx, next_idx]
+        rot_next_gw = _quat_to_matrix(next_gate_quat)
+        next_gate_xaxis_world = rot_next_gw[..., :, 0]
+        entry_wp = next_gate_pos - reward_cfg.lookahead_entry_offset_m * next_gate_xaxis_world
+        closing_wp = jnp.linalg.norm(entry_wp - prev_pos, axis=-1) - jnp.linalg.norm(
+            entry_wp - pos, axis=-1
+        )
+        lookahead = reward_cfg.progress_coef * reward_cfg.lookahead_coef * closing_wp
+        r_prog = r_prog + jnp.where(target_idx == 0, lookahead, jnp.zeros_like(r_prog))
+
+    # v43: switch from L1 to L2 norm on body rates. Song 2023's
+    # ``b · ‖ω_k‖`` is the L2 (Euclidean) magnitude; our L1 default was
+    # historical drift with no documented rationale.
+    r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], axis=-1)
 
     # v10: forward-flight bias (Liu eq. 8). Penalize lateral and backward
     # body-frame velocity. Symmetric ``r_prog`` cannot distinguish a drone
