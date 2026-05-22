@@ -1103,40 +1103,65 @@ class CurriculumConfig:
 def default_curriculum() -> CurriculumConfig:
     """Return the active curriculum.
 
-    v43 (2026-05-22): single bare level-2 stage, no curriculum scaffolding.
-    Strips Phase-1 seg-init (``segment_init_prob = 0``), Phase-2 buffer
-    replay (``phase2_prob = 0``), and the v38i reset-state symmetry-break
-    perturbations (``reset_pos_perturb_m = 0``, ``reset_yaw_perturb_rad
-    = 0``). The level-2 toml randomization (gate_pos ±0.15 m / gate_rpy
-    yaw ±0.20 rad / obstacle_pos ±0.15 m / drone_pos ±0.10 m / drone_rpy
-    ±0.10 rad / mass+inertia DR + action/dynamics noise) takes over the
-    symmetry-break job, and the policy must learn the full takeoff →
-    gate-0 → U-turn → gate-1 → gate-2 → U-turn → gate-3 chain from true
-    starts only. This is a clean diagnostic: if the v42 reward landscape
-    can't drive U-turn discovery from L2-true-start alone, no amount of
-    seg-init / phase-2 scaffolding will produce a deployable policy, and
-    the bottleneck is the reward function itself.
+    v44 (2026-05-22): single level-2 stage with Song 2023's Phase-1 +
+    Phase-2 distribution scaffolding reinstated, reward and PPO knobs
+    otherwise unchanged from v43.
 
-    The full multi-stage history (v36 Song-stripped warm-start, v38b
-    deterministic-L1 pretrain, v38i symmetry-break perturb, v38l
-    Lever-B seg-init re-enable, v41 phase-2 replay enable, v41 seg-init
-    geometry fix, v42 lookahead disable) is preserved in the prose
-    handoff at ``docs/handoffs/2026-05-22-v39-v42-investigation-handoff.md``
-    and in :func:`_full_curriculum` below for reinstatement.
+    The v43 bare-L2 + Song-verbatim run collapsed to a clean hover
+    attractor — 8,299 episodes, 498/500 steps each, 0/4096 gate passes,
+    0 crashes, ep_ret −3.3 dominated by integrated r_omega. The diagnosis
+    matches v36 / v37b history verbatim: under bare ``r_prog + r_omega +
+    r_terminal``, random-Gaussian exploration produces ~zero expected
+    r_prog while hover pays only r_omega (~−5/episode), and any committed
+    motion that crashes pays −10. Hover is strictly best until the value
+    function sees a positive return — but with no curriculum scaffolding,
+    the policy collapses to hover before random exploration ever reaches
+    a gate at true-start frequency. The wandb buffer fill diagnostic
+    (``phase2_buffer_fill_g1 = 609`` accidental passes recorded but
+    *discarded* because phase2_prob was 0) is the direct evidence that
+    Phase 2 replay would have been load-bearing.
+
+    v44 fix: reinstate the v41 Lever-B / Phase-2 settings at p=0.10
+    each. Phase 1 seg-init (``segment_init_prob = 0.10``,
+    ``segment_init_vel_mps = 2.5``) puts ~10% of envs at mid-track
+    segment centers with velocity along the next gate's traversal axis,
+    so r_prog is immediately positive from those spawns — anchoring V to
+    positive returns and breaking the hover attractor on the true-start
+    90%. Phase 2 replay (``phase2_prob = 0.10``,
+    ``phase2_warmup_steps = 20_000_000``) re-spawns from real past
+    gate-pass states once the buffer has filled, exposing the critic to
+    the entire reachable forward-progress distribution.
+
+    Reward stays Song-verbatim (3 terms: ``r_prog + r_omega + r_terminal``,
+    no jackpot, no guide, no time penalty, no obstacle barrier, no
+    lookahead) per the v43 design. PPO hyperparameters stay at the
+    Codex-reviewed values (``n_steps=250``, ``ent_coef 0.02 → 0.005``
+    anneal, ``LOG_STD_MIN = −2.5``, ``gamma=0.998``, ``gae_lambda=0.97``,
+    ``update_epochs=3``, ``target_kl=0.02``). ``reset_pos_perturb_m = 0``
+    is preserved because the level-2 toml randomization (drone_pos ±0.10 m
+    / drone_rpy ±0.10 rad) handles the symmetry-break job that motivated
+    v38i's 0.10 m perturb on deterministic L1.
+
+    Predecessor handoffs and the prose v43 hover-collapse diagnosis live
+    in ``docs/handoffs/`` (untracked); :func:`_default_curriculum_v42_history`
+    preserves the v42 two-stage L1→L2 layout, :func:`_full_curriculum`
+    preserves the legacy seven-stage progression.
     """
     return CurriculumConfig(
         stages=(
             CurriculumStage(
-                name="stage1_bare_level2",
+                name="stage1_level2_phase12",
                 level=2,
                 use_domain_randomization=False,
                 reset_pos_perturb_m=0.0,
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=0.0,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.0,
-                segment_init_vel_mps=0.0,
-                phase2_prob=0.0,
+                segment_init_prob=0.10,
+                segment_init_vel_mps=2.5,
+                phase2_prob=0.10,
+                phase2_capacity_per_gate=4096,
+                phase2_warmup_steps=20_000_000,
                 promote_target_gate_mean=float("inf"),
                 promote_crash_rate_max=float("inf"),
             ),
