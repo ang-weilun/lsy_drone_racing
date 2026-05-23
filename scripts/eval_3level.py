@@ -45,7 +45,11 @@ def main(checkpoint: str, n_runs: int = 20, levels: str = "0,1,2") -> None:
         Comma-separated level indices to evaluate (e.g. ``"0,1,2"`` or
         ``"0,1,2,3"`` to include the L3 OOD config).
     """
-    requested_levels = tuple(int(s) for s in levels.split(","))
+    # fire auto-parses comma-separated args to a tuple; accept either form.
+    if isinstance(levels, str):
+        requested_levels = tuple(int(s) for s in levels.split(","))
+    else:
+        requested_levels = tuple(int(s) for s in levels)
     finished: dict[int, int] = {}
     mean_lap: dict[int, float] = {}
     for level in requested_levels:
