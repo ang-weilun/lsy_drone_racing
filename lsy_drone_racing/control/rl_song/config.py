@@ -37,10 +37,21 @@ ENV_ACTION_DIM: int = 4
 # raw-norm at init stays in the linear regime of the norm-tanh squash.
 TANGENT_ALPHA_MAX_RAD: float = 0.16
 
-# Actor obs decomposition (cf. design doc §6). Total 61 floats.
+# Actor obs decomposition (cf. design doc §6). Total 65 floats.
 ACTOR_OBS_DRONE_DIM: int = 13  # 6D rot + body-vel + body-omega + z
 ACTOR_OBS_GATE_DIM: int = 24  # 2 gates * 4 corners * 3 coords
 ACTOR_OBS_VISITED_DIM: int = 2  # visited flags for the 2 future gates
+# v45: explicit one-hot encoding of the current target_gate index. v44 video
+# evidence showed the policy hovering near gate-1's exit / gate-2's entry
+# from a true-ground-start eval (target_gate=0) — a learned attractor at a
+# geometric position the training distribution heavily reinforced as
+# "high value" via Phase-1 segment_idx=2 hovering. The cyclic-shift trick
+# (gates[0] in obs = current target) was the only "which gate is target"
+# signal; the explicit one-hot disambiguates the OOD eval state from
+# geometrically-similar Phase-1/2 training states. ``target_gate = -1``
+# (race finished) maps to all-zeros — the actor output on that step is
+# discarded by the rollout buffer.
+ACTOR_OBS_TARGET_GATE_DIM: int = 4  # one-hot over n_gates (track has 4 gates)
 ACTOR_OBS_PREV_ACTION_DIM: int = ENV_ACTION_DIM
 ACTOR_OBS_OBSTACLE_DIM: int = 16  # 4 obstacles * (3 body-frame xyz + 1 visited)
 # v35: pre-computed obstacle-danger scalars to short-circuit a cross-channel
@@ -52,11 +63,12 @@ ACTOR_OBS_DIM: int = (
     ACTOR_OBS_DRONE_DIM
     + ACTOR_OBS_GATE_DIM
     + ACTOR_OBS_VISITED_DIM
+    + ACTOR_OBS_TARGET_GATE_DIM
     + ACTOR_OBS_PREV_ACTION_DIM
     + ACTOR_OBS_OBSTACLE_DIM
     + ACTOR_OBS_PROXIMITY_DIM
 )
-assert ACTOR_OBS_DIM == 61, "Actor obs layout drifted from design doc §6"
+assert ACTOR_OBS_DIM == 65, "Actor obs layout drifted from design doc §6"
 
 
 @dataclass(frozen=True)
@@ -856,7 +868,18 @@ class RewardConfig:
     # at γ=0.997, a 200-step lap pays 10·γ^200 ≈ 5.5 vs a 500-step
     # lap's 10·γ^500 ≈ 2.2 — a 3.3 differential that biases toward
     # speed without an explicit per-step cost.
-    time_penalty: float = 0.0
+    # v46: 0.0 -> 0.05. Re-introduce v8/v19 anti-hover pressure. Bare-Song
+    # reward at v43-v45 produced a stable "hover above gate 0" attractor
+    # — render evidence (v45 L0 renders) showed the policy taking off,
+    # climbing past gate 0's altitude, drifting laterally past gate 0
+    # without crossing the aperture, and hovering there. r_prog plateaus
+    # at the gate plane (distance(g_K, pos) ~ 0 once close), so without
+    # time_penalty hovering near gate K pays ~0 per step (better than
+    # crashing through). Per-step 0.05 makes a 500-step timeout cost -25;
+    # hovering's per-episode return drops from ~-5 to ~-30, strictly
+    # worse than even a crash (-10). Policy is now incentivised to either
+    # finish (+16.6 net at progress_coef=1.0) or attempt-and-crash (-10).
+    time_penalty: float = 0.05
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -917,7 +940,19 @@ class RewardConfig:
     # guide-field gradient may instead be the source of the gate-1
     # U-turn pathology by biasing entry geometry. v43 tests Song's
     # claim that the value function alone discovers safe-state regions.
-    use_guide: bool = False
+    # v46: False -> True. Re-introduce the v10/v11/v13A static Liu loiter
+    # field (use_guide_delta_phi=False below, so the original Liu eq. 6-7
+    # formulation, not the Δ-potential variant). Combined with the v46
+    # time_penalty re-add above, this attacks the v45 "fly over gate 0
+    # and hover" failure mode at two layers: time_penalty makes ANY
+    # hovering strictly negative-value (global anti-hover); r_guid adds
+    # a position-dependent loiter penalty SPECIFICALLY in the gate-plane
+    # vicinity that's larger when off-axis from the traversal line. The
+    # combination biases the policy toward axial approach + commit-through
+    # rather than over-fly-and-hover. guide_coef=0.5 is the v21-validated
+    # working magnitude; field shape uses default guide_k0=3.0, k1=1.0,
+    # k2=0.3.
+    use_guide: bool = True
     # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
     # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
     # r_guid over a perfectly centered pass is approximately guide_coef,
@@ -1157,9 +1192,9 @@ def default_curriculum() -> CurriculumConfig:
                 reset_vel_perturb_mps=0.0,
                 reset_yaw_perturb_rad=0.0,
                 gate_rand_scale=1.00,
-                segment_init_prob=0.10,
+                segment_init_prob=0.40,
                 segment_init_vel_mps=2.5,
-                phase2_prob=0.10,
+                phase2_prob=0.40,
                 phase2_capacity_per_gate=4096,
                 phase2_warmup_steps=20_000_000,
                 promote_target_gate_mean=float("inf"),

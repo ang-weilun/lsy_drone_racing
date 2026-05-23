@@ -1,13 +1,13 @@
 """Observation encoding for the Song-2023 RL prototype.
 
-Builds the 61-dimensional actor observation and the (Week-1-equivalent)
+Builds the 65-dimensional actor observation and the (Week-1-equivalent)
 critic observation from the racing env's observation dict. Pure JAX, designed
 to be ``jit``- and ``vmap``-friendly.
 
 Layout
 ------
 The actor observation is
-``[drone | gates | visited | prev_action | obstacles | proximity]``:
+``[drone | gates | visited | target_onehot | prev_action | obstacles | proximity]``:
 
 * drone (13): 6D rotation rep (first two columns of ``R_wb``), body-frame
   linear velocity (3), body-frame angular velocity (3), drone z (1).
@@ -17,6 +17,12 @@ The actor observation is
   recursive trick, used unchanged by Song 2023 / Romero 2024 / Wang 2025).
 * visited (2): float flags for whether each of the two future gates has been
   revealed.
+* target_onehot (4): v45 — explicit one-hot encoding of the current
+  ``target_gate`` index. Disambiguates the OOD true-start eval state (where
+  the geometric drone configuration may resemble Phase-1/2 mid-track training
+  states that had a different target_gate). ``target_gate = -1`` (finished)
+  → all-zeros; the actor output on that step is discarded by the rollout
+  buffer anyway.
 * prev_action (4): the previous env-action 4-vec ``[roll, pitch, yaw, thrust]``.
 * obstacles (16): four obstacles' body-frame relative positions (3 each) and
   visited flags (1 each).
@@ -27,7 +33,9 @@ The actor observation is
   to learn from the raw obstacle channel alone.
 
 Cyclic shift: the gate list is rotated so that ``gates[0]`` is always the
-current target. The target-gate index is therefore not encoded explicitly.
+current target. v45 also adds the explicit target_onehot above so the
+policy has both signals — the cyclic-shifted gate geometry and the explicit
+target index — to disambiguate OOD states.
 """
 
 from __future__ import annotations
@@ -76,7 +84,7 @@ def init_normalizer(obs_dim: int = ACTOR_OBS_DIM) -> NormalizerState:
     obs_dim : int, optional
         Dimensionality of the observation vector.
 
-    Returns
+    Returns:
     -------
     NormalizerState
         ``mean=0``, ``var=1``, ``count=NORM_VAR_EPS``.
@@ -98,7 +106,7 @@ def update_normalizer(state: NormalizerState, batch: Array) -> NormalizerState:
     batch : Array, shape (n, obs_dim)
         New raw (un-normalized) observations.
 
-    Returns
+    Returns:
     -------
     NormalizerState
         Updated statistics. Numerically stable parallel Welford (Chan et al.).
@@ -132,12 +140,12 @@ def _quat_to_matrix(quat_xyzw: Array) -> Array:
         Drone or gate orientation as an xyzw quaternion (env convention).
         Assumed unit-norm (sim and env guarantee this).
 
-    Returns
+    Returns:
     -------
     Array, shape (..., 3, 3)
         Rotation matrix ``R`` so that ``v_world = R @ v_local``.
 
-    Notes
+    Notes:
     -----
     Hand-rolled rather than calling
     ``jax.scipy.spatial.transform.Rotation.from_quat`` then ``.as_matrix()``
@@ -184,7 +192,7 @@ def _gate_corners_world(gate_pos: Array, gate_quat: Array) -> Array:
     gate_quat : Array, shape (4,)
         xyzw quaternion.
 
-    Returns
+    Returns:
     -------
     Array, shape (4, 3)
         Corners stacked as rows.
@@ -210,12 +218,12 @@ def build_actor_obs(
     normalizer : NormalizerState
         Running mean/std applied to the assembled raw observation.
 
-    Returns
+    Returns:
     -------
     Array, shape (ACTOR_OBS_DIM,)
         Normalized actor observation.
 
-    Notes
+    Notes:
     -----
     Pure JAX. To use across ``n_envs`` rollouts, ``jax.vmap`` this function
     over the leading dimension of every input.
@@ -263,6 +271,16 @@ def build_actor_obs(
     )
 
     visited_chan = gates_visited[gate_indices].astype(jnp.float32)
+
+    # v45: explicit one-hot target_gate. ``jax.nn.one_hot`` requires a
+    # static ``num_classes`` — gates_pos.shape[0] is known at trace time so
+    # passing it works inside vmap/jit. ``target_idx`` was clamped to 0
+    # above when ``target == -1`` (finished); mask the resulting one-hot
+    # back to all-zeros for that case so a finished episode is distinct
+    # from an active episode targeting gate 0.
+    target_onehot_raw = jax.nn.one_hot(target_idx, n_gates, dtype=jnp.float32)
+    target_active_mask = (target >= 0).astype(jnp.float32)
+    target_onehot = target_onehot_raw * target_active_mask
 
     prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(ENV_ACTION_DIM)
 
@@ -316,7 +334,15 @@ def build_actor_obs(
     )
 
     raw = jnp.concatenate(
-        [drone_chan, gate_chan, visited_chan, prev_action_chan, obstacle_chan, proximity_chan]
+        [
+            drone_chan,
+            gate_chan,
+            visited_chan,
+            target_onehot,
+            prev_action_chan,
+            obstacle_chan,
+            proximity_chan,
+        ]
     )
     return apply_normalizer(normalizer, raw)
 
@@ -349,7 +375,7 @@ def build_critic_obs(
     true_obstacles_pos : Array, shape (n_obstacles, 3), optional
         Unmasked true obstacle positions from ``env.data.obstacles_pos``.
 
-    Returns
+    Returns:
     -------
     Array, shape (ACTOR_OBS_DIM,)
         Normalized critic observation. Same dimensionality as the actor obs;
@@ -378,7 +404,7 @@ def vmap_build_actor_obs(
     normalizer : NormalizerState
         Broadcast over the batch.
 
-    Returns
+    Returns:
     -------
     Array, shape (n_envs, ACTOR_OBS_DIM)
     """
@@ -411,7 +437,7 @@ def vmap_build_critic_obs(
         Privileged unmasked poses. When all three are ``None`` the critic
         falls back to the actor encoding (no information advantage).
 
-    Returns
+    Returns:
     -------
     Array, shape (n_envs, ACTOR_OBS_DIM)
         Normalized critic observations.
