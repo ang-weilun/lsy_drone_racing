@@ -87,28 +87,25 @@ class Actor(nn.Module):
             x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
             x = nn.tanh(x)
 
-        # v60 (action-head ablation): replace v44's tanh-on-mean with
-        # hard-clip(±1). v44 rationale was that tanh's sech²(μ_pre) self-
-        # attenuates the gradient, naturally bounding mean drift. But the v48
-        # saturation diagnostics (raw_norm_mean=5.47, saturation_fraction=0.95)
-        # showed the mean DID drift far past the cap regardless — sech²(5.47)
-        # ≈ 4e-10, so tanh's "bounding" was a slow-leak, not a hard barrier.
-        # PPO drove pre_tanh weights arbitrarily as long as the residual
-        # gradient pointed up. v60 swaps in jnp.clip: gradient is exactly
-        # 1 inside (−1, 1) and exactly 0 outside, so weights stop changing
-        # the moment pre_clip leaves the boundary, preventing the asymmetric
-        # drift entirely. Downstream raw_to_env_action's tanh-on-thrust and
-        # norm-clip-on-tangent still squash the sample into env range when
-        # noise pushes it past ±1.
-        thrust_mean = jnp.clip(
-            nn.Dense(THRUST_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x),
-            -1.0,
-            1.0,
+        # v44 (paper-faithful action head): tanh on the last layer per Song
+        # 2023 §"Network". With unbounded ``mu_raw``, v43 saturation diagnostics
+        # showed ``tangent/raw_norm_mean=1.87`` and 49% sample saturation —
+        # the policy mean was sitting outside the downstream clip boundary,
+        # making PPO's gradient w.r.t. ``mu_raw`` informative only inside a
+        # small slice of mean space (the rest gives clipped outputs unchanged
+        # by ε perturbations, so ∂J/∂μ → 0). tanh-on-mean self-attenuates the
+        # gradient via ``sech²(μ_pre_tanh)``, naturally bounding mean drift to
+        # ``μ ∈ (−1, 1)`` while preserving raw-space Gaussian sampling and
+        # log-prob (sample = μ + σ·ε ∈ ℝ⁴, log-prob unchanged because we
+        # transform the mean, not the sample). The downstream
+        # ``raw_to_env_action`` tanh-on-thrust and norm-clip-on-tangent still
+        # bring the *sample* into the valid env range when noise pushes it
+        # past ±1.
+        thrust_mean = nn.tanh(
+            nn.Dense(THRUST_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
         )
-        tangent_mean = jnp.clip(
-            nn.Dense(TANGENT_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x),
-            -1.0,
-            1.0,
+        tangent_mean = nn.tanh(
+            nn.Dense(TANGENT_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
         )
         mu_raw = jnp.concatenate([thrust_mean, tangent_mean], axis=-1)
 
