@@ -47,6 +47,8 @@ from lsy_drone_racing.control.rl_song.config import (
     TANGENT_ALPHA_MAX_RAD,
     PPOConfig,
     TrainConfig,
+    _full_curriculum,
+    default_curriculum,
 )
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
 from lsy_drone_racing.control.rl_song.obs import NormalizerState
@@ -119,6 +121,14 @@ class CLIArgs:
     # ``use_guide``, was added to combat the v44-v45 hover collapse; on a
     # warm-started policy it may suppress aggressive transient maneuvers.
     time_penalty: float | None = None
+    # Curriculum factory selector. ``default`` (None) keeps the single-stage
+    # level-2 ``default_curriculum`` used by every v33-v60 run. ``full``
+    # switches to ``_full_curriculum`` which has the seven-stage L1 -> L3
+    # progression (stage3a/b/c_level3_rand{0.2,0.5,1.0} + stage4_level3_dr).
+    # Required for any L3 training: every prior policy was trained on
+    # default_curriculum and gets 0/20 on L3 because gate randomization is
+    # OOD. Pair with ``--stage`` to pick the entry stage (1-indexed).
+    curriculum: str | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -379,6 +389,16 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         if args.time_penalty < 0.0:
             raise ValueError(f"time_penalty must be non-negative; got {args.time_penalty}")
         reward_cfg = replace(reward_cfg, time_penalty=args.time_penalty)
+    curriculum_cfg = cfg.curriculum
+    if args.curriculum is not None:
+        if args.curriculum == "default":
+            curriculum_cfg = default_curriculum()
+        elif args.curriculum == "full":
+            curriculum_cfg = _full_curriculum()
+        else:
+            raise ValueError(
+                f"--curriculum must be 'default' or 'full'; got {args.curriculum!r}"
+            )
     return replace(
         cfg,
         ppo=ppo_cfg,
@@ -386,6 +406,7 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         initial_stage_index=args.stage - 1,
         tangent_alpha_max_rad=alpha_max,
         reward=reward_cfg,
+        curriculum=curriculum_cfg,
         wandb_project=args.wandb_project or cfg.wandb_project,
         wandb_entity=args.wandb_entity,
         run_name=args.run_name,
