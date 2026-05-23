@@ -38,21 +38,17 @@ N_HIDDEN_LAYERS: int = 2
 THRUST_RAW_DIM: int = 1
 TANGENT_RAW_DIM: int = 3
 DEFAULT_INIT_LOG_STD: float = PPOConfig().init_log_std
-# Hard floor on the learned log-std parameter. History: -2.0 (v42) ->
-# -2.5 (v43 Codex review) -> -3.5 (v59 wobble fix). The v43 design point
-# assumed α_max = 0.16: σ_min·√3·α_max ≈ 0.023 rad/step (≈1.3°/step ≈
-# 1.1 rad/s) of stochastic exploration after convergence. v49+ bumped
-# α_max to 0.32-0.56, so at LOG_STD_MIN=-2.5 the actual residual noise
-# rose to ≈4.5°/step (~4.0 rad/s) — far past the v43 "precision-flight"
-# design point, manifesting as the wobbly flight reported by user inspection
-# vs v7a's stable aggressive style. v59 (warm-start over v56-step163M):
-# drop LOG_STD_MIN to -3.5, giving σ_min ≈ 0.030 and ‖τ_scaled‖_noise ≈
-# 0.029 rad/step (≈1.7°/step ≈ 1.4 rad/s) at α_max=0.56 — close to the
-# v43 design point. The v43 ent_coef anneal (0.02 -> 0.005) and KL early-
-# stop manage early-stage exploration, so the std floor's role is still
-# "prevent total determinism for late-stage gradient flow" — a lower
-# magnitude suffices, especially under a higher-α_max action head.
-LOG_STD_MIN: float = -3.5
+# Hard floor on the learned log-std parameter. v43 (Codex review): -2.0 ->
+# -2.5. σ_min = exp(-2.5) ≈ 0.082; with α_max = 0.16, the floored tangent
+# action has ‖τ_scaled‖ ≈ tanh(σ_min·√3)·α_max ≈ 0.023 rad/step (≈1.3°/step
+# ≈ 1.1 rad/s) of stochastic exploration. The previous -2.0 floor (~2 rad/s
+# residual noise) injected too much attitude dithering after the policy
+# committed to a gate-passing line — useful as a cold-start anti-collapse
+# guarantee, but precision-flight-hostile late in training. The v43 ent_coef
+# anneal (0.02 -> 0.005) and the new KL early-stop already manage early-
+# stage exploration, so the std floor's role narrows to "prevent total
+# determinism for late-stage gradient flow" — a lower magnitude suffices.
+LOG_STD_MIN: float = -2.5
 TANGENT_NORM_EPS: float = 1e-8
 LOG_TWO_PI: float = 1.8378770664093453
 LOG_TWO_PI_E: float = 2.8378770664093453
