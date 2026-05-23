@@ -1,18 +1,23 @@
-"""Run 20-seed deterministic eval on level0/1/2 in a single Python process.
+"""Run N-seed deterministic eval over multiple level configs in one process.
 
-Reusing one process means Python startup + module imports + (often) JIT cache
-are amortized across the three eval matrices. ~2x faster than three back-to-back
-``eval_sim`` invocations.
+Reusing one process amortizes Python startup, module imports, and the JAX
+JIT cache across configs. Roughly 2x faster than back-to-back ``eval_sim``
+invocations.
 
-Emits the composite metric ``L2_lap_mean_finished_only / max(L2_finish_frac, 0.05)``
-on stdout, lower-is-better. The per-level results are echoed for the
-``post_hoc_select`` wrapper to grep.
+Two metrics emitted on stdout:
+
+- ``COMPOSITE_METRIC`` — historical L2 metric
+  ``L2_lap_mean_finished_only / max(L2_finish_frac, 0.05)``, lower-is-better.
+  Only emitted when level 2 is in ``--levels``.
+- ``L3_FINISHES`` — finish count on level 3, primary metric for L3 work.
+  Only emitted when level 3 is in ``--levels``.
 
 Usage
 -----
-    pixi run -e rl-train python scripts/eval_3level.py \
-        --checkpoint <run_or_view_dir> \
-        --n-runs 20
+    pixi run -e rl-train python scripts/eval_3level.py \\
+        --checkpoint <run_or_view_dir> \\
+        --n-runs 20 \\
+        --levels 0,1,2,3
 """
 
 from __future__ import annotations
@@ -24,8 +29,8 @@ import fire
 from lsy_drone_racing.control.rl_song import eval_sim
 
 
-def main(checkpoint: str, n_runs: int = 20) -> None:
-    """Eval one checkpoint on level0/1/2 deterministically.
+def main(checkpoint: str, n_runs: int = 20, levels: str = "0,1,2") -> None:
+    """Eval one checkpoint on the requested levels deterministically.
 
     Parameters
     ----------
@@ -36,10 +41,14 @@ def main(checkpoint: str, n_runs: int = 20) -> None:
     n_runs : int
         Episodes per level. Defaults to 20 to match the project's eval
         matrix convention.
+    levels : str
+        Comma-separated level indices to evaluate (e.g. ``"0,1,2"`` or
+        ``"0,1,2,3"`` to include the L3 OOD config).
     """
-    finished = {}
-    mean_lap = {}
-    for level in (0, 1, 2):
+    requested_levels = tuple(int(s) for s in levels.split(","))
+    finished: dict[int, int] = {}
+    mean_lap: dict[int, float] = {}
+    for level in requested_levels:
         ep_times = eval_sim.simulate(
             config=f"level{level}.toml",
             checkpoint=checkpoint,
@@ -53,14 +62,18 @@ def main(checkpoint: str, n_runs: int = 20) -> None:
         lap_str = f"{mean_lap[level]:.3f}" if ok else "NA"
         print(f"L{level}: {finished[level]}/{n_runs} @ {lap_str}", flush=True)
 
-    l2_finish_frac = finished[2] / n_runs
-    if math.isnan(mean_lap[2]):
-        metric = math.inf
-    else:
-        denom = max(l2_finish_frac, 0.05)
-        metric = mean_lap[2] / denom
-    metric_str = "inf" if math.isinf(metric) else f"{metric:.2f}"
-    print(f"COMPOSITE_METRIC={metric_str}", flush=True)
+    if 2 in finished:
+        l2_finish_frac = finished[2] / n_runs
+        if math.isnan(mean_lap[2]):
+            metric = math.inf
+        else:
+            denom = max(l2_finish_frac, 0.05)
+            metric = mean_lap[2] / denom
+        metric_str = "inf" if math.isinf(metric) else f"{metric:.2f}"
+        print(f"COMPOSITE_METRIC={metric_str}", flush=True)
+
+    if 3 in finished:
+        print(f"L3_FINISHES={finished[3]}/{n_runs}", flush=True)
 
 
 if __name__ == "__main__":
