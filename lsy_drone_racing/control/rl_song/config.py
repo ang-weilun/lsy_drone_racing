@@ -821,6 +821,42 @@ class RewardConfig:
     # See ``reward.step_reward``: ``r_exit_vel = exit_vel_coef *
     # clip(v · dir_to_next, -exit_vel_clip, exit_vel_clip)``.
     exit_vel_clip_mps: float = 5.0
+    # v64: Caution shaping for randomized-track regime (level 3 or any
+    # stage with gate_rand_scale > 0). Penalizes high speed near the
+    # current target gate when the gate is NOT YET sensor-visible. The
+    # racing env masks ``env_obs["gates_pos"]`` to the nominal/placed
+    # location until the gate enters ``sensor_range`` (= 0.7 m on level
+    # 3 toml); after that the masked obs matches the true wobbled gate.
+    # Without this shaping, the policy on a randomized track flies at
+    # ~5 m/s toward the nominal location, gets only ~0.14 s (7 steps at
+    # 50 Hz) of reaction time after sensor reveal, and crashes into the
+    # actually-positioned gate frame. r_caution = -caution_coef *
+    # ||vel|| * exp(-((dist - peak_m)/kernel_m)^2) * visibility_factor,
+    # where visibility_factor is 1.0 when ||masked - true|| > threshold
+    # (gate not yet revealed) and ``caution_visible_factor`` otherwise.
+    # On deterministic tracks ||masked - true|| = 0 always, so with the
+    # default ``caution_visible_factor = 0`` the term is dormant on L0/
+    # L1/L2. Off by default (opt-in via --use-caution).
+    use_caution: bool = False
+    caution_coef: float = 0.05
+    # Peak penalty distance (m) — the kernel exp(-((dist-peak)/width)^2)
+    # is maximal at dist = peak_m. Defaults to 1.0 m which is just outside
+    # the level-3 sensor_range so the penalty incentivises braking before
+    # the reveal point.
+    caution_peak_m: float = 1.0
+    # Gaussian width (m) of the caution kernel. Tapers to negligible
+    # beyond ~2.5 × kernel_m from the peak.
+    caution_kernel_m: float = 0.8
+    # Threshold (m) on ||masked_target_pos - true_target_pos||; below
+    # this the gate is treated as sensor-visible. Default 0.005 m
+    # (5 mm) is conservatively below any meaningful wobble.
+    caution_visible_threshold_m: float = 0.005
+    # Penalty multiplier when the gate is sensor-visible. Default 0.0
+    # means caution turns off completely once the sensor reveals the
+    # true position, so the policy can commit aggressively in that
+    # final window. Raise to 0.2-0.5 if late-window aggression is too
+    # much.
+    caution_visible_factor: float = 0.0
     # v8: per-step time penalty. With randomized gates the random-init policy
     # has zero progress in expectation, while a stationary "hover" policy
     # collects zero shaping reward and just times out — making hover the Q≈0

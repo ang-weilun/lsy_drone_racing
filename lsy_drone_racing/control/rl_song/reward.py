@@ -481,6 +481,40 @@ def step_reward(
         exit_vel_active, reward_cfg.exit_vel_coef * v_to_next_clipped, jnp.zeros_like(r_prog)
     )
 
+    # v64: Caution shaping for randomized-track regime. Penalizes high
+    # speed near the current target gate when ``env_obs["gates_pos"]``
+    # (masked by sensor_range) still reports the nominal/placed location.
+    # On deterministic tracks the masked obs equals the true position, so
+    # the visibility factor (default 0.0) zeros this term out and L0/L1/L2
+    # behaviour is unchanged. On randomized tracks the masked vs true
+    # difference is non-zero until the target gate enters sensor_range,
+    # at which point the visibility factor drops the penalty so the policy
+    # can commit aggressively to the revealed true position. See
+    # ``RewardConfig.use_caution`` for the full rationale.
+    masked_target_pos = env_obs["gates_pos"][env_idx, target_idx]
+    gate_visibility_err = jnp.linalg.norm(masked_target_pos - gate_pos, axis=-1)
+    gate_visible = gate_visibility_err < reward_cfg.caution_visible_threshold_m
+    caution_visibility_factor = jnp.where(
+        gate_visible,
+        jnp.full_like(r_prog, reward_cfg.caution_visible_factor),
+        jnp.ones_like(r_prog),
+    )
+    caution_target_dist = jnp.linalg.norm(gate_pos - pos, axis=-1)
+    caution_kernel = jnp.exp(
+        -jnp.square(
+            (caution_target_dist - reward_cfg.caution_peak_m) / reward_cfg.caution_kernel_m
+        )
+    )
+    caution_speed = jnp.linalg.norm(env_obs["vel"], axis=-1)
+    r_caution_raw = (
+        -reward_cfg.caution_coef * caution_speed * caution_kernel * caution_visibility_factor
+    )
+    r_caution = jnp.where(
+        jnp.asarray(reward_cfg.use_caution, dtype=bool) & (current_target >= 0),
+        r_caution_raw,
+        jnp.zeros_like(r_prog),
+    )
+
     r_finish = jnp.where(finished, reward_cfg.finish_bonus, jnp.zeros_like(r_prog))
     r_crash = jnp.where(terminated & ~finished, -reward_cfg.crash_penalty, jnp.zeros_like(r_prog))
     r_terminal = r_finish + r_crash
@@ -510,6 +544,7 @@ def step_reward(
     r_obs = jnp.where(not_crash, r_obs, jnp.zeros_like(r_obs))
     r_gate_frame = jnp.where(not_crash, r_gate_frame, jnp.zeros_like(r_gate_frame))
     r_guid = jnp.where(not_crash, r_guid, jnp.zeros_like(r_guid))
+    r_caution = jnp.where(not_crash, r_caution, jnp.zeros_like(r_caution))
 
     components = {
         "r_prog": r_prog,
@@ -522,6 +557,7 @@ def step_reward(
         "r_time": r_time,
         "r_vel": r_vel,
         "r_guid": r_guid,
+        "r_caution": r_caution,
     }
     reward = (
         r_prog
@@ -534,5 +570,6 @@ def step_reward(
         + r_time
         + r_vel
         + r_guid
+        + r_caution
     )
     return reward, components

@@ -129,6 +129,13 @@ class CLIArgs:
     # default_curriculum and gets 0/20 on L3 because gate randomization is
     # OOD. Pair with ``--stage`` to pick the entry stage (1-indexed).
     curriculum: str | None = None
+    # Toggle for the v64 caution-shaping reward term (``r_caution``).
+    # Penalises ``||vel|| × kernel(dist_to_target_gate)`` when the target
+    # gate is not yet sensor-visible (masked obs differs from true). Off
+    # by default (no behaviour change on L0-L2 even when on, since masked
+    # equals true on deterministic tracks). Recommended for any
+    # randomized-track stage (L3 or stage3a/b/c).
+    use_caution: bool | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -389,6 +396,8 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         if args.time_penalty < 0.0:
             raise ValueError(f"time_penalty must be non-negative; got {args.time_penalty}")
         reward_cfg = replace(reward_cfg, time_penalty=args.time_penalty)
+    if args.use_caution is not None:
+        reward_cfg = replace(reward_cfg, use_caution=args.use_caution)
     curriculum_cfg = cfg.curriculum
     if args.curriculum is not None:
         if args.curriculum == "default":
