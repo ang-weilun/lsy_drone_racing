@@ -29,7 +29,7 @@ import fire
 from lsy_drone_racing.control.rl_song import eval_sim
 
 
-def main(checkpoint: str, n_runs: int = 20, levels: str = "0,1,2") -> None:
+def main(checkpoint: str, n_runs: int = 10, levels: str = "0,1,2") -> None:
     """Eval one checkpoint on the requested levels deterministically.
 
     Parameters
