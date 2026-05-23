@@ -102,6 +102,16 @@ class CLIArgs:
     # re-bloom entropy by ~10 units before annealing back down, wasting
     # 100-200M steps. Set 0.001 to keep the policy committed.
     ent_coef_start: float | None = None
+    # Override ``PPOConfig.ent_coef_final`` (default 0.005). v66 finding:
+    # setting only ``ent_coef_start=0.001`` makes the linear schedule
+    # ANNEAL UP from 0.001 to 0.005 over training — exactly opposite of
+    # the intended "keep policy committed" behavior. On on-distribution
+    # warm-starts (v53/v55/v56 chain), the policy survived this because
+    # the curriculum was familiar. On randomized-track L3 warm-starts
+    # (v61-v65), the rising entropy was fatal: policy already crashing,
+    # needed to commit harder, instead got progressively more random.
+    # Pair with ``ent_coef_start`` for a true flat low-entropy schedule.
+    ent_coef_final: float | None = None
     # Override the per-step rotation budget ``‖τ_scaled‖ ≤ α_max`` (rad). The
     # default (``TrainConfig.tangent_alpha_max_rad`` = :data:`TANGENT_ALPHA_MAX_RAD`)
     # is 0.04 rad ≈ 2.3°/step at 50 Hz — conservative per Schuck 2025 Hyp. 1.
@@ -393,6 +403,8 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         ppo_cfg = replace(ppo_cfg, gamma=args.gamma)
     if args.ent_coef_start is not None:
         ppo_cfg = replace(ppo_cfg, ent_coef=args.ent_coef_start)
+    if args.ent_coef_final is not None:
+        ppo_cfg = replace(ppo_cfg, ent_coef_final=args.ent_coef_final)
     alpha_max = cfg.tangent_alpha_max_rad if args.alpha_max_rad is None else args.alpha_max_rad
     if alpha_max <= 0.0:
         raise ValueError(f"alpha_max_rad must be positive; got {alpha_max}")
