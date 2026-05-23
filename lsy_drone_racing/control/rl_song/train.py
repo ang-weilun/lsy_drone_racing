@@ -136,6 +136,13 @@ class CLIArgs:
     # equals true on deterministic tracks). Recommended for any
     # randomized-track stage (L3 or stage3a/b/c).
     use_caution: bool | None = None
+    # Override ``RewardConfig.caution_coef`` (default 0.05). Magnitude of
+    # the r_caution penalty per step. v64 at 0.05 (gave ~-0.25/step near
+    # invisible gates, comparable to progress reward's ~+0.5/step) caused
+    # immediate policy collapse on warm-start. v65 onward sweeps lower
+    # (0.01-0.02 range) to find the value that nudges behavior without
+    # destroying the racing prior.
+    caution_coef: float | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -398,6 +405,10 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         reward_cfg = replace(reward_cfg, time_penalty=args.time_penalty)
     if args.use_caution is not None:
         reward_cfg = replace(reward_cfg, use_caution=args.use_caution)
+    if args.caution_coef is not None:
+        if args.caution_coef < 0.0:
+            raise ValueError(f"caution_coef must be non-negative; got {args.caution_coef}")
+        reward_cfg = replace(reward_cfg, caution_coef=args.caution_coef)
     curriculum_cfg = cfg.curriculum
     if args.curriculum is not None:
         if args.curriculum == "default":
