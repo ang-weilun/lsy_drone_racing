@@ -107,6 +107,18 @@ class CLIArgs:
     # spot for the active track; ``tangent/saturation_fraction`` rising past
     # ~0.5 is the wandb signal to bump α_max.
     alpha_max_rad: float | None = None
+    # Override ``RewardConfig.use_guide`` (default True). Disables the
+    # Δ-potential aperture/anti-loiter shaping term ``r_guid``. Added v46 to
+    # prevent the hover-above-gate-0 attractor; on a warm-started, already-
+    # non-hovering policy it may shape behavior toward conservative midline
+    # tracking rather than time-optimal cornering. Pair with
+    # ``time_penalty 0`` for a clean test of the v46 anti-hover stack.
+    use_guide: bool | None = None
+    # Override ``RewardConfig.time_penalty`` (default 0.05 per step). Global
+    # anti-hover signal that costs -25 over a 500-step timeout. Like
+    # ``use_guide``, was added to combat the v44-v45 hover collapse; on a
+    # warm-started policy it may suppress aggressive transient maneuvers.
+    time_penalty: float | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -360,12 +372,20 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
     alpha_max = cfg.tangent_alpha_max_rad if args.alpha_max_rad is None else args.alpha_max_rad
     if alpha_max <= 0.0:
         raise ValueError(f"alpha_max_rad must be positive; got {alpha_max}")
+    reward_cfg = cfg.reward
+    if args.use_guide is not None:
+        reward_cfg = replace(reward_cfg, use_guide=args.use_guide)
+    if args.time_penalty is not None:
+        if args.time_penalty < 0.0:
+            raise ValueError(f"time_penalty must be non-negative; got {args.time_penalty}")
+        reward_cfg = replace(reward_cfg, time_penalty=args.time_penalty)
     return replace(
         cfg,
         ppo=ppo_cfg,
         seed=args.seed,
         initial_stage_index=args.stage - 1,
         tangent_alpha_max_rad=alpha_max,
+        reward=reward_cfg,
         wandb_project=args.wandb_project or cfg.wandb_project,
         wandb_entity=args.wandb_entity,
         run_name=args.run_name,
