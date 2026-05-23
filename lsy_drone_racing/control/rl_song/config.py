@@ -348,7 +348,15 @@ class RewardConfig:
     # of which v43 strips. With those gone, Song's literal value restores
     # the documented event:r_prog ratio (finish +10 vs integrated r_prog
     # ≈ +6.6 over a clean lap on the 6.61 m level-1 path).
-    progress_coef: float = 1.0
+    # v47: 1.0 -> 10.0. Bare Song magnitudes left a finished lap paying
+    # only -6 net at v46's anti-hover-augmented reward (r_prog +6.6 +
+    # finish +10 - time -10 - guide -10 - omega -2). Crash dominated,
+    # producing a "commit-and-crash" attractor instead of a finish-
+    # incentivised one. Restoring v38's 10× scaling: integrated r_prog
+    # ≈ +66 over a clean lap puts finish at +100 net (with gate_pass
+    # bonus +100 below) vs crash -15, restoring the v42 positive
+    # gradient that produced 100% L0 gate-0 traversal.
+    progress_coef: float = 10.0
     # v20: switch r_prog from the legacy distance-delta formulation
     # (||g - p_prev|| - ||g - p||) to the Song-2023 / Kaufmann-2023
     # velocity-projection variant: project the world-frame displacement
@@ -524,7 +532,13 @@ class RewardConfig:
     # paired with time_penalty=0.05 and gate_pass_bonus=20-scaled. v43
     # drops all three add-ons; Song's literal ±10 is the matched pair
     # that holds the finish:crash ratio at 1:1.
-    crash_penalty: float = 10.0
+    # v47: 10.0 -> 15.0. v38c value, paired with v47 progress_coef=10 and
+    # finish_bonus=100 below. With v42's full reward stack, integrated
+    # event reward over a clean lap is ~+200 (gate jackpot scaled
+    # 10+20+30+40=100 + finish 100), so a 15-point crash penalty is
+    # deterrent without making crash-trying strictly worse than do-
+    # nothing (which time_penalty=0.05 already handles at -25/episode).
+    crash_penalty: float = 15.0
     # v9: increased finish_bonus from 10 to 100 in tandem with shrinking the
     # per-gate jackpot below. The reward economics from v8 paid +60 for
     # reach-gate-2-then-crash vs +10 for finish, so crashing was rational.
@@ -545,7 +559,14 @@ class RewardConfig:
     # v38's 100 was a 10× scale-up to match the v18 jackpot magnitude
     # (+200 integrated event reward); with jackpot stripped in v43, +10
     # is the only consistent value.
-    finish_bonus: float = 10.0
+    # v47: 10.0 -> 100.0. With progress_coef=10 and integrated r_prog ≈
+    # +66 over a clean lap, finish_bonus needs to be on the same order
+    # for the value function to weight the lap-finish event meaningfully.
+    # 100 was v38/v42's value and pairs with the jackpot scaling below
+    # (1+2+3+4 × 10 = +100 event reward for completing the four gates,
+    # plus +100 finish = +200 event total, dominating the dense -10
+    # time + -10 guide cost).
+    finish_bonus: float = 100.0
     # Obstacle soft barrier: -w_obs * sum_i exp(-||p - p_obstacle_i||^2 / sigma^2)
     # v32: bump sigma from 0.2 → 0.3 m so the penalty has a meaningful
     # avoidance gradient at safe-but-close distances (old 0.2 m gave
@@ -732,7 +753,14 @@ class RewardConfig:
     # is real but unverified under the current 4D delta-tangent action
     # head + bare L2 curriculum; v43 is the clean test of whether the
     # gate-progress gradient alone bootstraps under those conditions.
-    use_gate_pass_bonus: bool = False
+    # v47: False -> True. Per-gate event reward (scaled 10/20/30/40 with
+    # scale_gate_bonus_by_index below) — the v18 cold-start scaffold
+    # that v36's no-jackpot run lacked, the v37b/v42 history block
+    # identified as load-bearing. With v46 anti-hover pressure now in
+    # place, the jackpot provides the *positive* gradient toward
+    # gate-passing that bare Song's distance-delta r_prog (which
+    # plateaus at the gate plane) doesn't.
+    use_gate_pass_bonus: bool = True
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
     # jackpot. The dense progress reward already pulls the policy through
