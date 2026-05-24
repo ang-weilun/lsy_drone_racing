@@ -133,7 +133,10 @@ def train(
             name=run_name,
             id=run_name,
             resume="allow",
-            sync_tensorboard=True,  # SBX writes through SB3's tensorboard logger
+            # ``sync_tensorboard`` would require the ``tensorboard`` package
+            # which isn't in the rl-train env. WandbCallback below already
+            # forwards SB3's scalar logger to wandb, so the tensorboard
+            # sync is redundant.
             config={
                 "stack": "rl_sbx",
                 "total_timesteps": total_timesteps,
@@ -194,7 +197,6 @@ def train(
         target_kl=train_cfg.ppo.target_kl,
         seed=seed,
         verbose=1,
-        tensorboard_log=f"runs/{run_name}" if wandb_run is not None else None,
     )
 
     callbacks: list = [NormalizerUpdateCallback()]
