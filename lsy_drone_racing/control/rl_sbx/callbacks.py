@@ -1,0 +1,129 @@
+"""SBX callbacks for the rl_sbx stack.
+
+``NormalizerUpdateCallback`` runs the Welford running-stat updates on the
+env's two ``NormalizerState`` instances at each ``_on_rollout_end``. Updates
+are independent — actor and critic normalizers are NEVER cross-pollinated.
+
+The rollout buffer stores normalized obs (the env wrapper normalizes before
+returning). We invert the affine normalization to recover raw values, then
+run ``update_normalizer`` on the raw batch. This mirrors
+``RLSongVecEnv.update_normalizer_from_batch``.
+"""
+
+from __future__ import annotations
+
+import jax.numpy as jnp
+import numpy as np
+from stable_baselines3.common.callbacks import BaseCallback
+
+from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM
+from lsy_drone_racing.control.rl_song.obs import NORM_VAR_EPS, NormalizerState, update_normalizer
+
+# Flat-concat obs layout (see ``RLSBXVecEnv._build_obs``):
+#   [0 : ACTOR_OBS_DIM)            → masked actor obs
+#   [ACTOR_OBS_DIM : 2*ACTOR_OBS_DIM) → privileged critic obs
+ACTOR_SLICE = slice(0, ACTOR_OBS_DIM)
+CRITIC_SLICE = slice(ACTOR_OBS_DIM, 2 * ACTOR_OBS_DIM)
+
+
+def _find_underlying_env(env: object) -> object:
+    """Drill through ``VecEnv`` wrappers to find the ``RLSBXVecEnv``.
+
+    Parameters:
+    ----------
+    env : object
+        The initial env (typically ``BaseCallback.training_env``), which may
+        be wrapped in ``VecMonitor``, ``VecNormalize``, etc.
+
+    Returns:
+    -------
+    object
+        The first env in the wrapper chain exposing ``actor_normalizer``.
+
+    Raises:
+    ------
+    RuntimeError
+        If no env in the chain exposes ``actor_normalizer``.
+    """
+    while not hasattr(env, "actor_normalizer"):
+        if hasattr(env, "venv"):
+            env = env.venv
+        elif hasattr(env, "env"):
+            env = env.env
+        else:
+            raise RuntimeError("Could not find RLSBXVecEnv under training_env wrappers.")
+    return env
+
+
+class NormalizerUpdateCallback(BaseCallback):
+    """Welford-update both normalizers after each rollout buffer fill.
+
+    The rollout buffer at ``_on_rollout_end`` contains ``n_steps * n_envs``
+    samples of shape ``(2*ACTOR_OBS_DIM,)`` that have already been normalized
+    by the env wrapper. We split each sample into actor / critic halves,
+    invert the affine ``(x - mean) / sqrt(var + eps)`` to recover raw values,
+    and feed each half to its respective ``NormalizerState`` independently.
+
+    Parameters:
+    ----------
+    verbose : int, optional
+        SB3 verbosity, propagated to ``BaseCallback``.
+
+    Notes:
+    -----
+    Inversion is exact (no information loss): the env wrapper normalizes with
+    the stats valid at the start of the rollout, and those same stats live on
+    the env object until this callback fires.
+    """
+
+    def __init__(self, verbose: int = 0) -> None:
+        """Initialize the callback. See class docstring for parameter details."""
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Update both ``NormalizerState`` instances from the rollout buffer."""
+        env = _find_underlying_env(self.training_env)
+        rollout_buffer = self.model.rollout_buffer
+        observations = rollout_buffer.observations
+        if observations is None:
+            raise RuntimeError("rollout_buffer.observations is None at _on_rollout_end.")
+        # Flatten (n_steps, n_envs, obs_dim) → (n_steps * n_envs, obs_dim).
+        flat_obs = np.asarray(observations).reshape(-1, observations.shape[-1])
+        actor_normalized = flat_obs[:, ACTOR_SLICE]
+        critic_normalized = flat_obs[:, CRITIC_SLICE]
+
+        actor_raw = self._invert(actor_normalized, env.actor_normalizer)
+        critic_raw = self._invert(critic_normalized, env.critic_normalizer)
+
+        new_actor = update_normalizer(env.actor_normalizer, jnp.asarray(actor_raw))
+        new_critic = update_normalizer(env.critic_normalizer, jnp.asarray(critic_raw))
+        env.set_actor_normalizer(new_actor)
+        env.set_critic_normalizer(new_critic)
+
+    @staticmethod
+    def _invert(normalized: np.ndarray, state: NormalizerState) -> np.ndarray:
+        """Recover raw obs values from post-normalization obs.
+
+        Parameters:
+        ----------
+        normalized : ndarray, shape (n_samples, obs_dim)
+            Observations as stored in the rollout buffer.
+        state : NormalizerState
+            The normalizer state in effect during the rollout.
+
+        Returns:
+        -------
+        raw : ndarray, shape (n_samples, obs_dim)
+            Raw obs values, recovered via ``z * sqrt(var + eps) + mean``.
+
+        Notes:
+        -----
+        The forward map is ``normalize(x) = (x - mean) / sqrt(var + eps)``;
+        this is its exact inverse.
+        """
+        std = np.sqrt(np.asarray(state.var) + NORM_VAR_EPS)
+        mean = np.asarray(state.mean)
+        return normalized * std + mean
