@@ -267,7 +267,13 @@ class RLSBXVecEnv(VecEnv):
         self._prev_env_obs = env_obs
 
         obs_array = self._build_obs(env_obs)
-        reward_np = np.asarray(reward, dtype=np.float32)
+        # ``np.asarray`` on a JAX array returns a read-only view backed by the
+        # device buffer. SBX's ``OnPolicyAlgorithm.collect_rollouts`` mutates
+        # the returned reward in-place when bootstrapping value on timeout
+        # (``rewards[idx] += gamma * terminal_value`` at
+        # ``sbx/common/on_policy_algorithm.py:210``), so the reward must be a
+        # writable numpy array. ``np.array`` forces a copy.
+        reward_np = np.array(reward, dtype=np.float32)
         infos = _build_infos(self.num_envs, terminated_np, truncated_np, obs_array)
         return obs_array, reward_np, done_np, infos
 
