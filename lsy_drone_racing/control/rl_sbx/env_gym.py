@@ -7,9 +7,14 @@ in :mod:`sbx` can drive the same JAX simulation the Song-2023 prototype used.
 Three design choices distinguish this wrapper from
 :class:`lsy_drone_racing.control.rl_song.env_wrapper.RLSongVecEnv`.
 
-1. **Dict observation space** ``{"actor", "critic"}`` instead of two parallel
-   tensors. SBX/SB3 routes dict obs to a Dict policy unchanged, which is
-   what the asymmetric actor/critic in Task 4 consumes.
+1. **Flat-concat observation space.** A single ``Box(2*ACTOR_OBS_DIM,)`` whose
+   first half is the masked actor obs and second half is the privileged critic
+   obs. The Task 4 ``Actor`` / ``Critic`` flax modules slice their respective
+   half. ``sbx.PPO`` has no dict-obs support
+   (``sbx/ppo/ppo.py:297`` calls ``rollout_data.observations.numpy()``
+   unconditionally), so a single tensor is the only transport that works with
+   the stock training loop. See the 2026-05-24 addendum in
+   ``docs/specs/2026-05-24-sbx-migration-design.md``.
 2. **Masked-geometry reward.** ``step_reward`` is called without ``true_*``
    kwargs, so the reward gradients only see what the actor sees. This is
    risk-3 mitigation from the migration design: the v85 line of attack
@@ -106,15 +111,8 @@ class RLSBXVecEnv(VecEnv):
         seed: int,
     ):
         """Construct the wrapper. See the class docstring for parameter details."""
-        observation_space = spaces.Dict(
-            {
-                "actor": spaces.Box(
-                    low=OBS_LOW, high=OBS_HIGH, shape=(ACTOR_OBS_DIM,), dtype=np.float32
-                ),
-                "critic": spaces.Box(
-                    low=OBS_LOW, high=OBS_HIGH, shape=(ACTOR_OBS_DIM,), dtype=np.float32
-                ),
-            }
+        observation_space = spaces.Box(
+            low=OBS_LOW, high=OBS_HIGH, shape=(2 * ACTOR_OBS_DIM,), dtype=np.float32
         )
         action_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(RAW_ACTION_DIM,), dtype=np.float32
@@ -141,19 +139,19 @@ class RLSBXVecEnv(VecEnv):
     # SB3 VecEnv interface
     # ------------------------------------------------------------------
     def reset(self) -> VecEnvObs:
-        """Reset every world and return the dict observation.
+        """Reset every world and return the flat-concat observation.
 
         Returns:
         -------
-        observations : dict[str, np.ndarray]
-            ``{"actor", "critic"}`` arrays each shaped
-            ``(n_envs, ACTOR_OBS_DIM)``.
+        observations : np.ndarray, shape (n_envs, 2*ACTOR_OBS_DIM)
+            First half is masked actor obs, second half is privileged critic
+            obs. See module docstring for the layout rationale.
         """
         env_obs, _info = self.jax_env.reset(seed=self.seed_value)
         env_obs = _to_jax_obs(env_obs)
         self._prev_env_obs = env_obs
         self._prev_action = jnp.zeros((self.num_envs, ENV_ACTION_DIM), dtype=jnp.float32)
-        return self._build_dict_obs(env_obs)
+        return self._build_obs(env_obs)
 
     def step_async(self, actions: np.ndarray) -> None:
         """Stash actions for the next :meth:`step_wait`."""
@@ -164,7 +162,8 @@ class RLSBXVecEnv(VecEnv):
 
         Returns:
         -------
-        obs : dict[str, np.ndarray]
+        obs : np.ndarray, shape (n_envs, 2*ACTOR_OBS_DIM)
+            Flat-concat obs, see :meth:`reset` for layout.
         reward : np.ndarray, shape (n_envs,)
         done : np.ndarray, shape (n_envs,)
             ``terminated | truncated``. SB3 PPO uses the per-env
@@ -236,10 +235,10 @@ class RLSBXVecEnv(VecEnv):
         self._prev_action = jnp.where(done[:, None], reset_prev_action, env_action)
         self._prev_env_obs = env_obs
 
-        obs_dict = self._build_dict_obs(env_obs)
+        obs_array = self._build_obs(env_obs)
         reward_np = np.asarray(reward, dtype=np.float32)
-        infos = _build_infos(self.num_envs, terminated_np, truncated_np, obs_dict)
-        return obs_dict, reward_np, done_np, infos
+        infos = _build_infos(self.num_envs, terminated_np, truncated_np, obs_array)
+        return obs_array, reward_np, done_np, infos
 
     def close(self) -> None:
         """Close the underlying JAX env."""
@@ -309,8 +308,16 @@ class RLSBXVecEnv(VecEnv):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _build_dict_obs(self, env_obs: dict[str, Array]) -> dict[str, np.ndarray]:
-        """Encode masked actor obs and privileged critic obs as ``(n_envs, D)``."""
+    def _build_obs(self, env_obs: dict[str, Array]) -> np.ndarray:
+        """Encode the flat-concat ``[actor | critic]`` obs of shape ``(n_envs, 2D)``.
+
+        The actor half is built from masked geometry via
+        :func:`obs_encoding.vmap_build_actor_obs`; the critic half is built
+        from privileged geometry via :func:`obs_encoding.vmap_build_critic_obs`
+        with ``true_*`` kwargs read straight from the JAX env's ``data``. Each
+        half is normalized by its own ``NormalizerState`` before
+        concatenation.
+        """
         actor = obs_encoding.vmap_build_actor_obs(env_obs, self._prev_action, self.actor_normalizer)
         critic = obs_encoding.vmap_build_critic_obs(
             env_obs,
@@ -320,10 +327,9 @@ class RLSBXVecEnv(VecEnv):
             true_gates_quat=jnp.asarray(self.jax_env.data.gates_quat),
             true_obstacles_pos=jnp.asarray(self.jax_env.data.obstacles_pos),
         )
-        return {
-            "actor": np.asarray(actor, dtype=np.float32),
-            "critic": np.asarray(critic, dtype=np.float32),
-        }
+        return np.concatenate(
+            [np.asarray(actor, dtype=np.float32), np.asarray(critic, dtype=np.float32)], axis=-1
+        )
 
 
 def _to_jax_obs(env_obs: dict[str, Any]) -> dict[str, Array]:
@@ -341,7 +347,7 @@ def _resolve_indices_count(indices: Any, num_envs: int) -> int:
 
 
 def _build_infos(
-    num_envs: int, terminated: np.ndarray, truncated: np.ndarray, obs_dict: dict[str, np.ndarray]
+    num_envs: int, terminated: np.ndarray, truncated: np.ndarray, obs: np.ndarray
 ) -> list[dict[str, Any]]:
     """Build the per-env info list with SB3 timeout-bootstrap fields.
 
@@ -349,8 +355,8 @@ def _build_infos(
     ----------
     num_envs : int
     terminated, truncated : np.ndarray, shape (n_envs,)
-    obs_dict : dict[str, np.ndarray]
-        Already-built post-step (post-autoreset) dict obs. Stored under
+    obs : np.ndarray, shape (n_envs, 2*ACTOR_OBS_DIM)
+        Already-built post-step (post-autoreset) flat-concat obs. Stored under
         ``terminal_observation`` for envs whose ``done`` flag is set, so
         SB3's PPO can bootstrap correctly on timeouts. Note this is the
         observation of the freshly-reset world, not of the terminal state
@@ -364,8 +370,5 @@ def _build_infos(
         if not done_mask[env_idx]:
             continue
         infos[env_idx]["TimeLimit.truncated"] = bool(truncated[env_idx] and not terminated[env_idx])
-        infos[env_idx]["terminal_observation"] = {
-            "actor": obs_dict["actor"][env_idx],
-            "critic": obs_dict["critic"][env_idx],
-        }
+        infos[env_idx]["terminal_observation"] = obs[env_idx]
     return infos
