@@ -223,9 +223,14 @@ class RLSBXVecEnv(VecEnv):
 
         # Autoreset only worlds that finished. The high-level ``.reset()``
         # resets every world, which would discard fresh in-flight transitions.
+        # ``race_core_obs(data)`` is shape ``(n_envs, n_drones=1, ...)`` — the
+        # high-level ``VecDroneRaceEnv.step/reset`` squeezes the drone axis
+        # before returning. We replicate that squeeze here so the obs dict is
+        # consistent across the pre-step and post-autoreset paths.
         if bool(done_np.any()):
             self.jax_env.data, _ = self.jax_env._reset(self.jax_env.data, seed=None, mask=done)
-            env_obs = _to_jax_obs(race_core_obs(self.jax_env.data))
+            raw_env_obs = race_core_obs(self.jax_env.data)
+            env_obs = {key: jnp.asarray(value[:, 0]) for key, value in raw_env_obs.items()}
 
         reset_prev_action = jnp.zeros_like(env_action)
         self._prev_action = jnp.where(done[:, None], reset_prev_action, env_action)
