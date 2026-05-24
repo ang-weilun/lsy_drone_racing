@@ -34,7 +34,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import fire
-from drone_models.core import load_params
 from sbx import PPO
 
 from lsy_drone_racing.control.rl_sbx.callbacks import NormalizerUpdateCallback
@@ -43,12 +42,6 @@ from lsy_drone_racing.control.rl_sbx.env_gym import RLSBXVecEnv
 from lsy_drone_racing.control.rl_sbx.policy import AsymmetricActorCriticPolicy
 from lsy_drone_racing.control.rl_song.config import TANGENT_ALPHA_MAX_RAD, RewardConfig, TrainConfig
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
-
-# Matches rl_song.controller / env_wrapper: the per-rotor sys_id thrust is
-# scaled by the rotor count (4 for cf2x) to obtain the collective-thrust bound
-# the attitude controller commands. Keep in sync with
-# ``rl_song.env_wrapper.TOTAL_THRUST_MULTIPLIER``.
-THRUST_MULTIPLIER: float = 4.0
 
 # v77 cold-train recipe defaults; see design doc §M1.
 DEFAULT_TOTAL_TIMESTEPS: int = 155_000_000
@@ -123,12 +116,12 @@ def train(
     # runs its own reset(seed=seed+stage_idx) — no second reset call needed.
     wrapper = RLSongVecEnv(train_cfg, n_envs=effective_n_envs, stage_idx=0, seed=seed, device="gpu")
 
-    # Mirror rl_song.env_wrapper.RLSongVecEnv: per-rotor thrust bounds from
-    # the cf2x_L250 sys_id, scaled by the four-rotor count to give the
-    # collective-thrust envelope the attitude controller commands.
-    drone_params = load_params("sys_id", "cf2x_L250")
-    thrust_min = float(drone_params["thrust_min"] * THRUST_MULTIPLIER)
-    thrust_max = float(drone_params["thrust_max"] * THRUST_MULTIPLIER)
+    # Inherit thrust bounds from the wrapper, which already loaded them via
+    # ``load_params(level_toml.sim.physics, level_toml.sim.drone_model)``
+    # ("first_principles" / "cf21B_500" for the level2 toml) and scaled by
+    # ``TOTAL_THRUST_MULTIPLIER``. Avoids hardcoding a physics/drone-model
+    # pair here that could drift out of sync with the actual training stage.
+    thrust_min, thrust_max = wrapper.get_thrust_bounds()
 
     env = RLSBXVecEnv(
         jax_env=wrapper.env,
