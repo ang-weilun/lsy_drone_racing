@@ -35,13 +35,20 @@ from pathlib import Path
 
 import fire
 from sbx import PPO
+from wandb.integration.sb3 import WandbCallback
 
+import wandb
 from lsy_drone_racing.control.rl_sbx.callbacks import NormalizerUpdateCallback
 from lsy_drone_racing.control.rl_sbx.checkpoint import save_step
 from lsy_drone_racing.control.rl_sbx.env_gym import RLSBXVecEnv
 from lsy_drone_racing.control.rl_sbx.policy import AsymmetricActorCriticPolicy
 from lsy_drone_racing.control.rl_song.config import TANGENT_ALPHA_MAX_RAD, RewardConfig, TrainConfig
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
+
+# Share the rl_song wandb project so rl_sbx runs land alongside the v33-v100
+# line for direct comparison plots. ``TrainConfig.wandb_project`` is the
+# canonical source — pulled into a module constant here for clarity.
+WANDB_PROJECT: str = TrainConfig().wandb_project
 
 # v77 cold-train recipe defaults; see design doc §M1.
 DEFAULT_TOTAL_TIMESTEPS: int = 155_000_000
@@ -69,6 +76,9 @@ def train(
     batch_size: int = DEFAULT_BATCH_SIZE,
     seed: int = 0,
     checkpoint_root: str = "lsy_drone_racing/control/rl_sbx/checkpoints",
+    wandb_project: str = WANDB_PROJECT,
+    wandb_entity: str | None = None,
+    no_wandb: bool = False,
 ) -> None:
     """Run SBX PPO cold-train against the milestone-1 L2 seg-init curriculum.
 
@@ -100,12 +110,43 @@ def train(
         JAX env + PPO seed.
     checkpoint_root : str, optional
         Run directories are created at ``<checkpoint_root>/<run_name>``.
+    wandb_project : str, optional
+        Wandb project name. Defaults to the same project the rl_song line
+        publishes to so SBX runs land alongside v33-v100 for comparison.
+    wandb_entity : str, optional
+        Wandb entity (team / user). ``None`` uses the local wandb default.
+    no_wandb : bool, optional
+        Skip wandb init entirely (stdout-only diagnostics). Default
+        ``False`` — milestone-1 needs the wandb plots for the comparison
+        write-up.
 
     Notes:
     -----
     The construction order (RLSongVecEnv → RLSBXVecEnv with seg-init hook
     → SBX PPO) is load-bearing — see the module docstring.
     """
+    wandb_run = None
+    if not no_wandb:
+        wandb_run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=run_name,
+            id=run_name,
+            resume="allow",
+            sync_tensorboard=True,  # SBX writes through SB3's tensorboard logger
+            config={
+                "stack": "rl_sbx",
+                "total_timesteps": total_timesteps,
+                "alpha_max_rad": alpha_max_rad,
+                "ent_coef": ent_coef,
+                "learning_rate": learning_rate,
+                "n_envs": n_envs,
+                "n_steps": n_steps,
+                "n_epochs": n_epochs,
+                "batch_size": batch_size,
+                "seed": seed,
+            },
+        )
     train_cfg = TrainConfig()
     effective_n_envs = train_cfg.ppo.n_envs if n_envs is None else int(n_envs)
     # v77 baseline reward: no gate_frame / obstacle weight, three-term Song
@@ -153,9 +194,15 @@ def train(
         target_kl=train_cfg.ppo.target_kl,
         seed=seed,
         verbose=1,
+        tensorboard_log=f"runs/{run_name}" if wandb_run is not None else None,
     )
 
-    callbacks = [NormalizerUpdateCallback()]
+    callbacks: list = [NormalizerUpdateCallback()]
+    if wandb_run is not None:
+        # ``model_save_path=None`` skips WandbCallback's own SB3 zip dump
+        # — our two-file checkpoint format is what the deploy controller
+        # expects. ``verbose=2`` mirrors rl_song's wandb logging detail.
+        callbacks.append(WandbCallback(verbose=2))
     model.learn(total_timesteps=total_timesteps, callback=callbacks, log_interval=1)
 
     run_dir = Path(checkpoint_root) / run_name
@@ -170,6 +217,8 @@ def train(
         tangent_alpha_max_rad=alpha_max_rad,
     )
     print(f"Saved final checkpoint to {step_dir}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
