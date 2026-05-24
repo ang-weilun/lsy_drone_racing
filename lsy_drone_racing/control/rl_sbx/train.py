@@ -181,6 +181,21 @@ def train(
     # SBX 0.26 PPO kwargs: confirmed via inspect.signature on remote. ``device``
     # left at "auto" (JAX picks the default backend, which is the GPU the env
     # is already on).
+    #
+    # ``target_kl=None`` is load-bearing. SBX's ``KLAdaptiveLR`` fires
+    # ``adaptive_lr.update(kl)`` PER MINIBATCH (sbx/ppo/ppo.py:332) with a
+    # multiplicative factor of 1.5 per call. With our buffer geometry
+    # (n_envs=16384 × n_steps=256 = 4_194_304 samples, batch_size=16384,
+    # n_epochs=3) that's 256 minibatches × 3 epochs = 768 updates per
+    # iteration; even a single iteration of mostly-low-KL minibatches drives
+    # the adaptive LR up to ``max_learning_rate=1e-2`` (the v110 run sat at
+    # LR=0.01 throughout). A 0.01 LR on a 256x256 MLP melts the policy —
+    # the v110 actor's mu saturated against the ``tanh`` head and never
+    # recovered. ``rl_song.PPOConfig.target_kl=0.02`` was an EARLY-STOPPING
+    # threshold in the hand-rolled PPO loop, not an LR adaptation knob;
+    # SBX's mechanism with the same number is the opposite semantic. Disable
+    # the adaptive LR; PPO's ``clip_range`` already controls per-update
+    # policy change.
     model = PPO(
         policy=AsymmetricActorCriticPolicy,
         env=env,
@@ -194,7 +209,7 @@ def train(
         ent_coef=ent_coef,
         vf_coef=train_cfg.ppo.vf_coef,
         max_grad_norm=train_cfg.ppo.max_grad_norm,
-        target_kl=train_cfg.ppo.target_kl,
+        target_kl=None,
         seed=seed,
         verbose=1,
     )
