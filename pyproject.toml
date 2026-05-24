@@ -133,6 +133,7 @@ wandb = "*"
 imageio-ffmpeg = ">=0.6.0, <0.7"
 sbx-rl = ">=0.18.0"
 gymnasium = ">=0.29"
+tensorboard = "*"
 
 [tool.pixi.feature.rl-jax.tasks]
 train-rl-song = { cmd = "python -m lsy_drone_racing.control.rl_song.train", description = "Train the Song-2023 RL policy" }

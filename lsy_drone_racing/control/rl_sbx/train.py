@@ -133,10 +133,13 @@ def train(
             name=run_name,
             id=run_name,
             resume="allow",
-            # ``sync_tensorboard`` would require the ``tensorboard`` package
-            # which isn't in the rl-train env. WandbCallback below already
-            # forwards SB3's scalar logger to wandb, so the tensorboard
-            # sync is redundant.
+            # ``WandbCallback`` from ``wandb.integration.sb3`` only forwards
+            # system + (PyTorch) gradient metrics — SB3's scalar logger
+            # (entropy_loss, value_loss, approx_kl, ...) reaches wandb only
+            # via the tensorboard sync path. ``sync_tensorboard=True`` makes
+            # wandb watch the directory passed to ``PPO(tensorboard_log=...)``
+            # below and forward the scalar events as they're written.
+            sync_tensorboard=True,
             config={
                 "stack": "rl_sbx",
                 "total_timesteps": total_timesteps,
@@ -212,6 +215,7 @@ def train(
         target_kl=None,
         seed=seed,
         verbose=1,
+        tensorboard_log=f"runs/{run_name}" if wandb_run is not None else None,
     )
 
     callbacks: list = [NormalizerUpdateCallback()]
