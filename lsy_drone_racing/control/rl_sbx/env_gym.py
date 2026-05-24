@@ -63,6 +63,13 @@ if TYPE_CHECKING:
 OBS_LOW: float = -obs_encoding.NORM_CLIP
 OBS_HIGH: float = +obs_encoding.NORM_CLIP
 
+# SB3's base_class.py:199 asserts finite bounds on continuous action spaces.
+# The policy emits a Gaussian raw action (mu near 0, sigma ≈ 0.6 from
+# log_std_init=-0.5); ``raw_to_env_action`` squashes its output regardless, so
+# the cap here is purely the SB3 sanity check. ±10 is many sigmas above the
+# sampling range without ever clipping a realistic action.
+RAW_ACTION_BOUND: float = 10.0
+
 
 class RLSBXVecEnv(VecEnv):
     """SB3 ``VecEnv`` wrapping a JAX :class:`VecDroneRaceEnv`.
@@ -129,7 +136,10 @@ class RLSBXVecEnv(VecEnv):
             low=OBS_LOW, high=OBS_HIGH, shape=(2 * ACTOR_OBS_DIM,), dtype=np.float32
         )
         action_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(RAW_ACTION_DIM,), dtype=np.float32
+            low=-RAW_ACTION_BOUND,
+            high=RAW_ACTION_BOUND,
+            shape=(RAW_ACTION_DIM,),
+            dtype=np.float32,
         )
         super().__init__(
             num_envs=n_envs, observation_space=observation_space, action_space=action_space
