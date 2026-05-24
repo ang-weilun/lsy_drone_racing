@@ -54,6 +54,8 @@ from lsy_drone_racing.control.rl_song.reward import step_reward
 from lsy_drone_racing.envs.race_core import obs as race_core_obs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
 
 # Bounds for the SB3 Box observation space. The normalizer clips every feature
@@ -85,6 +87,17 @@ class RLSBXVecEnv(VecEnv):
         Vectorization width. Must equal ``jax_env``'s vec width.
     seed : int
         Initial JAX env seed.
+    reset_done_hook : Callable[[Array], None], optional
+        Optional callable invoked inside :meth:`step_wait` after the JAX env
+        autoreset, with the boolean ``done`` mask of shape ``(n_envs,)``.
+        Wired by the training entry to
+        :meth:`RLSongVecEnv._apply_reset_perturbation` so the curriculum
+        reset-perturbation (drone pos/vel/yaw noise) and Song 2023 §III-B
+        Phase-1 seg-init (segment_init_prob mid-track re-spawn) fire on the
+        same worlds that just autoreset. Without this hook the wrapper would
+        silently disable seg-init — the lever that took v77 from 0% to 19%
+        L2 finish-rate. The hook may mutate ``self.jax_env.data`` in place;
+        the subsequent ``race_core_obs`` rebuild reads the post-hook state.
 
     Notes:
     -----
@@ -109,6 +122,7 @@ class RLSBXVecEnv(VecEnv):
         thrust_max: float,
         n_envs: int,
         seed: int,
+        reset_done_hook: Callable[[Array], None] | None = None,
     ):
         """Construct the wrapper. See the class docstring for parameter details."""
         observation_space = spaces.Box(
@@ -127,6 +141,7 @@ class RLSBXVecEnv(VecEnv):
         self.thrust_min = float(thrust_min)
         self.thrust_max = float(thrust_max)
         self.seed_value = int(seed)
+        self.reset_done_hook = reset_done_hook
 
         self.actor_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
         self.critic_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
@@ -228,6 +243,12 @@ class RLSBXVecEnv(VecEnv):
         # consistent across the pre-step and post-autoreset paths.
         if bool(done_np.any()):
             self.jax_env.data, _ = self.jax_env._reset(self.jax_env.data, seed=None, mask=done)
+            # The hook may mutate ``self.jax_env.data`` (e.g. seg-init re-spawns
+            # a Bernoulli-selected subset of just-reset worlds at mid-track
+            # gate-entry waypoints). Must run BEFORE the ``race_core_obs``
+            # rebuild so the rebuilt obs reflects the post-hook state.
+            if self.reset_done_hook is not None:
+                self.reset_done_hook(done)
             raw_env_obs = race_core_obs(self.jax_env.data)
             env_obs = {key: jnp.asarray(value[:, 0]) for key, value in raw_env_obs.items()}
 
