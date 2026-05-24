@@ -71,6 +71,12 @@ NET_ARCH: tuple[int, ...] = (HIDDEN_SIZE,) * N_HIDDEN_LAYERS
 # the v33-onward runs successfully bootstrapped from.
 LOG_STD_INIT: float = -0.5
 
+# Floor on ``log_std`` per ``rl_song.policy.LOG_STD_MIN``. Prevents the
+# learnable log-std parameter from collapsing the exploration noise to zero
+# in late training (sigma ≈ 0.082 at this floor), which would freeze the
+# KL signal and stop the policy from refining.
+LOG_STD_MIN: float = -2.5
+
 # Total flat-concat obs dimension; the env wrapper packs
 # ``[actor (ACTOR_OBS_DIM) | critic (ACTOR_OBS_DIM)]``.
 FLAT_CONCAT_OBS_DIM: int = 2 * ACTOR_OBS_DIM
@@ -142,18 +148,33 @@ class Actor(nn.Module):
             x = nn.Dense(n_units)(x)
             x = self.activation_fn(x)
 
+        # ``tanh`` on the mean per Song 2023 §Network and ``rl_song.policy.Actor``.
+        # Bounds the policy mean to (-1, 1) so PPO's gradient w.r.t. ``mu``
+        # stays informative — without tanh the v43 saturation diagnostics
+        # showed ``raw_norm_mean=1.87`` and 49% sample saturation, with the
+        # mean sitting outside the downstream clip boundary. The Gaussian
+        # *sample* still goes through ℝ⁴ (so log-prob is unchanged); the
+        # downstream ``raw_to_env_action`` squashes the sample into the env
+        # action range.
         if self.ortho_init:
-            mu = nn.Dense(
+            mu_pre = nn.Dense(
                 self.action_dim,
                 kernel_init=nn.initializers.orthogonal(scale=0.01),
                 bias_init=nn.initializers.zeros,
             )(x)
         else:
-            mu = nn.Dense(self.action_dim)(x)
+            mu_pre = nn.Dense(self.action_dim)(x)
+        mu = nn.tanh(mu_pre)
 
-        log_std = self.param(
+        log_std_raw = self.param(
             "log_std", nn.initializers.constant(self.log_std_init), (self.action_dim,)
         )
+        # Floor ``log_std`` at ``LOG_STD_MIN = -2.5`` (sigma ≈ 0.082) per
+        # ``rl_song.policy.LOG_STD_MIN`` — prevents PPO from collapsing the
+        # exploration noise to zero in late training, which would freeze the
+        # KL signal and stop the policy from refining.
+        log_std = jnp.maximum(log_std_raw, LOG_STD_MIN)
+        log_std = jnp.broadcast_to(log_std, mu.shape)
         return tfd.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_std))
 
 
