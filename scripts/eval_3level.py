@@ -29,7 +29,9 @@ import fire
 from lsy_drone_racing.control.rl_song import eval_sim
 
 
-def main(checkpoint: str, n_runs: int = 10, levels: str = "0,1,2") -> None:
+def main(
+    checkpoint: str, n_runs: int = 10, levels: str = "0,1,2", controller: str | None = None
+) -> None:
     """Eval one checkpoint on the requested levels deterministically.
 
     Parameters
@@ -44,6 +46,11 @@ def main(checkpoint: str, n_runs: int = 10, levels: str = "0,1,2") -> None:
     levels : str
         Comma-separated level indices to evaluate (e.g. ``"0,1,2"`` or
         ``"0,1,2,3"`` to include the L3 OOD config).
+    controller : str, optional
+        Path under ``lsy_drone_racing/control/`` selecting the controller
+        class. ``None`` keeps ``eval_sim.simulate``'s default
+        (``rl_song/controller.py``). Pass ``rl_sbx/controller.py`` to
+        evaluate a checkpoint produced by the SBX migration stack.
     """
     # fire auto-parses comma-separated args to a tuple; accept either form.
     if isinstance(levels, str):
@@ -55,6 +62,7 @@ def main(checkpoint: str, n_runs: int = 10, levels: str = "0,1,2") -> None:
     for level in requested_levels:
         ep_times = eval_sim.simulate(
             config=f"level{level}.toml",
+            controller=controller,
             checkpoint=checkpoint,
             control_mode="attitude",
             n_runs=n_runs,
