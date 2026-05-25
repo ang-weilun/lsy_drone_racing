@@ -114,6 +114,7 @@ def train(
     time_penalty: float = 0.10,
     guide_coef: float = 0.5,
     gate_pass_bonus: float = 10.0,
+    ortho_init: bool = True,
     n_envs: int | None = None,
     n_steps: int = DEFAULT_N_STEPS,
     n_epochs: int = DEFAULT_N_EPOCHS,
@@ -285,10 +286,20 @@ def train(
     # SBX's mechanism with the same number is the opposite semantic. Disable
     # the adaptive LR; PPO's ``clip_range`` already controls per-update
     # policy change.
+    # 2026-05-25: ortho_init=True by default to match rl_song.policy.Actor's
+    # output head init (orthogonal scale 0.01) and hidden layers (orthogonal
+    # scale sqrt(2)). The Flax default (lecun_normal) produces output kernels
+    # ~6x larger, so the initial Gaussian policy has confidently random mu
+    # values that PPO struggles to recover from -- evidence: v112/v113/
+    # v113b/v113d/v113e all 0/10 across L0/L1/L2 with ortho_init=False.
+    # Settable to False to preserve the original v112 architecture for
+    # reproducibility comparisons.
+    policy_kwargs = {"ortho_init": bool(ortho_init)}
     model = JitScanPPO(
         policy=AsymmetricActorCriticPolicy,
         env=env,
         learning_rate=learning_rate,
+        policy_kwargs=policy_kwargs,
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
