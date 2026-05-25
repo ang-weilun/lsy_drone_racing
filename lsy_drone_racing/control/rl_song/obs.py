@@ -270,6 +270,18 @@ def build_actor_obs(
         [target_corners_body.reshape(-1), next_corners_in_target.reshape(-1)]
     )
 
+    # v74: just-passed gate corners in drone body frame. Lets the policy
+    # observe the gate frame the reward is penalising it for grazing on exit
+    # (the gate-3 rim graze failure mode in v56 — see
+    # ``reference_wang_env_as_policy`` and the v73a investigation handoff).
+    # Clamp ``target_idx - 1`` to >=0; on the first gate this aliases to
+    # the target gate (redundant signal, harmless — no exit graze risk yet).
+    prev_gate_idx = jnp.maximum(target_idx - 1, 0)
+    g_prev_pos = gates_pos[prev_gate_idx]
+    g_prev_quat = gates_quat[prev_gate_idx]
+    g_prev_corners_w = _gate_corners_world(g_prev_pos, g_prev_quat)
+    prev_corners_body = (g_prev_corners_w - pos) @ rot_bw.T  # (4, 3)
+
     visited_chan = gates_visited[gate_indices].astype(jnp.float32)
 
     # v45: explicit one-hot target_gate. ``jax.nn.one_hot`` requires a
@@ -333,6 +345,11 @@ def build_actor_obs(
         [min_clearance_xy.astype(jnp.float32), closing_speed.astype(jnp.float32)]
     )
 
+    # v74: prev-gate corners appended at the end so the obs-grow padding
+    # in ``_pad_first_dense_for_obs_grow`` works on a v56-era warm-start
+    # (which was saved with the 65-dim layout). New channels at the END
+    # get zero-initialised weights in the first dense layer, preserving
+    # the prior policy's behaviour at warm-start.
     raw = jnp.concatenate(
         [
             drone_chan,
@@ -342,6 +359,7 @@ def build_actor_obs(
             prev_action_chan,
             obstacle_chan,
             proximity_chan,
+            prev_corners_body.reshape(-1),
         ]
     )
     return apply_normalizer(normalizer, raw)

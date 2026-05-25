@@ -153,6 +153,37 @@ class CLIArgs:
     # (0.01-0.02 range) to find the value that nudges behavior without
     # destroying the racing prior.
     caution_coef: float | None = None
+    # v69 (option B from 2026-05-23 codex consult): per-env sensor_range
+    # randomization. When both are set with max > min, each env samples its
+    # ``sensor_range`` from ``U[min, max]`` at stage construction. Replaces
+    # the toml-loaded scalar (level3.toml = 0.7). Setting min=0.4 max=5.0
+    # keeps the deploy regime (0.7) inside training distribution while
+    # exposing the policy to both shorter and longer reveal windows.
+    # Override is applied to **every** stage in the active curriculum.
+    sensor_range_random_min: float | None = None
+    sensor_range_random_max: float | None = None
+    # v70: re-enable the per-step gate-frame barrier (point-distance Gaussian on
+    # the 4 aperture edges of the {target_idx-1, target_idx, target_idx+1} gates).
+    # Default ``RewardConfig.gate_frame_weight = 0.0`` since v36's reward strip.
+    # Use to fix rim-graze failures (drone clipping top/side of frame between
+    # gates) on warm-starts where the policy's spatial path crosses frame
+    # structure. v33 used 1.2; start lower (0.3-0.5) on warm-start to avoid
+    # destabilising a converged policy. Pair with low ``--learning-rate`` so
+    # the new gradient refines rather than overwrites the racing prior.
+    gate_frame_weight: float | None = None
+    # v70: override ``PPOConfig.learning_rate`` (default 3e-4). On warm-starts
+    # of an already-converged policy, the full LR can re-randomise the loaded
+    # parameters; 3e-5 (1/10x) is a typical refinement schedule that lets new
+    # reward signals propagate without destroying the existing solution.
+    learning_rate: float | None = None
+    # v72: re-enable obstacle barrier (``RewardConfig.obstacle_weight``,
+    # default 0.0 since v43's Song-verbatim strip). r_obstacle uses the same
+    # Gaussian point-distance barrier as r_gate_frame but against L2's
+    # vertical-pole obstacles. Pair with ``gate_frame_weight > 0`` to avoid
+    # the documented v36 side effect: gate-frame avoidance widens approaches
+    # and walks the policy into nearby obstacles. v34 used 0.5-0.8; start at
+    # 0.5 on warm-start.
+    obstacle_weight: float | None = None
 
 
 class RolloutBatch(NamedTuple):
@@ -405,6 +436,10 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         ppo_cfg = replace(ppo_cfg, ent_coef=args.ent_coef_start)
     if args.ent_coef_final is not None:
         ppo_cfg = replace(ppo_cfg, ent_coef_final=args.ent_coef_final)
+    if args.learning_rate is not None:
+        if args.learning_rate <= 0.0:
+            raise ValueError(f"learning_rate must be positive; got {args.learning_rate}")
+        ppo_cfg = replace(ppo_cfg, learning_rate=args.learning_rate)
     alpha_max = cfg.tangent_alpha_max_rad if args.alpha_max_rad is None else args.alpha_max_rad
     if alpha_max <= 0.0:
         raise ValueError(f"alpha_max_rad must be positive; got {alpha_max}")
@@ -421,6 +456,18 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
         if args.caution_coef < 0.0:
             raise ValueError(f"caution_coef must be non-negative; got {args.caution_coef}")
         reward_cfg = replace(reward_cfg, caution_coef=args.caution_coef)
+    if args.gate_frame_weight is not None:
+        if args.gate_frame_weight < 0.0:
+            raise ValueError(
+                f"gate_frame_weight must be non-negative; got {args.gate_frame_weight}"
+            )
+        reward_cfg = replace(reward_cfg, gate_frame_weight=args.gate_frame_weight)
+    if args.obstacle_weight is not None:
+        if args.obstacle_weight < 0.0:
+            raise ValueError(
+                f"obstacle_weight must be non-negative; got {args.obstacle_weight}"
+            )
+        reward_cfg = replace(reward_cfg, obstacle_weight=args.obstacle_weight)
     curriculum_cfg = cfg.curriculum
     if args.curriculum is not None:
         if args.curriculum == "default":
@@ -431,6 +478,34 @@ def _build_train_config(args: CLIArgs) -> TrainConfig:
             raise ValueError(
                 f"--curriculum must be 'default' or 'full'; got {args.curriculum!r}"
             )
+    if args.sensor_range_random_min is not None or args.sensor_range_random_max is not None:
+        sr_min = (
+            0.0
+            if args.sensor_range_random_min is None
+            else float(args.sensor_range_random_min)
+        )
+        sr_max = (
+            0.0
+            if args.sensor_range_random_max is None
+            else float(args.sensor_range_random_max)
+        )
+        if sr_min < 0.0 or sr_max < 0.0:
+            raise ValueError(
+                f"sensor_range_random_{{min,max}} must be non-negative; got {sr_min=} {sr_max=}"
+            )
+        if sr_max <= sr_min:
+            raise ValueError(
+                f"sensor_range_random_max must exceed sensor_range_random_min; got {sr_min=} {sr_max=}"
+            )
+        patched_stages = tuple(
+            replace(
+                stage,
+                sensor_range_random_min=sr_min,
+                sensor_range_random_max=sr_max,
+            )
+            for stage in curriculum_cfg.stages
+        )
+        curriculum_cfg = replace(curriculum_cfg, stages=patched_stages)
     return replace(
         cfg,
         ppo=ppo_cfg,

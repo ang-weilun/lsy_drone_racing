@@ -59,6 +59,18 @@ ACTOR_OBS_OBSTACLE_DIM: int = 16  # 4 obstacles * (3 body-frame xyz + 1 visited)
 # Layout: [min_clearance_xy_m, closing_speed_to_nearest_obs_mps]. See
 # ``obs.build_actor_obs`` for the construction.
 ACTOR_OBS_PROXIMITY_DIM: int = 2
+# v74: just-passed gate corners in drone body frame. Mirrors the existing
+# target-gate corner block but for ``gate_indices[-1] = max(target_idx - 1, 0)``.
+# Added after gate-3 rim-graze investigation (2026-05-23) showed the policy
+# could not learn to clear the frame it was exiting because the actor obs
+# only included {target, next} gates — the just-passed gate the reward was
+# penalising proximity to was literally unobserved. Appended at the END of
+# the obs vector so ``_pad_first_dense_for_obs_grow`` can warm-start v56
+# weights (65 -> 77) with zero-initialised input weights for this block.
+# On ``target_idx == 0`` the clamp yields the target gate itself — degenerate
+# (redundant with target_corners_body) but valid; the policy isn't grazing
+# its own target during approach so the signal is uninformative there anyway.
+ACTOR_OBS_PREV_GATE_DIM: int = 12  # 4 corners * 3 coords
 ACTOR_OBS_DIM: int = (
     ACTOR_OBS_DRONE_DIM
     + ACTOR_OBS_GATE_DIM
@@ -67,8 +79,9 @@ ACTOR_OBS_DIM: int = (
     + ACTOR_OBS_PREV_ACTION_DIM
     + ACTOR_OBS_OBSTACLE_DIM
     + ACTOR_OBS_PROXIMITY_DIM
+    + ACTOR_OBS_PREV_GATE_DIM
 )
-assert ACTOR_OBS_DIM == 65, "Actor obs layout drifted from design doc §6"
+assert ACTOR_OBS_DIM == 77, "Actor obs layout drifted from design doc §6"
 
 
 @dataclass(frozen=True)
@@ -1188,6 +1201,15 @@ class CurriculumStage:
     phase2_prob: float = 0.0
     phase2_capacity_per_gate: int = 4096
     phase2_warmup_steps: int = 0
+    # v69 (option B from 2026-05-23 codex consult): per-env sensor_range
+    # randomization. When ``sensor_range_random_max > sensor_range_random_min``,
+    # each env samples its sensor_range from ``U[min, max]`` at stage
+    # construction, replacing the toml scalar. Deploy ``sensor_range=0.7``
+    # (level3.toml) is intentionally inside the recommended training range so
+    # the deploy regime is one point of an in-distribution training
+    # distribution rather than an OOD edge. Both 0.0 disables (off by default).
+    sensor_range_random_min: float = 0.0
+    sensor_range_random_max: float = 0.0
 
 
 @dataclass(frozen=True)
