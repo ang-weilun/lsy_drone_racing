@@ -160,6 +160,39 @@ def train(
     The construction order (RLSongVecEnv → RLSBXVecEnv with seg-init hook
     → SBX PPO) is load-bearing — see the module docstring.
     """
+    train_cfg = TrainConfig()
+    effective_n_envs = train_cfg.ppo.n_envs if n_envs is None else int(n_envs)
+    # v77 baseline reward: no gate_frame / obstacle weight, three-term Song
+    # reward (r_prog + r_omega + r_terminal). RewardConfig defaults match.
+    reward_cfg = RewardConfig()
+
+    # The wrapper's __init__ instantiates the inner JAX env via set_stage and
+    # runs its own reset(seed=seed+stage_idx) — no second reset call needed.
+    wrapper = RLSongVecEnv(train_cfg, n_envs=effective_n_envs, stage_idx=0, seed=seed, device="gpu")
+
+    # Inherit thrust bounds from the wrapper, which already loaded them via
+    # ``load_params(level_toml.sim.physics, level_toml.sim.drone_model)``
+    # ("first_principles" / "cf21B_500" for the level2 toml) and scaled by
+    # ``TOTAL_THRUST_MULTIPLIER``. Avoids hardcoding a physics/drone-model
+    # pair here that could drift out of sync with the actual training stage.
+    thrust_min, thrust_max = wrapper.get_thrust_bounds()
+
+    # Seg-init / perturbation knobs from the active curriculum stage.
+    # ``JitScanPPO.collect_rollouts`` forwards these into the compiled
+    # ``scan_rollout`` so the Phase-1 mid-track re-spawn and the drone-
+    # state perturbation fire inside the JAX scan. The ``reset_done_hook``
+    # below is the legacy step_wait path; JIT-scan bypasses ``step_wait``
+    # entirely so the in-scan path is the one that matters here.
+    stage = wrapper.stage
+    seg_init_kwargs: dict[str, float] = {
+        "reset_pos_perturb_m": float(stage.reset_pos_perturb_m),
+        "reset_vel_perturb_mps": float(stage.reset_vel_perturb_mps),
+        "reset_yaw_perturb_rad": float(stage.reset_yaw_perturb_rad),
+        "segment_init_prob": float(stage.segment_init_prob),
+        "segment_init_perturb_m": float(stage.segment_init_perturb_m),
+        "segment_init_vel_mps": float(stage.segment_init_vel_mps),
+    }
+
     wandb_run = None
     if not no_wandb:
         wandb_run = wandb.init(
@@ -186,24 +219,10 @@ def train(
                 "n_epochs": n_epochs,
                 "batch_size": batch_size,
                 "seed": seed,
+                "stage_name": stage.name,
+                **seg_init_kwargs,
             },
         )
-    train_cfg = TrainConfig()
-    effective_n_envs = train_cfg.ppo.n_envs if n_envs is None else int(n_envs)
-    # v77 baseline reward: no gate_frame / obstacle weight, three-term Song
-    # reward (r_prog + r_omega + r_terminal). RewardConfig defaults match.
-    reward_cfg = RewardConfig()
-
-    # The wrapper's __init__ instantiates the inner JAX env via set_stage and
-    # runs its own reset(seed=seed+stage_idx) — no second reset call needed.
-    wrapper = RLSongVecEnv(train_cfg, n_envs=effective_n_envs, stage_idx=0, seed=seed, device="gpu")
-
-    # Inherit thrust bounds from the wrapper, which already loaded them via
-    # ``load_params(level_toml.sim.physics, level_toml.sim.drone_model)``
-    # ("first_principles" / "cf21B_500" for the level2 toml) and scaled by
-    # ``TOTAL_THRUST_MULTIPLIER``. Avoids hardcoding a physics/drone-model
-    # pair here that could drift out of sync with the actual training stage.
-    thrust_min, thrust_max = wrapper.get_thrust_bounds()
 
     env = RLSBXVecEnv(
         jax_env=wrapper.env,
@@ -214,6 +233,7 @@ def train(
         n_envs=effective_n_envs,
         seed=seed,
         reset_done_hook=wrapper._apply_reset_perturbation,
+        seg_init_kwargs=seg_init_kwargs,
     )
 
     # SBX 0.26 PPO kwargs: confirmed via inspect.signature on remote. ``device``
