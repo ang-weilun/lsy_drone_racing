@@ -122,6 +122,7 @@ def train(
     seed: int = 0,
     checkpoint_root: str = "lsy_drone_racing/control/rl_sbx/checkpoints",
     save_freq_steps: int = 20_000_000,
+    init_from: str | None = None,
     wandb_project: str = WANDB_PROJECT,
     wandb_entity: str | None = None,
     no_wandb: bool = False,
@@ -314,6 +315,40 @@ def train(
         verbose=1,
         # No ``tensorboard_log``: scalars go via ``WandbScalarCallback``.
     )
+
+    # 2026-05-25: optional warm-start from an existing checkpoint. The
+    # checkpoint format mirrors save_step (5 files: actor.params.msgpack,
+    # critic.params.msgpack, {actor,critic}_normalizer.json,
+    # policy_config.json). Loads actor + critic params into the freshly
+    # constructed model.policy TrainStates, and the two normalizers into
+    # the env wrapper. Optimizer state stays freshly-initialized -- SBX
+    # has no opt-state checkpoint to restore.
+    if init_from is not None:
+        from lsy_drone_racing.control.rl_sbx.checkpoint import load_all
+
+        init_path = Path(init_from)
+        if not init_path.is_absolute():
+            init_path = Path(checkpoint_root).parent.parent.parent / init_path
+        # If init_from is a run dir, pick the highest step.
+        if not (init_path / "actor.params.msgpack").exists():
+            step_dirs = sorted(init_path.glob("step_*"))
+            if not step_dirs:
+                raise FileNotFoundError(f"No step_* dirs under {init_path}")
+            init_path = step_dirs[-1]
+        print(f"warm-start from {init_path}", flush=True)
+        actor_template = model.policy.actor_state.params
+        critic_template = model.policy.vf_state.params
+        loaded = load_all(init_path, actor_template, critic_template)
+        # Replace the TrainState params (preserves optimizer state with the
+        # new shapes intact). Apply_fn / opt_state remain from model setup.
+        model.policy.actor_state = model.policy.actor_state.replace(
+            params=loaded["actor_params"]
+        )
+        model.policy.vf_state = model.policy.vf_state.replace(
+            params=loaded["critic_params"]
+        )
+        env.set_actor_normalizer(loaded["actor_normalizer"])
+        env.set_critic_normalizer(loaded["critic_normalizer"])
 
     run_dir = Path(checkpoint_root) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
