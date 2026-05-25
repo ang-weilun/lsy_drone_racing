@@ -4,6 +4,10 @@
 env's two ``NormalizerState`` instances at each ``_on_rollout_end``. Updates
 are independent — actor and critic normalizers are NEVER cross-pollinated.
 
+``PeriodicCheckpointCallback`` writes a ``save_step`` checkpoint every
+``save_freq_steps`` env steps so post-hoc selection works on long runs
+(handoff note: "final step overtrains" on >100M cold-trains).
+
 The rollout buffer stores normalized obs (the env wrapper normalizes before
 returning). We invert the affine normalization to recover raw values, then
 run ``update_normalizer`` on the raw batch. This mirrors
@@ -12,10 +16,13 @@ run ``update_normalizer`` on the raw batch. This mirrors
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import jax.numpy as jnp
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
+from lsy_drone_racing.control.rl_sbx.checkpoint import save_step
 from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM
 from lsy_drone_racing.control.rl_song.obs import NORM_VAR_EPS, NormalizerState, update_normalizer
 
@@ -127,3 +134,72 @@ class NormalizerUpdateCallback(BaseCallback):
         std = np.sqrt(np.asarray(state.var) + NORM_VAR_EPS)
         mean = np.asarray(state.mean)
         return normalized * std + mean
+
+
+class PeriodicCheckpointCallback(BaseCallback):
+    """Write a ``save_step`` checkpoint every ``save_freq_steps`` env steps.
+
+    Enables post-hoc checkpoint selection on cold-trains and warm-starts
+    longer than ~100 M steps. The 2026-05-25 handoff documented that the
+    final step of v56 / v77 over-trained; the working checkpoint was one
+    earlier ``step_NNN``. The previous ``rl_sbx/train.py`` only saved the
+    final step, blocking that selection — fixed by this callback.
+
+    Parameters:
+    ----------
+    run_dir : Path
+        Existing run directory; per-step subdirs created under it.
+    alpha_max_rad : float
+        Forwarded to :func:`save_step` so eval can reconstruct the policy
+        with the same tangent-space rotation budget used at training.
+    save_freq_steps : int
+        Number of *env steps* between saves (not gradient updates). The
+        callback fires on ``_on_rollout_end`` (once per PPO iteration), so
+        the effective cadence is rounded up to the nearest iteration
+        boundary. At ``n_envs=16384 × n_steps=256`` that's ~4.19 M per
+        iteration, so a request of 10 M saves every 3rd iter.
+    verbose : int, optional
+        SB3 verbosity, propagated to ``BaseCallback``.
+
+    Notes:
+    -----
+    The callback never deletes checkpoints — disk grows linearly with run
+    length. A 155 M cold-train at ``save_freq_steps=20_000_000`` produces
+    ~8 step-dirs; each is ~1 MB so this is negligible vs the wandb run.
+    """
+
+    def __init__(
+        self,
+        run_dir: Path,
+        alpha_max_rad: float,
+        save_freq_steps: int = 20_000_000,
+        verbose: int = 0,
+    ) -> None:
+        """Initialize the callback. See class docstring for parameter details."""
+        super().__init__(verbose)
+        self.run_dir = run_dir
+        self.alpha_max_rad = float(alpha_max_rad)
+        self.save_freq_steps = int(save_freq_steps)
+        self._last_save_step: int = 0
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Save a checkpoint if the cumulative timestep crossed the cadence."""
+        current = int(self.model.num_timesteps)
+        if current - self._last_save_step < self.save_freq_steps:
+            return
+        env = _find_underlying_env(self.training_env)
+        step_dir = save_step(
+            run_dir=self.run_dir,
+            global_step=current,
+            actor_params=self.model.policy.actor_state.params,
+            critic_params=self.model.policy.vf_state.params,
+            actor_normalizer=env.actor_normalizer,
+            critic_normalizer=env.critic_normalizer,
+            tangent_alpha_max_rad=self.alpha_max_rad,
+        )
+        self._last_save_step = current
+        if self.verbose:
+            print(f"[checkpoint] step {current} -> {step_dir}", flush=True)

@@ -37,7 +37,10 @@ import fire
 from stable_baselines3.common.callbacks import BaseCallback
 
 import wandb
-from lsy_drone_racing.control.rl_sbx.callbacks import NormalizerUpdateCallback
+from lsy_drone_racing.control.rl_sbx.callbacks import (
+    NormalizerUpdateCallback,
+    PeriodicCheckpointCallback,
+)
 from lsy_drone_racing.control.rl_sbx.checkpoint import save_step
 from lsy_drone_racing.control.rl_sbx.env_gym import RLSBXVecEnv
 from lsy_drone_racing.control.rl_sbx.jit_scan_ppo import JitScanPPO
@@ -111,6 +114,7 @@ def train(
     batch_size: int = DEFAULT_BATCH_SIZE,
     seed: int = 0,
     checkpoint_root: str = "lsy_drone_racing/control/rl_sbx/checkpoints",
+    save_freq_steps: int = 20_000_000,
     wandb_project: str = WANDB_PROJECT,
     wandb_entity: str | None = None,
     no_wandb: bool = False,
@@ -295,13 +299,21 @@ def train(
         # No ``tensorboard_log``: scalars go via ``WandbScalarCallback``.
     )
 
-    callbacks: list = [NormalizerUpdateCallback()]
+    run_dir = Path(checkpoint_root) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    callbacks: list = [
+        NormalizerUpdateCallback(),
+        PeriodicCheckpointCallback(
+            run_dir=run_dir,
+            alpha_max_rad=alpha_max_rad,
+            save_freq_steps=save_freq_steps,
+            verbose=1,
+        ),
+    ]
     if wandb_run is not None:
         callbacks.append(WandbScalarCallback())
     model.learn(total_timesteps=total_timesteps, callback=callbacks, log_interval=1)
 
-    run_dir = Path(checkpoint_root) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
     step_dir = save_step(
         run_dir=run_dir,
         global_step=int(model.num_timesteps),
