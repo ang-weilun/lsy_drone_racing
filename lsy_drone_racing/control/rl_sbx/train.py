@@ -38,6 +38,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 import wandb
 from lsy_drone_racing.control.rl_sbx.callbacks import (
+    EntropyAnnealCallback,
     NormalizerUpdateCallback,
     PeriodicCheckpointCallback,
 )
@@ -107,6 +108,7 @@ def train(
     total_timesteps: int = DEFAULT_TOTAL_TIMESTEPS,
     alpha_max_rad: float = DEFAULT_ALPHA_MAX_RAD,
     ent_coef: float = DEFAULT_ENT_COEF,
+    ent_coef_final: float | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     n_envs: int | None = None,
     n_steps: int = DEFAULT_N_STEPS,
@@ -310,6 +312,20 @@ def train(
             verbose=1,
         ),
     ]
+    if ent_coef_final is not None:
+        # v77 cold-train recipe annealed ent 0.005 -> 0.001 over training.
+        # SBX's PPO takes ent_coef as a float at construction and never
+        # schedules it; the callback mutates self.model.ent_coef at each
+        # _on_rollout_end so the next iteration's update closes over the
+        # new value.
+        callbacks.append(
+            EntropyAnnealCallback(
+                ent_coef_start=ent_coef,
+                ent_coef_final=ent_coef_final,
+                total_timesteps=total_timesteps,
+                verbose=0,
+            )
+        )
     if wandb_run is not None:
         callbacks.append(WandbScalarCallback())
     model.learn(total_timesteps=total_timesteps, callback=callbacks, log_interval=1)

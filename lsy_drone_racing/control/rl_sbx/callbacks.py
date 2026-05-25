@@ -136,6 +136,60 @@ class NormalizerUpdateCallback(BaseCallback):
         return normalized * std + mean
 
 
+class EntropyAnnealCallback(BaseCallback):
+    """Linearly anneal ``model.ent_coef`` from start to final over training.
+
+    SBX's PPO accepts ``ent_coef`` as a float at construction and never
+    schedules it. The v77 cold-train recipe used ent_coef 0.005 -> 0.001
+    annealed linearly with timesteps -- a stronger commit-pressure
+    schedule than v112's constant 0.005. Restore that on the SBX stack.
+
+    Parameters:
+    ----------
+    ent_coef_start : float
+        Initial entropy coefficient (also the model's construction-time
+        value; this callback overwrites it at the first rollout end).
+    ent_coef_final : float
+        Final entropy coefficient at ``total_timesteps``.
+    total_timesteps : int
+        Schedule horizon; should match ``model.learn(total_timesteps=...)``.
+    verbose : int, optional
+        SB3 verbosity, propagated to ``BaseCallback``.
+
+    Notes:
+    -----
+    The schedule is linear in env steps (not iterations), so the
+    instantaneous value at step ``t`` is ``start + (final - start) *
+    min(1, t / total)``. After ``total`` the value clamps at ``final``.
+    """
+
+    def __init__(
+        self,
+        ent_coef_start: float,
+        ent_coef_final: float,
+        total_timesteps: int,
+        verbose: int = 0,
+    ) -> None:
+        """Initialize the callback. See class docstring for parameter details."""
+        super().__init__(verbose)
+        self.ent_coef_start = float(ent_coef_start)
+        self.ent_coef_final = float(ent_coef_final)
+        self.total_timesteps = int(total_timesteps)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Update ``model.ent_coef`` per the linear schedule."""
+        t = int(self.model.num_timesteps)
+        frac = min(1.0, t / max(1, self.total_timesteps))
+        new_ent = self.ent_coef_start + (self.ent_coef_final - self.ent_coef_start) * frac
+        # ``sbx.PPO`` reads ``self.ent_coef`` per ``_one_update`` call inside
+        # the JIT, so updating the Python attribute is sufficient -- the next
+        # iteration's update will close over the new value.
+        self.model.ent_coef = float(new_ent)
+
+
 class PeriodicCheckpointCallback(BaseCallback):
     """Write a ``save_step`` checkpoint every ``save_freq_steps`` env steps.
 
