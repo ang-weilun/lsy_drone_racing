@@ -114,6 +114,8 @@ def train(
     time_penalty: float = 0.10,
     guide_coef: float = 0.5,
     gate_pass_bonus: float = 10.0,
+    gate_frame_weight: float = 0.0,
+    obstacle_weight: float = 0.0,
     ortho_init: bool = True,
     n_envs: int | None = None,
     n_steps: int = DEFAULT_N_STEPS,
@@ -197,6 +199,8 @@ def train(
         progress_coef=progress_coef,
         guide_coef=guide_coef,
         gate_pass_bonus=gate_pass_bonus,
+        gate_frame_weight=gate_frame_weight,
+        obstacle_weight=obstacle_weight,
     )
 
     # The wrapper's __init__ instantiates the inner JAX env via set_stage and
