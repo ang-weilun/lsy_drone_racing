@@ -34,16 +34,51 @@ from __future__ import annotations
 from pathlib import Path
 
 import fire
-from sbx import PPO
-from wandb.integration.sb3 import WandbCallback
+from stable_baselines3.common.callbacks import BaseCallback
 
 import wandb
 from lsy_drone_racing.control.rl_sbx.callbacks import NormalizerUpdateCallback
 from lsy_drone_racing.control.rl_sbx.checkpoint import save_step
 from lsy_drone_racing.control.rl_sbx.env_gym import RLSBXVecEnv
+from lsy_drone_racing.control.rl_sbx.jit_scan_ppo import JitScanPPO
 from lsy_drone_racing.control.rl_sbx.policy import AsymmetricActorCriticPolicy
 from lsy_drone_racing.control.rl_song.config import TANGENT_ALPHA_MAX_RAD, RewardConfig, TrainConfig
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
+
+
+class WandbScalarCallback(BaseCallback):
+    """Forward SB3 logger scalars to wandb at each rollout end.
+
+    ``WandbCallback`` from ``wandb.integration.sb3`` only forwards system
+    + (PyTorch) gradient metrics. SBX's training loop accumulates
+    rollout/train scalars into ``self.model.logger.name_to_value`` and
+    flushes them via ``logger.dump(step=...)``. We snapshot that dict on
+    each ``_on_rollout_end`` (fires after the SBX collector and right
+    before the train step) and push it straight to ``wandb.log``.
+
+    Notes:
+    -----
+    Replaces the ``sync_tensorboard=True`` + ``tensorboard_log=...`` path
+    in the JIT-scan stack — the tensorboard event-file watcher adds disk
+    I/O proportional to the metric count per iteration and the
+    file-system polling cost is non-trivial at 250k+ env-steps/s.
+    Direct ``wandb.log`` calls bypass that entirely.
+    """
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Snapshot the SB3 logger's scalar dict and forward to wandb."""
+        # ``name_to_value`` carries the keys SB3 / SBX have written since
+        # the last ``dump`` (rollout/* from the previous iteration, train/*
+        # from the current iteration if any). It's an ``OrderedDict``;
+        # ``dict(...)`` snapshots it so wandb sees a consistent view.
+        scalars = dict(self.model.logger.name_to_value)
+        if not scalars:
+            return
+        wandb.log(scalars, step=int(self.model.num_timesteps))
+
 
 # Share the rl_song wandb project so rl_sbx runs land alongside the v33-v100
 # line for direct comparison plots. ``TrainConfig.wandb_project`` is the
@@ -133,13 +168,13 @@ def train(
             name=run_name,
             id=run_name,
             resume="allow",
-            # ``WandbCallback`` from ``wandb.integration.sb3`` only forwards
-            # system + (PyTorch) gradient metrics — SB3's scalar logger
-            # (entropy_loss, value_loss, approx_kl, ...) reaches wandb only
-            # via the tensorboard sync path. ``sync_tensorboard=True`` makes
-            # wandb watch the directory passed to ``PPO(tensorboard_log=...)``
-            # below and forward the scalar events as they're written.
-            sync_tensorboard=True,
+            # SB3 scalar metrics reach wandb via ``WandbScalarCallback``
+            # below — it forwards ``model.logger.name_to_value`` straight
+            # to ``wandb.log`` at each ``_on_rollout_end``. The tensorboard
+            # sync path is gone (event-file watcher I/O isn't free at
+            # 250k+ env-steps/s, and our JIT-scan collector skips the
+            # per-step callback dispatch that SBX's WandbCallback hooks
+            # into for gradient metrics).
             config={
                 "stack": "rl_sbx",
                 "total_timesteps": total_timesteps,
@@ -199,7 +234,7 @@ def train(
     # SBX's mechanism with the same number is the opposite semantic. Disable
     # the adaptive LR; PPO's ``clip_range`` already controls per-update
     # policy change.
-    model = PPO(
+    model = JitScanPPO(
         policy=AsymmetricActorCriticPolicy,
         env=env,
         learning_rate=learning_rate,
@@ -215,15 +250,12 @@ def train(
         target_kl=None,
         seed=seed,
         verbose=1,
-        tensorboard_log=f"runs/{run_name}" if wandb_run is not None else None,
+        # No ``tensorboard_log``: scalars go via ``WandbScalarCallback``.
     )
 
     callbacks: list = [NormalizerUpdateCallback()]
     if wandb_run is not None:
-        # ``model_save_path=None`` skips WandbCallback's own SB3 zip dump
-        # — our two-file checkpoint format is what the deploy controller
-        # expects. ``verbose=2`` mirrors rl_song's wandb logging detail.
-        callbacks.append(WandbCallback(verbose=2))
+        callbacks.append(WandbScalarCallback())
     model.learn(total_timesteps=total_timesteps, callback=callbacks, log_interval=1)
 
     run_dir = Path(checkpoint_root) / run_name
