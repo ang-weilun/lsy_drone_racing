@@ -110,6 +110,10 @@ def train(
     ent_coef: float = DEFAULT_ENT_COEF,
     ent_coef_final: float | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
+    progress_coef: float = 15.0,
+    time_penalty: float = 0.10,
+    guide_coef: float = 0.5,
+    gate_pass_bonus: float = 10.0,
     n_envs: int | None = None,
     n_steps: int = DEFAULT_N_STEPS,
     n_epochs: int = DEFAULT_N_EPOCHS,
@@ -183,15 +187,14 @@ def train(
     # default RewardConfig has 7+ active terms (r_prog, r_omega,
     # r_terminal, r_guid, r_gate_bonus scaled by index, r_time). This
     # construction makes the experiment label honest.
+    # Defaults are the v113 recipe (time_penalty=0.10, progress_coef=15);
+    # CLI flags allow overriding any of the four reward levers for variant
+    # sweeps without editing this file.
     reward_cfg = RewardConfig(
-        # 0.05 -> 0.10. Opens hover-vs-crash margin from +0.6 (no gradient)
-        # to +15.9; preserves finish-vs-partial-crash margin at +110.
-        time_penalty=0.10,
-        # 10.0 -> 15.0. Positive bias toward motion when the policy
-        # stumbles into closing velocity (user-preferred direction over
-        # raising time_penalty alone). Integrated r_prog over a clean lap
-        # rises from +66 to +99; jackpot-to-prog ratio drops 3.0x -> 2.0x.
-        progress_coef=15.0,
+        time_penalty=time_penalty,
+        progress_coef=progress_coef,
+        guide_coef=guide_coef,
+        gate_pass_bonus=gate_pass_bonus,
     )
 
     # The wrapper's __init__ instantiates the inner JAX env via set_stage and
