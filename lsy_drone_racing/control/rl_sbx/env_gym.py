@@ -130,8 +130,23 @@ class RLSBXVecEnv(VecEnv):
         n_envs: int,
         seed: int,
         reset_done_hook: Callable[[Array], None] | None = None,
+        seg_init_kwargs: dict[str, float] | None = None,
     ):
-        """Construct the wrapper. See the class docstring for parameter details."""
+        """Construct the wrapper. See the class docstring for parameter details.
+
+        Parameters
+        ----------
+        seg_init_kwargs : dict[str, float], optional
+            Seg-init / drone-state perturbation knobs forwarded verbatim
+            to :func:`rl_sbx.rollout.make_static_config` by
+            :class:`JitScanPPO`. Expected keys: ``reset_pos_perturb_m``,
+            ``reset_vel_perturb_mps``, ``reset_yaw_perturb_rad``,
+            ``segment_init_prob``, ``segment_init_perturb_m``,
+            ``segment_init_vel_mps``. ``None`` defaults to an empty dict
+            (seg-init disabled). Mirrors :attr:`RLSongVecEnv.stage`
+            fields one-for-one — the training entry is expected to
+            populate this from ``wrapper.stage``.
+        """
         observation_space = spaces.Box(
             low=OBS_LOW, high=OBS_HIGH, shape=(2 * ACTOR_OBS_DIM,), dtype=np.float32
         )
@@ -152,6 +167,9 @@ class RLSBXVecEnv(VecEnv):
         self.thrust_max = float(thrust_max)
         self.seed_value = int(seed)
         self.reset_done_hook = reset_done_hook
+        self.seg_init_kwargs: dict[str, float] = (
+            dict(seg_init_kwargs) if seg_init_kwargs is not None else {}
+        )
 
         self.actor_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
         self.critic_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
