@@ -144,8 +144,19 @@ class Actor(nn.Module):
             ``scale_diag = exp(log_std)``.
         """
         x = obs[..., :ACTOR_OBS_DIM]
+        # 2026-05-25: when ``ortho_init=True``, match rl_song's hidden-layer
+        # orthogonal(sqrt(2)) init alongside the output head's orthogonal(0.01).
+        # rl_song.policy.Actor uses orthogonal init for ALL Dense layers; just
+        # fixing the output head while leaving hidden layers at Flax default
+        # (lecun_normal) is the partial-parity case that left v113f's
+        # gradient flow distinct from v77's.
+        hidden_kernel_init: Any
+        if self.ortho_init:
+            hidden_kernel_init = nn.initializers.orthogonal(jnp.sqrt(2.0))
+        else:
+            hidden_kernel_init = nn.initializers.lecun_normal()
         for n_units in self.net_arch:
-            x = nn.Dense(n_units)(x)
+            x = nn.Dense(n_units, kernel_init=hidden_kernel_init)(x)
             x = self.activation_fn(x)
 
         # ``tanh`` on the mean per Song 2023 §Network and ``rl_song.policy.Actor``.
