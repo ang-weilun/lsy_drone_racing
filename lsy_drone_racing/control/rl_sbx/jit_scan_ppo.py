@@ -146,6 +146,7 @@ class JitScanPPO(PPO):
             "alpha_max",
             "thrust_min",
             "thrust_max",
+            "seg_init_kwargs",
             "_prev_action",
         ):
             if not hasattr(env, attr):
@@ -161,6 +162,7 @@ class JitScanPPO(PPO):
             thrust_max=env.thrust_max,
             tangent_alpha_max_rad=env.alpha_max,
             reward_cfg=env.reward_cfg,
+            **env.seg_init_kwargs,
         )
 
         # ``_last_episode_starts`` lives on SBX as a float32 / bool numpy
@@ -168,10 +170,13 @@ class JitScanPPO(PPO):
         # explicitly so a stale dtype on the SBX side doesn't propagate.
         next_done_jax = jnp.asarray(self._last_episode_starts, dtype=jnp.bool_)
 
-        # Advance the wrapper's RNG once per rollout. The scan does its
+        # Advance the wrapper's RNGs once per rollout. The scan does its
         # own per-step splits internally; we only need one fresh key
-        # per dispatch.
+        # per dispatch. The reset-key stream is independent of the
+        # action-sampling stream so toggling seg-init does not bit-shift
+        # the policy's exploration trajectory.
         rng_key = self._next_rollout_rng_key()
+        reset_rng_key = self._next_reset_rng_key()
 
         scan_result: RLSBXScanResult = scan_rollout(
             env.jax_env.data,
@@ -181,6 +186,7 @@ class JitScanPPO(PPO):
             env.critic_normalizer,
             env._prev_action,
             rng_key,
+            reset_rng_key,
             next_done_jax,
             env.jax_env._step,
             env.jax_env._reset,
@@ -276,4 +282,27 @@ class JitScanPPO(PPO):
             key = self.policy.noise_key
         key, sub = jax.random.split(key)
         self._jit_scan_key = key
+        return sub
+
+    def _next_reset_rng_key(self) -> jnp.ndarray:
+        """Return a fresh PRNG key for the in-scan seg-init / perturbation.
+
+        Maintains a stream independent of the action-sampling key so a
+        stage that toggles seg-init does not bit-shift the policy's
+        exploration trajectory. First-call bootstrap derives from the
+        policy noise key via a single ``jax.random.fold_in`` so a fixed
+        PPO seed still produces a deterministic reset stream.
+        """
+        import jax
+
+        if hasattr(self, "_jit_reset_key"):
+            key = self._jit_reset_key
+        else:
+            # Fold a distinct domain tag into the policy noise key. The
+            # raw seed is reused only as the bootstrap source; once
+            # _jit_reset_key is stored we split it independently from
+            # _jit_scan_key on every subsequent rollout.
+            key = jax.random.fold_in(self.policy.noise_key, 0xFEEDBEEF)
+        key, sub = jax.random.split(key)
+        self._jit_reset_key = key
         return sub
