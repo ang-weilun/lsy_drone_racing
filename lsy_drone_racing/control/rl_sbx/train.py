@@ -331,8 +331,6 @@ def train(
         from lsy_drone_racing.control.rl_sbx.checkpoint import load_all
 
         init_path = Path(init_from)
-        if not init_path.is_absolute():
-            init_path = Path(checkpoint_root).parent.parent.parent / init_path
         # If init_from is a run dir, pick the highest step.
         if not (init_path / "actor.params.msgpack").exists():
             step_dirs = sorted(init_path.glob("step_*"))
