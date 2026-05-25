@@ -162,9 +162,31 @@ def train(
     """
     train_cfg = TrainConfig()
     effective_n_envs = train_cfg.ppo.n_envs if n_envs is None else int(n_envs)
-    # v77 baseline reward: no gate_frame / obstacle weight, three-term Song
-    # reward (r_prog + r_omega + r_terminal). RewardConfig defaults match.
-    reward_cfg = RewardConfig()
+    # 2026-05-25: v112 (`reward_cfg = RewardConfig()`) cold-trained without
+    # seg-init and converged to the "barely-not-hover thrust, drone falls
+    # slowly to floor" local optimum (0/100 across L0/L1/L2/L3). Discounted-
+    # return analysis (gamma=0.998, max_episode=500) showed the v112 reward
+    # had only a +0.6 margin between hover-then-truncate (-15.81) and
+    # crash@10 (-15.20) — break-even is at time_penalty ≈ 0.0506 and the
+    # default 0.05 sat 0.6 % under that. PPO had no usable gradient between
+    # "stay alive doing nothing" and "try to move and crash". See
+    # docs/specs/2026-05-25-reward-and-seginit-fix-design.md for the
+    # archetype-by-archetype scoring table and Codex's bug audit.
+    #
+    # The v112 comment "three-term Song reward" was also wrong — the
+    # default RewardConfig has 7+ active terms (r_prog, r_omega,
+    # r_terminal, r_guid, r_gate_bonus scaled by index, r_time). This
+    # construction makes the experiment label honest.
+    reward_cfg = RewardConfig(
+        # 0.05 -> 0.10. Opens hover-vs-crash margin from +0.6 (no gradient)
+        # to +15.9; preserves finish-vs-partial-crash margin at +110.
+        time_penalty=0.10,
+        # 10.0 -> 15.0. Positive bias toward motion when the policy
+        # stumbles into closing velocity (user-preferred direction over
+        # raising time_penalty alone). Integrated r_prog over a clean lap
+        # rises from +66 to +99; jackpot-to-prog ratio drops 3.0x -> 2.0x.
+        progress_coef=15.0,
+    )
 
     # The wrapper's __init__ instantiates the inner JAX env via set_stage and
     # runs its own reset(seed=seed+stage_idx) — no second reset call needed.
