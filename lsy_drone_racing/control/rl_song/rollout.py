@@ -561,6 +561,15 @@ def scan_rollout(
             finished & (previous_target >= 0)
         )
 
+        # v85 (2026-05-24): grade r_prog on the masked env_obs gate poses (what
+        # the actor sees) rather than the true post-randomization poses. The
+        # asymmetric-AC critic at L520-528 still receives unmasked poses; only
+        # the reward signal is aligned with the actor's observation. r_obs and
+        # r_gate_frame already use safety_gates_pos = env_obs (masked) since v33;
+        # r_prog was the remaining leak. The mitigation attempts in v64
+        # (r_caution shaping) and v74 (prev_gate obs slot) all stayed at 0–5%
+        # L3 because they treated the symptom; this addresses the structural
+        # gradient on randomization the actor cannot observe.
         reward, components = step_reward(
             next_env_obs,
             env_obs,
@@ -569,9 +578,6 @@ def scan_rollout(
             finished,
             gate_just_passed,
             static_cfg.reward_cfg,
-            true_gates_pos=stepped_data.gates_pos,
-            true_gates_quat=stepped_data.gates_quat,
-            true_obstacles_pos=stepped_data.obstacles_pos,
         )
 
         done_bool = terminated | truncated
@@ -1209,11 +1215,31 @@ def _apply_segment_init(
     mask_b3 = do_seg[:, None, None]
     new_pos_b = new_pos[:, None, :]
     new_vel_b = seg_vel[:, None, :]
-    identity_quat = jnp.zeros_like(states.quat).at[..., 3].set(1.0)
+    # 2026-05-25 seg-init audit found two bugs in the identity-quat respawn:
+    # (a) the drone's body +x pointed world +x while its velocity pointed
+    # along the gate's +x_local — for the U-turn gate that's a ~90 deg
+    # nose/velocity mismatch costing the first ~20 steps of every Phase-1
+    # episode while the policy yaws into alignment. (b) ang_vel was never
+    # mentioned in the replace() call, so the drone inherited whatever
+    # rotational momentum its previous episode terminated with (typically a
+    # tumble from a crash). Fix both: yaw-only quaternion aligning body +x
+    # with gate_xaxis_world (drone level, nose along velocity), and zero
+    # ang_vel on respawn. Matches Song 2023's §III-B distributed hover-spawn
+    # convention. Phase-2 replay already restored ang_vel correctly from
+    # the buffer, so only Phase-1 was affected.
+    yaw = jnp.arctan2(gate_xaxis_world[..., 1], gate_xaxis_world[..., 0])
+    half_yaw = yaw * 0.5
+    seg_quat = jnp.stack(
+        [jnp.zeros_like(yaw), jnp.zeros_like(yaw), jnp.sin(half_yaw), jnp.cos(half_yaw)],
+        axis=-1,
+    )
+    seg_quat_b = seg_quat[:, None, :]
+    new_ang_vel_b = jnp.zeros_like(states.ang_vel)
     new_states = states.replace(
         pos=jnp.where(mask_b3, new_pos_b, states.pos),
         vel=jnp.where(mask_b3, new_vel_b, states.vel),
-        quat=jnp.where(mask_b3, identity_quat, states.quat),
+        quat=jnp.where(mask_b3, seg_quat_b, states.quat),
+        ang_vel=jnp.where(mask_b3, new_ang_vel_b, states.ang_vel),
     )
 
     new_target = jnp.where(

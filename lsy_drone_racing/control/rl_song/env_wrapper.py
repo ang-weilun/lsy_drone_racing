@@ -311,7 +311,7 @@ class RLSongVecEnv:
         race_cfg = self._load_stage_config(stage)
         randomizations = self._stage_randomizations(race_cfg, stage)
         disturbances = self._stage_disturbances(stage)
-        return VecDroneRaceEnv(
+        env = VecDroneRaceEnv(
             num_envs=self.n_envs,
             freq=race_cfg.env.freq,
             sim_config=race_cfg.sim,
@@ -324,6 +324,23 @@ class RLSongVecEnv:
             max_episode_steps=self.max_episode_steps,
             device=self.device,
         )
+        # v69: optional per-env sensor_range domain randomization.
+        # Deploy sensor_range=0.7 is in-distribution by intent of the [min,max]
+        # range chosen at CLI; sampled once per stage construction and held
+        # constant across the stage's training (re-sampled on stage switch
+        # via :meth:`set_stage`). Broadcast shape (n_envs, 1, 1) matches the
+        # ``(n_envs, n_drones, n_gates)`` shape that ``data.sensor_range``
+        # is compared against in ``race_core._reset_env_data`` and
+        # ``_update_visited_objects``.
+        if stage.sensor_range_random_max > stage.sensor_range_random_min:
+            rng = np.random.default_rng(self.seed + self.stage_idx + 1)
+            per_env_sr = rng.uniform(
+                low=float(stage.sensor_range_random_min),
+                high=float(stage.sensor_range_random_max),
+                size=(self.n_envs, 1, 1),
+            ).astype(np.float32)
+            env.data = env.data.replace(sensor_range=jnp.asarray(per_env_sr))
+        return env
 
     def _load_stage_config(self, stage: CurriculumStage) -> ConfigDict:
         """Load and patch the TOML config for a stage without touching disk."""
@@ -509,11 +526,25 @@ class RLSongVecEnv:
         mask_b3 = do_seg[:, None, None]
         new_pos_b = new_pos[:, None, :]
         new_vel_b = seg_vel[:, None, :]
-        identity_quat = jnp.zeros_like(states.quat).at[..., 3].set(1.0)
+        # 2026-05-25 seg-init audit: identity quat caused nose/velocity
+        # mismatch (drone body +x pointed world +x while velocity pointed
+        # along gate's +x_local), and ang_vel was inherited from the
+        # previous terminated episode (typically a tumble from crash).
+        # Mirror the fix in rollout._apply_segment_init exactly so the
+        # eager and JIT-scan branches share the same state distribution.
+        yaw = jnp.arctan2(gate_xaxis_world[..., 1], gate_xaxis_world[..., 0])
+        half_yaw = yaw * 0.5
+        seg_quat = jnp.stack(
+            [jnp.zeros_like(yaw), jnp.zeros_like(yaw), jnp.sin(half_yaw), jnp.cos(half_yaw)],
+            axis=-1,
+        )
+        seg_quat_b = seg_quat[:, None, :]
+        new_ang_vel_b = jnp.zeros_like(states.ang_vel)
         new_states = states.replace(
             pos=jnp.where(mask_b3, new_pos_b, states.pos),
             vel=jnp.where(mask_b3, new_vel_b, states.vel),
-            quat=jnp.where(mask_b3, identity_quat, states.quat),
+            quat=jnp.where(mask_b3, seg_quat_b, states.quat),
+            ang_vel=jnp.where(mask_b3, new_ang_vel_b, states.ang_vel),
         )
 
         new_target = jnp.where(
