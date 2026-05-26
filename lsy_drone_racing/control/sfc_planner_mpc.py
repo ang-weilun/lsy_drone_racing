@@ -126,7 +126,7 @@ class SfcCorridorPlanner:
     REPLAN_DEBOUNCE_TICKS = 5
 
     # --- TOPP (variable-speed schedule) tunables ---
-    V_MAX_GLOBAL = 2.4  # m/s. Speed ceiling on straights.
+    V_MAX_GLOBAL = 1.5  # m/s. Speed ceiling on straights.
     TILT_LIMIT_PLANNER = 0.5  # rad. Mirrors controller TILT_LIMIT. Drives a_lat_max.
     A_LONG_MAX_FACTOR = (
         0.53  # a_long_max = factor * a_lat_max. Vertical thrust eats some accel budget.
@@ -170,26 +170,35 @@ class SfcCorridorPlanner:
         self._record_replan_event(reason="init")
 
     def update(self, obs: dict[str, NDArray]) -> bool:
-        """Sync target_gate_idx from obs and replan if any object moved (debounced)."""
+        """Sync target_gate_idx from obs and replan if any object moved or gate passed."""
         self._tick += 1
 
-        # 1. Sync gate counter — does NOT trigger replan
+        # 1. Sync gate counter — triggers replan if we only look ahead a few gates
         env_target = int(obs.get("target_gate", self.target_gate_idx))
+        gate_changed = False
         if env_target == -1:
+            if self.target_gate_idx != len(self.gates_pos):
+                gate_changed = True
             self.target_gate_idx = len(self.gates_pos)
         else:
+            if self.target_gate_idx != env_target:
+                gate_changed = True
             self.target_gate_idx = env_target
 
         # Update current projection on spline
         self._current_t = self._find_closest_t(obs["pos"])
 
-        # 2. Detect movement
+        # 2. Detect movement or gate change
         moved, reason = self._check_objects_moved(obs)
+        if gate_changed:
+            moved = True
+            reason = "gate_passed"
+
         if not moved:
             return False
         if self._tick - self._last_replan_tick < self.REPLAN_DEBOUNCE_TICKS:
             return False
-        if self.target_gate_idx >= len(self.gates_pos):
+        if self.target_gate_idx >= len(self.gates_pos) and not gate_changed:
             return False
 
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
@@ -200,6 +209,44 @@ class SfcCorridorPlanner:
     def evaluate(self, t_offset: float) -> tuple[NDArray, NDArray, NDArray]:
         t_eval = self._current_t + t_offset
         return self._evaluate_absolute(t_eval)
+
+    def evaluate_corridor(self, t_offset: float) -> tuple[NDArray, NDArray] | None:
+        """Returns the (A, b) matrices for the flight corridor at time t_offset.
+        
+        Args:
+            t_offset: Time in seconds into the future.
+            
+        Returns:
+            Tuple (A, b) representing A*x <= b, or None if no corridor is active.
+        """
+        if not hasattr(self, "corridors") or self.corridors is None or len(self.corridors) == 0:
+            return None
+
+        t_eval = self._current_t + t_offset
+        if self._t_total <= 0:
+            u = 1.0
+        else:
+            t_clamped = float(np.clip(t_eval, 0.0, self._t_total))
+            if self._t_to_u is not None:
+                u = float(self._t_to_u(t_clamped))
+            else:
+                u = t_clamped / self._t_total
+        u = float(np.clip(u, 0.0, 1.0))
+
+        # Determine segment index. u spans [0, 1].
+        # There are n_segments = len(corridors).
+        # We need to map u back to the segment index.
+        # The B-spline knots define the parameterization.
+        # A simple approximation: u roughly maps linearly to segments.
+        # A better approach: use the control point parametrization mapping from optimize_control_points.
+        # For now, approximate linearly over segments since control points are evenly spaced.
+        n_segments = len(self.corridors)
+        seg_idx = int(np.floor(u * n_segments))
+        seg_idx = min(seg_idx, n_segments - 1)
+        
+        A = np.array(self.corridors[seg_idx].A)
+        b = np.array(self.corridors[seg_idx].b)
+        return A, b
 
     def _find_closest_t(self, pos: NDArray) -> float:
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
@@ -516,17 +563,106 @@ class SfcCorridorPlanner:
             corridors.append(corr)
         return corridors
 
+
+    def _init_casadi_planner(self) -> None:
+        """Initializes the fixed-size parametric CasADi optimizer."""
+        import casadi as ca
+        self.MAX_CTRL = 80
+        self.MAX_PLANES = 25
+
+        self.opti = ca.Opti()
+        self.P_ca = self.opti.variable(self.MAX_CTRL, 3)
+
+        self.mask_ca = self.opti.parameter(self.MAX_CTRL)
+        self.ref_pts_ca = self.opti.parameter(self.MAX_CTRL, 3)
+        
+        self.A_corr_ca = self.opti.parameter(self.MAX_CTRL * self.MAX_PLANES, 3)
+        self.b_corr_ca = self.opti.parameter(self.MAX_CTRL * self.MAX_PLANES)
+        
+        self.is_gate_ca = self.opti.parameter(self.MAX_CTRL)
+        self.gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
+        
+        self.tube_mask_ca = self.opti.parameter(self.MAX_CTRL)
+        self.tube_gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
+        self.tube_normal_ca = self.opti.parameter(self.MAX_CTRL, 3)
+        self.tube_sign_ca = self.opti.parameter(self.MAX_CTRL)
+        self.tube_facets_ca = self.opti.parameter(self.MAX_CTRL * 8, 3)
+        
+        self.align_mask_ca = self.opti.parameter(self.MAX_CTRL)
+        
+        self.P0_ref_ca = self.opti.parameter(3)
+        self.P1_ref_ca = self.opti.parameter(3)
+        self.P1_weight_ca = self.opti.parameter(1)
+        
+        self.end_mask_ca = self.opti.parameter(self.MAX_CTRL)
+        self.end_pos_ca = self.opti.parameter(3)
+
+        cost = 1e-6 * ca.sumsqr(self.P_ca)
+
+        for i in range(self.MAX_CTRL - 1):
+            diff = self.P_ca[i+1, :] - self.P_ca[i, :]
+            cost += self.W_VEL * self.mask_ca[i] * self.mask_ca[i+1] * ca.sumsqr(diff)
+            
+        for i in range(self.MAX_CTRL - 2):
+            diff = self.P_ca[i+2, :] - 2*self.P_ca[i+1, :] + self.P_ca[i, :]
+            cost += self.W_ACC * self.mask_ca[i] * self.mask_ca[i+1] * self.mask_ca[i+2] * ca.sumsqr(diff)
+
+        for i in range(self.MAX_CTRL - 3):
+            diff = self.P_ca[i+3, :] - 3*self.P_ca[i+2, :] + 3*self.P_ca[i+1, :] - self.P_ca[i, :]
+            cost += self.W_JERK * self.mask_ca[i] * self.mask_ca[i+1] * self.mask_ca[i+2] * self.mask_ca[i+3] * ca.sumsqr(diff)
+
+        for i in range(self.MAX_CTRL):
+            cost += self.W_CENTER * self.mask_ca[i] * ca.sumsqr(self.P_ca[i, :] - self.ref_pts_ca[i, :])
+            cost += 1e5 * self.is_gate_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.gate_pos_ca[i, :].T)
+            cost += 1e5 * self.end_mask_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.end_pos_ca)
+            
+        cost += 10.0 * ca.sumsqr(self.P_ca[0, :].T - self.P0_ref_ca)
+        cost += self.P1_weight_ca * ca.sumsqr(self.P_ca[1, :].T - self.P1_ref_ca)
+
+        for i in range(self.MAX_CTRL):
+            dp = self.P_ca[i, :] - self.tube_gate_pos_ca[i, :]
+            normal = self.tube_normal_ca[i, :]
+            proj = ca.dot(dp, normal) * normal
+            cost += self.W_GATE_ALIGN * self.align_mask_ca[i] * ca.sumsqr(dp - proj)
+
+        self.opti.minimize(cost)
+
+        for i in range(self.MAX_CTRL):
+            A_i = self.A_corr_ca[i*self.MAX_PLANES : (i+1)*self.MAX_PLANES, :]
+            b_i = self.b_corr_ca[i*self.MAX_PLANES : (i+1)*self.MAX_PLANES]
+            self.opti.subject_to( ca.mtimes(A_i, self.P_ca[i, :].T) <= b_i )
+
+            dp = self.P_ca[i, :] - self.tube_gate_pos_ca[i, :]
+            for f in range(8):
+                facet = self.tube_facets_ca[i*8 + f, :]
+                val = self.tube_mask_ca[i] * ca.dot(dp, facet)
+                bound = self.tube_mask_ca[i] * self.GATE_TUBE_RADIUS + (1 - self.tube_mask_ca[i]) * 1000.0
+                self.opti.subject_to( val <= bound )
+                
+            proj_n = self.tube_mask_ca[i] * self.tube_sign_ca[i] * ca.dot(dp, self.tube_normal_ca[i, :])
+            min_bound = self.tube_mask_ca[i] * self.GATE_TUBE_AXIAL_MIN - (1 - self.tube_mask_ca[i]) * 1000.0
+            max_bound = self.tube_mask_ca[i] * self.GATE_TUBE_HALF_LENGTH + (1 - self.tube_mask_ca[i]) * 1000.0
+            self.opti.subject_to( self.opti.bounded(min_bound, proj_n, max_bound) )
+
+        p_opts = {"expand": True}
+        s_opts = {"max_iter": 100, "print_level": 0, "tol": 1e-4, "acceptable_tol": 1e-3, "sb": "yes"}
+        self.opti.solver('ipopt', p_opts, s_opts)
+        self._casadi_initialized = True
+        self._last_P = None
+
     def _optimize_control_points(
         self,
         skeleton_path: list[SkeletonPoint],
         corridors: list[FlightCorridor],
         current_vel: NDArray,
     ) -> NDArray:
-        """Solves a QP to find optimal control points strictly within the Safe Corridors."""
+        """Solves a fixed-size parametric CasADi QP to find optimal control points."""
+        if getattr(self, "_casadi_initialized", False) is False:
+            self._init_casadi_planner()
+
         n_segments = len(corridors)
         pts_per_seg = self.points_per_segment
 
-        # Determine first segment points based on distance to next waypoint
         if len(skeleton_path) > 1:
             dist_to_next = np.linalg.norm(skeleton_path[1].pos - skeleton_path[0].pos)
             if dist_to_next < 0.25:
@@ -543,145 +679,137 @@ class SfcCorridorPlanner:
         pts_rest_seg = pts_per_seg
         n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
-        # Cubic B-spline fit and cp.diff(P, k=3) require n_ctrl >= 4. With
-        # pre/post anchors no longer in the skeleton, late-race replans
-        # (1 gate left, drone close to it) can produce a single corridor with
-        # n_ctrl as low as 1. Bump pts_first_seg to keep the spline well-defined.
         if n_ctrl < 4:
             pts_first_seg = 4 - (n_segments - 1) * pts_rest_seg
             n_ctrl = pts_first_seg + (n_segments - 1) * pts_rest_seg
 
-        P = cp.Variable((n_ctrl, 3))
-        constraints = []
+        n_ctrl = min(n_ctrl, self.MAX_CTRL)
 
-        # Build reference points with variable points per segment
-        reference_points_list = []
-        for i in range(n_segments):
-            n_pts = pts_first_seg if i == 0 else pts_rest_seg
-            for j in range(n_pts):
-                pt = corridors[i].p1 + (j / n_pts) * (corridors[i].p2 - corridors[i].p1)
-                reference_points_list.append(pt)
-        reference_points = np.array(reference_points_list)
+        v_mask = np.zeros(self.MAX_CTRL)
+        v_ref = np.zeros((self.MAX_CTRL, 3))
+        v_A = np.zeros((self.MAX_CTRL * self.MAX_PLANES, 3))
+        v_b = np.ones(self.MAX_CTRL * self.MAX_PLANES) * 1000.0
+        v_is_gate = np.zeros(self.MAX_CTRL)
+        v_gate_pos = np.zeros((self.MAX_CTRL, 3))
+        v_tube_mask = np.zeros(self.MAX_CTRL)
+        v_tube_gate = np.zeros((self.MAX_CTRL, 3))
+        v_tube_norm = np.zeros((self.MAX_CTRL, 3))
+        v_tube_sign = np.zeros(self.MAX_CTRL)
+        v_tube_facets = np.zeros((self.MAX_CTRL * 8, 3))
+        v_align_mask = np.zeros(self.MAX_CTRL)
+        v_end_mask = np.zeros(self.MAX_CTRL)
 
-        # Apply corridor constraints with variable points per segment
         idx = 0
         for seg_idx, corr in enumerate(corridors):
+            n_pts = pts_first_seg if seg_idx == 0 else pts_rest_seg
             A = np.array(corr.A)
             b = np.array(corr.b)
-            n_pts = pts_first_seg if seg_idx == 0 else pts_rest_seg
-            for _ in range(n_pts):
-                constraints.append(A @ P[idx] <= b)
+            n_planes = min(len(b), self.MAX_PLANES)
+            
+            for j in range(n_pts):
+                if idx >= self.MAX_CTRL:
+                    break
+                v_mask[idx] = 1.0
+                pt = corr.p1 + (j / n_pts) * (corr.p2 - corr.p1)
+                v_ref[idx] = pt
+                
+                v_A[idx * self.MAX_PLANES : idx * self.MAX_PLANES + n_planes] = A[:n_planes]
+                v_b[idx * self.MAX_PLANES : idx * self.MAX_PLANES + n_planes] = b[:n_planes]
                 idx += 1
 
-        constraints.extend([P[-1] == skeleton_path[-1].pos])
+        if idx == 0:
+            return np.array([self._current_pos_for_spline]*4)
+            
+        n_ctrl = idx 
 
-        # Build a mapping from skeleton path indices to control point indices
-        cp_idx_map = [0]  # skeleton_path[0] maps to control point 0
-        idx = pts_first_seg
+        cp_idx_map = [0]
+        curr_idx = pts_first_seg
         for seg_idx in range(1, n_segments):
-            cp_idx_map.append(idx)
-            idx += pts_rest_seg
-        cp_idx_map.append(n_ctrl - 1)  # Last skeleton point maps to last control point
+            cp_idx_map.append(curr_idx)
+            curr_idx += pts_rest_seg
+        cp_idx_map.append(n_ctrl - 1)
 
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
                 gate_cp_idx = cp_idx_map[i]
-                normal = skeleton_path[i].gate_normal
-                constraints.append(P[gate_cp_idx] == skeleton_path[i].pos)
-
-        # Re-inject pre/post anchor coordinates as reference targets for the
-        # gate-neighbour control points. Pre/post are no longer skeleton nodes
-        # (they used to break the corridor topology). The W_CENTER cost
-        # (weight 0.01) provides a tiny on-normal bias when nothing else is
-        # pushing the points off-axis. The hard tube fence + soft alignment
-        # cost are the load-bearing constraints; this is a comfort-blanket nudge.
-        for i in range(1, len(skeleton_path) - 1):
-            if skeleton_path[i].is_gate:
-                gate_cp_idx = cp_idx_map[i]
+                if gate_cp_idx >= self.MAX_CTRL:
+                    continue
+                    
                 gate_pos = skeleton_path[i].pos
-                normal = skeleton_path[i].gate_normal
-                if gate_cp_idx - 1 >= 0:
-                    reference_points[gate_cp_idx - 1] = gate_pos - normal * self.anchor_gap
-                if gate_cp_idx + 1 < n_ctrl:
-                    reference_points[gate_cp_idx + 1] = gate_pos + normal * self.anchor_gap
-
-        cost = (
-            self.W_VEL * cp.sum_squares(cp.diff(P, axis=0))
-            + self.W_ACC * cp.sum_squares(cp.diff(P, k=2, axis=0))
-            + self.W_JERK * cp.sum_squares(cp.diff(P, k=3, axis=0))
-            + self.W_CENTER * cp.sum_squares(P - reference_points)
-        )
-
-        # Initial position and velocity continuity: anchor spline to current drone state
-        current_pos = self._current_pos_for_spline
-        cost += 10.0 * cp.sum_squares(P[0] - current_pos)  # Soft anchor P[0] near current pos
-
-        # C1 Continuity (Initial Velocity Matching)
-        speed = np.linalg.norm(current_vel)
-        if speed > 0.1:
-            # Predict where the drone will be in the next 0.05 seconds
-            dt = 0.05
-            p_expected = current_pos + current_vel * dt
-            cost += 50.0 * cp.sum_squares(P[1] - p_expected)  # Strong velocity matching
-        else:
-            # If stationary, just keep next point close
-            cost += 10.0 * cp.sum_squares(P[1] - current_pos)
-
-        for i in range(1, len(skeleton_path) - 1):
-            if skeleton_path[i].is_gate:
-                gate_cp_idx = cp_idx_map[i]
                 normal = skeleton_path[i].gate_normal
                 right = skeleton_path[i].gate_right
                 up = skeleton_path[i].gate_up
-                gate_pos = skeleton_path[i].pos
 
-                # Polyhedral lateral fence: 8 half-spaces inscribed in a cylinder
-                # of radius GATE_TUBE_RADIUS around the gate-normal axis. We use
-                # a polyhedral approximation rather than cp.norm(..., 2) because
-                # the QP is solved with OSQP, which does not support SOC.
+                v_is_gate[gate_cp_idx] = 1.0
+                v_gate_pos[gate_cp_idx] = gate_pos
+
                 facet_dirs = []
                 for k in range(self.GATE_TUBE_N_FACETS):
                     theta = 2.0 * np.pi * k / self.GATE_TUBE_N_FACETS
                     facet_dirs.append(np.cos(theta) * right + np.sin(theta) * up)
+                facet_dirs = np.array(facet_dirs)
 
-                # Side convention: P[gate_idx − 1] sits on −n side, P[gate_idx + 1]
-                # on +n side. Without this signed split + min-axial fence, smoothness
-                # costs collapse both neighbours toward gate_pos, producing a tight
-                # high-curvature arc at the crossing that the controller can't track
-                # cleanly (residual ~0.09 m lateral error → frame-bar clip).
-                for offset_idx, sign in ((gate_cp_idx - 1, -1.0), (gate_cp_idx + 1, +1.0)):
-                    if not (0 <= offset_idx < n_ctrl):
-                        continue
-                    dp = P[offset_idx] - gate_pos
-                    # Lateral fence: 8 facet half-spaces.
-                    for d in facet_dirs:
-                        constraints.append(dp @ d <= self.GATE_TUBE_RADIUS)
-                    # Axial fence: signed band [min, half_length] on the assigned side.
-                    constraints.append(sign * (dp @ normal) >= self.GATE_TUBE_AXIAL_MIN)
-                    constraints.append(sign * (dp @ normal) <= self.GATE_TUBE_HALF_LENGTH)
-
-                # Softly penalize deviation from the normal line
                 if gate_cp_idx - 1 >= 0:
-                    dp = P[gate_cp_idx - 1] - skeleton_path[i].pos
-                    proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
+                    v_ref[gate_cp_idx - 1] = gate_pos - normal * self.anchor_gap
+                    v_tube_mask[gate_cp_idx - 1] = 1.0
+                    v_tube_gate[gate_cp_idx - 1] = gate_pos
+                    v_tube_norm[gate_cp_idx - 1] = normal
+                    v_tube_sign[gate_cp_idx - 1] = -1.0
+                    v_tube_facets[(gate_cp_idx - 1)*8 : gate_cp_idx*8] = facet_dirs
+                    v_align_mask[gate_cp_idx - 1] = 1.0
+
                 if gate_cp_idx + 1 < n_ctrl:
-                    dp = P[gate_cp_idx + 1] - skeleton_path[i].pos
-                    proj = cp.reshape(dp @ normal, (1,), order="C") * normal
-                    cost += self.W_GATE_ALIGN * cp.sum_squares(dp - proj)
+                    v_ref[gate_cp_idx + 1] = gate_pos + normal * self.anchor_gap
+                    v_tube_mask[gate_cp_idx + 1] = 1.0
+                    v_tube_gate[gate_cp_idx + 1] = gate_pos
+                    v_tube_norm[gate_cp_idx + 1] = normal
+                    v_tube_sign[gate_cp_idx + 1] = 1.0
+                    v_tube_facets[(gate_cp_idx + 1)*8 : (gate_cp_idx + 2)*8] = facet_dirs
+                    v_align_mask[gate_cp_idx + 1] = 1.0
 
-        problem = cp.Problem(cp.Minimize(cost), constraints)
+        v_end_mask[n_ctrl - 1] = 1.0
+        v_end_pos = skeleton_path[-1].pos
+
+        v_P0_ref = self._current_pos_for_spline
+        speed = np.linalg.norm(current_vel)
+        if speed > 0.1:
+            v_P1_ref = v_P0_ref + current_vel * 0.05
+            v_P1_weight = 50.0
+        else:
+            v_P1_ref = v_P0_ref
+            v_P1_weight = 10.0
+
+        self.opti.set_value(self.mask_ca, v_mask)
+        self.opti.set_value(self.ref_pts_ca, v_ref)
+        self.opti.set_value(self.A_corr_ca, v_A)
+        self.opti.set_value(self.b_corr_ca, v_b)
+        self.opti.set_value(self.is_gate_ca, v_is_gate)
+        self.opti.set_value(self.gate_pos_ca, v_gate_pos)
+        self.opti.set_value(self.tube_mask_ca, v_tube_mask)
+        self.opti.set_value(self.tube_gate_pos_ca, v_tube_gate)
+        self.opti.set_value(self.tube_normal_ca, v_tube_norm)
+        self.opti.set_value(self.tube_sign_ca, v_tube_sign)
+        self.opti.set_value(self.tube_facets_ca, v_tube_facets)
+        self.opti.set_value(self.align_mask_ca, v_align_mask)
+        self.opti.set_value(self.end_mask_ca, v_end_mask)
+        self.opti.set_value(self.end_pos_ca, v_end_pos)
+        self.opti.set_value(self.P0_ref_ca, v_P0_ref)
+        self.opti.set_value(self.P1_ref_ca, v_P1_ref)
+        self.opti.set_value(self.P1_weight_ca, v_P1_weight)
+
+        if self._last_P is not None:
+            self.opti.set_initial(self.P_ca, self._last_P)
+        else:
+            self.opti.set_initial(self.P_ca, v_ref)
+
         try:
-            problem.solve(solver=cp.OSQP, verbose=False)
-        except Exception:
-            pass
-
-        if P.value is None:
-            print("Warning: SFC QP infeasible. Relaxing constraints.")
-            return reference_points[:n_ctrl]
-
-        return P.value
-
+            sol = self.opti.solve()
+            P_opt = sol.value(self.P_ca)
+            self._last_P = P_opt
+            return P_opt[:n_ctrl]
+        except Exception as e:
+            logger.warning(f"SFC CasADi QP failed: {e}. Relaxing constraints.")
+            return v_ref[:n_ctrl]
     def _calculate_anchors(self, current_pos: NDArray) -> list[SkeletonPoint]:
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
@@ -749,6 +877,14 @@ class SfcCorridorPlanner:
                         exit_swing = clearance_pos - right * 1.0 - normal * 0.7
 
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None))
+
+        # Add an additional waypoint after the final gate to maintain speed through the finish line
+        if len(self.gates_pos) > 0 and self.target_gate_idx <= len(self.gates_pos):
+            last_gate_idx = len(self.gates_pos) - 1
+            last_pos = self.gates_pos[last_gate_idx]
+            last_normal = gate_normals[last_gate_idx]
+            finish_pos = last_pos + last_normal * 0.75
+            raw_path.append(SkeletonPoint(finish_pos, False, None, None, None))
 
         obs_circles = []
         for p in self.obstacles_pos:
