@@ -48,6 +48,26 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.x = X
     model.u = U
 
+    # Define parameters for dynamic corridor constraints
+    # n_g_max planes, each defined by 3 normal components + 1 distance offset
+    n_g_max = 50
+    import casadi as ca
+    p = ca.MX.sym('p', n_g_max * 4)
+    model.p = p
+
+    # Define nonlinear constraint: h(x, p) = A * pos - b <= 0
+    # p contains flattened [A_0, b_0, A_1, b_1, ...]
+    pos = X[0:3]
+    h_expr = ca.MX.zeros(n_g_max)
+    for i in range(n_g_max):
+        idx = i * 4
+        A_i = p[idx:idx+3]
+        b_i = p[idx+3]
+        # h_i = A_i dot pos - b_i
+        h_expr[i] = ca.dot(A_i, pos) - b_i
+    model.con_h_expr = h_expr
+    model.con_h_expr_e = h_expr
+
     return model
 
 
@@ -117,10 +137,11 @@ def create_corridor_ocp_solver(
     ocp.cost.yref = np.zeros(ny)
     ocp.cost.yref_e = np.zeros(ny_e)
 
-    # Attitude constraints: ±30 degrees roll/pitch
+    # Attitude constraints
     ocp.constraints.lbx = np.array([-0.5, -0.5])
     ocp.constraints.ubx = np.array([0.5, 0.5])
     ocp.constraints.idxbx = np.array([3, 4])
+
 
     # Thrust constraints
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4])
@@ -130,8 +151,36 @@ def create_corridor_ocp_solver(
     # Initial state
     ocp.constraints.x0 = np.zeros(nx)
 
+    # Nonlinear Path Constraints (Corridor Boundaries: h(x, p) <= 0)
+    n_g_max = 50
+    # h = A*x - b, so we want h <= 0
+    # lb <= h <= ub
+    ocp.constraints.lh = -1e3 * np.ones(n_g_max)
+    ocp.constraints.uh = np.zeros(n_g_max)
+    ocp.constraints.lh_e = -1e3 * np.ones(n_g_max)
+    ocp.constraints.uh_e = np.zeros(n_g_max)
+    
+    # Make constraints soft to avoid infeasibility
+    ocp.constraints.idxsh = np.arange(n_g_max)
+    ocp.constraints.idxsh_e = np.arange(n_g_max)
+    
+    # Penalize slack variables heavily
+    # Zl, Zu: quadratic penalty, zl, zu: linear penalty
+    ocp.cost.Zl = 10.0 * np.ones(n_g_max)
+    ocp.cost.Zu = 10.0 * np.ones(n_g_max)
+    ocp.cost.zl = 100.0 * np.ones(n_g_max)
+    ocp.cost.zu = 100.0 * np.ones(n_g_max)
+
+    ocp.cost.Zl_e = 10.0 * np.ones(n_g_max)
+    ocp.cost.Zu_e = 10.0 * np.ones(n_g_max)
+    ocp.cost.zl_e = 100.0 * np.ones(n_g_max)
+    ocp.cost.zu_e = 100.0 * np.ones(n_g_max)
+
+    # Initialize parameters
+    ocp.parameter_values = np.zeros(n_g_max * 4)
+
     # Solver options
-    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
+    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
     ocp.solver_options.nlp_solver_type = "SQP"
@@ -140,8 +189,8 @@ def create_corridor_ocp_solver(
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
 
-    ocp.solver_options.qp_solver_iter_max = 20
-    ocp.solver_options.nlp_solver_max_iter = 50
+    ocp.solver_options.qp_solver_iter_max = 50
+    ocp.solver_options.nlp_solver_max_iter = 100
 
     ocp.solver_options.tf = Tf
 
@@ -223,6 +272,14 @@ class SfcMpcCorridorController(Controller):
         self.solver.set(0, "ubx", x0)
 
         # Set reference trajectory from planner
+        n_g_max = 50
+        p_dummy = np.zeros(n_g_max * 4)
+        # For unused planes, set A=[1, 0, 0] and b=100. 
+        # This gives h = pos_x - 100 <= 0, preventing a zero Jacobian which causes HPIPM error 3.
+        for i in range(n_g_max):
+            p_dummy[i * 4 + 0] = 1.0
+            p_dummy[i * 4 + 3] = 100.0
+
         for k in range(self._N):
             t_ref = k * self._dt
             pos_ref, vel_ref, acc_ref = self.planner.evaluate(t_ref)
@@ -234,6 +291,18 @@ class SfcMpcCorridorController(Controller):
 
             self.solver.set(k, "yref", yref)
 
+            # Corridor Path Constraints via parameters
+            corr = self.planner.evaluate_corridor(t_ref)
+            p_k = p_dummy.copy()
+            if corr is not None:
+                A, b = corr
+                num_planes = min(A.shape[0], n_g_max)
+                for i in range(num_planes):
+                    idx = i * 4
+                    p_k[idx:idx+3] = A[i, :]
+                    p_k[idx+3] = b[i]
+            self.solver.set(k, "p", p_k)
+
         # Set terminal reference
         t_ref = self._N * self._dt
         pos_ref, vel_ref, acc_ref = self.planner.evaluate(t_ref)
@@ -241,6 +310,20 @@ class SfcMpcCorridorController(Controller):
         yref_e[0:3] = pos_ref
         yref_e[6:9] = vel_ref
         self.solver.set(self._N, "y_ref", yref_e)
+
+        # Terminal Corridor Constraints via parameters
+        # Terminal step (k=N) has no "p" for path constraints if we don't define con_h_expr_e.
+        # But we must set "p" if the model has parameters. Acados expects parameters on all nodes.
+        corr = self.planner.evaluate_corridor(t_ref)
+        p_e = p_dummy.copy()
+        if corr is not None:
+            A, b = corr
+            num_planes = min(A.shape[0], n_g_max)
+            for i in range(num_planes):
+                idx = i * 4
+                p_e[idx:idx+3] = A[i, :]
+                p_e[idx+3] = b[i]
+        self.solver.set(self._N, "p", p_e)
 
         # Solve OCP with error handling
         try:
