@@ -35,6 +35,12 @@ sim = [
     "crazyflow>=0.1.0",
     "jax >= 0.7",
     "warp-lang",
+    # Required by the SBX-trained controller (`control/sbx_song.py`) — the
+    # Actor module and its output distribution. Training-side deps (sbx,
+    # optax, flax.training.train_state) are intentionally not listed; they
+    # live in a separate training env.
+    "flax >= 0.10",
+    "tensorflow-probability >= 0.25",
 ]
 # option[gpu]: simulation with gpu
 gpu = ["jax[cuda12]"]
@@ -42,12 +48,6 @@ gpu = ["jax[cuda12]"]
 deploy = [
     "cfclient",
     "drone-estimators",
-    # Required by the SBX-trained controller (`control/sbx_song.py`) — the
-    # Actor module and its output distribution. Training-side deps (sbx,
-    # optax, flax.training.train_state) are intentionally not listed; they
-    # live in a separate training env.
-    "flax >= 0.10",
-    "tensorflow-probability >= 0.25",
 ]
 # option[rl]: train rl policy
 rl = ["torch == 2.8.0", "wandb"]
