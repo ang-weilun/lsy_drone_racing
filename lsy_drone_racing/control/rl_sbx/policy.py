@@ -12,10 +12,12 @@ emits a single flat-concat array of shape ``(2 * ACTOR_OBS_DIM,)``:
 * ``obs[..., ACTOR_OBS_DIM:]`` is the privileged critic obs (critic normalizer)
 
 The :class:`Actor` and :class:`Critic` flax modules each slice their own half
-as the first operation in ``__call__``. SBX's loss code calls
+as the first operation in ``__call__``. At training time the Actor wraps its
+output in a ``tfd.MultivariateNormalDiag`` so SBX's loss code can call
 ``dist.log_prob(actions)`` / ``dist.entropy()`` (``sbx/ppo/ppo.py:225-235``)
-unmodified — our Actor returns a ``tfd.MultivariateNormalDiag``, satisfying
-both contracts.
+unmodified. On the inference-only branch (this file) the Actor returns the
+mean ``mu`` directly — deploy uses ``dist.mean()`` and nothing else, so the
+``tfp`` dependency is dropped.
 
 Layer widths and activation match
 :mod:`lsy_drone_racing.control.rl_song.policy` (two 256-unit ``tanh`` hidden
@@ -50,14 +52,11 @@ from typing import TYPE_CHECKING, Any
 
 import flax.linen as nn
 import jax.numpy as jnp
-import tensorflow_probability.substrates.jax as tfp
 
 from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-
-tfd = tfp.distributions
 
 # Hidden-layer widths for actor and critic MLPs.
 # v132 (2026-05-27): reverted 512 -> 256 to match rl_song.policy.HIDDEN_SIZE.
@@ -77,13 +76,6 @@ NET_ARCH: tuple[int, ...] = (HIDDEN_SIZE,) * N_HIDDEN_LAYERS
 # exploration noise on the SBX-trained policy starts at the same magnitude
 # the v33-onward runs successfully bootstrapped from.
 LOG_STD_INIT: float = -0.5
-
-# Floor on ``log_std`` per ``rl_song.policy.LOG_STD_MIN``. Prevents the
-# learnable log-std parameter from collapsing the exploration noise to zero
-# in late training (sigma ≈ 0.082 at this floor), which would freeze the
-# KL signal and stop the policy from refining.
-LOG_STD_MIN: float = -2.5
-
 
 class Actor(nn.Module):
     """Flax actor that slices the actor half of the flat-concat obs.
@@ -131,7 +123,7 @@ class Actor(nn.Module):
         return jnp.array(0.0)
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray) -> tfd.Distribution:
+    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         """Run the actor.
 
         Parameters
@@ -142,9 +134,12 @@ class Actor(nn.Module):
 
         Returns:
         -------
-        tfd.MultivariateNormalDiag
-            Diagonal-Gaussian action distribution with mean ``mu`` and
-            ``scale_diag = exp(log_std)``.
+        jnp.ndarray, shape (..., action_dim)
+            Deterministic action mean ``mu``. The inference-only branch
+            drops the diagonal-Gaussian wrapping (and the ``tfp`` import)
+            since deploy uses the mean directly; the ``log_std`` parameter
+            is still declared so checkpoint loading matches the trained
+            params dict.
         """
         x = obs[..., :ACTOR_OBS_DIM]
         # 2026-05-25: when ``ortho_init=True``, match rl_song's hidden-layer
@@ -172,15 +167,14 @@ class Actor(nn.Module):
             )(x)
         )
 
-        log_std_raw = self.param(
+        # Keep the ``log_std`` parameter declared so checkpoints saved with
+        # the training-time Actor (which exposed it as a state-independent
+        # Gaussian std) load into this inference-only Actor cleanly. The
+        # value is unused on the deterministic deploy path.
+        _ = self.param(
             "log_std", nn.initializers.constant(self.log_std_init), (self.action_dim,)
         )
-        # Floor ``log_std`` at ``LOG_STD_MIN = -2.5`` (sigma ≈ 0.082) per
-        # ``rl_song.policy.LOG_STD_MIN`` — prevents PPO from collapsing the
-        # exploration noise to zero in late training.
-        log_std = jnp.maximum(log_std_raw, LOG_STD_MIN)
-        log_std = jnp.broadcast_to(log_std, mu.shape)
-        return tfd.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_std))
+        return mu
 
 
 class Critic(nn.Module):

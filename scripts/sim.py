@@ -10,11 +10,13 @@ Look for instructions in `README.md` and in the official documentation.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fire
 import gymnasium
+import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
 from lsy_drone_racing.utils import load_config, load_controller
@@ -30,10 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level0.toml",
+    config: str = "level2.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
+    profile_controller: bool = False,
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
@@ -72,6 +75,7 @@ def simulate(
     env = JaxToNumpy(env)
 
     ep_times = []
+    control_dt_ms: list[float] = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
         obs, info = env.reset()
         controller: Controller = controller_cls(obs, info, config)
@@ -81,7 +85,12 @@ def simulate(
         while True:
             curr_time = i / config.env.freq
 
-            action = controller.compute_control(obs, info)
+            if profile_controller:
+                t0 = time.perf_counter()
+                action = controller.compute_control(obs, info)
+                control_dt_ms.append((time.perf_counter() - t0) * 1e3)
+            else:
+                action = controller.compute_control(obs, info)
 
             obs, reward, terminated, truncated, info = env.step(action)
             # Update the controller internal state and models.
@@ -104,6 +113,31 @@ def simulate(
 
     # Close the environment
     env.close()
+
+    if profile_controller and control_dt_ms:
+        # Drop the first call: it includes JAX trace/compile and is not
+        # representative of steady-state inference cost.
+        warm = control_dt_ms[0]
+        steady = np.asarray(control_dt_ms[1:], dtype=np.float64)
+        budget_ms = 1000.0 / config.env.freq
+        over = int((steady > budget_ms).sum())
+        logger.info(
+            "compute_control timing over %d calls (warmup %.2f ms dropped):\n"
+            "  mean %.3f ms | p50 %.3f | p95 %.3f | p99 %.3f | max %.3f ms\n"
+            "  budget @ %d Hz = %.2f ms | over budget: %d / %d (%.2f%%)",
+            steady.size,
+            warm,
+            steady.mean(),
+            np.percentile(steady, 50),
+            np.percentile(steady, 95),
+            np.percentile(steady, 99),
+            steady.max(),
+            int(config.env.freq),
+            budget_ms,
+            over,
+            steady.size,
+            100.0 * over / steady.size,
+        )
     return ep_times
 
 

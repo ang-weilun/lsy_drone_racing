@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from drone_models.core import load_params
@@ -30,7 +31,7 @@ from lsy_drone_racing.control.controller import Controller
 from lsy_drone_racing.control.rl_sbx import checkpoint as ckpt
 from lsy_drone_racing.control.rl_sbx.policy import LOG_STD_INIT, NET_ARCH, Actor
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
-from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, ENV_ACTION_DIM, RAW_ACTION_DIM
+from lsy_drone_racing.control.rl_song.config import ENV_ACTION_DIM, RAW_ACTION_DIM
 from lsy_drone_racing.control.rl_song.policy import raw_to_env_action
 
 if TYPE_CHECKING:
@@ -116,6 +117,34 @@ class RLSBXController(Controller):
         # to keep the module signature identical.
         self._actor = Actor(action_dim=RAW_ACTION_DIM, net_arch=NET_ARCH, log_std_init=LOG_STD_INIT)
 
+        # JIT the full obs-encode → actor → action-projection chain. Without
+        # this, every ``compute_control`` retraces ``build_actor_obs``,
+        # ``actor.apply``, and ``raw_to_env_action`` from Python — ~45 ms per
+        # call on a dev GPU host, over the 20 ms budget at 50 Hz. The thrust
+        # bounds and ``alpha_max`` are static (constant across the episode)
+        # so they bake in as compile-time constants on the first call.
+        actor_apply = self._actor.apply
+
+        def _forward(
+            actor_params: Any,
+            env_obs: dict[str, Array],
+            prev_action: Array,
+            normalizer: Any,
+            thrust_min: float,
+            thrust_max: float,
+            alpha_max: float,
+        ) -> Array:
+            actor_obs = obs_encoding.build_actor_obs(env_obs, prev_action, normalizer)
+            flat_obs = jnp.concatenate([actor_obs, jnp.zeros_like(actor_obs)], axis=-1)
+            mu = actor_apply(actor_params, flat_obs[None, :])
+            return raw_to_env_action(
+                mu[0], env_obs["quat"], thrust_min, thrust_max, alpha_max=alpha_max
+            )
+
+        self._forward = jax.jit(
+            _forward, static_argnames=("thrust_min", "thrust_max", "alpha_max")
+        )
+
     def compute_control(
         self, obs: dict[str, npt.NDArray[np.floating]], info: dict | None = None
     ) -> npt.NDArray[np.floating]:
@@ -137,28 +166,20 @@ class RLSBXController(Controller):
         -----
         The flat-concat layout is collapsed to ``(2 * ACTOR_OBS_DIM,)``
         with the critic half zeroed; the actor slices the first half
-        internally so the second half is never read. The Gaussian mean
-        (``dist.mean()``) is used directly — deterministic deploy, no
-        sampling.
+        internally so the second half is never read. The Actor returns
+        the Gaussian mean ``mu`` directly (no ``tfp`` distribution wrap on
+        the deploy path) — deterministic deploy, no sampling.
         """
         del info
         jax_obs = {key: jnp.asarray(value) for key, value in obs.items()}
-        actor_obs = obs_encoding.build_actor_obs(
-            jax_obs, self.prev_action_env_4vec, self.actor_normalizer
-        )
-        # Pad the critic half with zeros — actor slices ``[..., :ACTOR_OBS_DIM]``
-        # and never touches the rest. Float32 to match the trained dtype.
-        flat_obs = jnp.concatenate(
-            [actor_obs, jnp.zeros((ACTOR_OBS_DIM,), dtype=actor_obs.dtype)], axis=-1
-        )
-        dist = self._actor.apply(self.actor_params, flat_obs[None, :])
-        raw_action = dist.mean()[0]
-        env_action = raw_to_env_action(
-            raw_action,
-            jax_obs["quat"],
+        env_action = self._forward(
+            self.actor_params,
+            jax_obs,
+            self.prev_action_env_4vec,
+            self.actor_normalizer,
             self.thrust_min,
             self.thrust_max,
-            alpha_max=self.alpha_max_rad,
+            self.alpha_max_rad,
         )
         self.prev_action_env_4vec = env_action
         return np.asarray(env_action, dtype=np.float32)
