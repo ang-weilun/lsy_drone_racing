@@ -5,9 +5,8 @@ passes one ``observations`` array to both ``actor_state.apply_fn`` and
 ``vf_state.apply_fn``. Dict observations are explicitly unsupported — see
 ``sbx/ppo/ppo.py:297`` where the rollout buffer is read as ``.observations.numpy()``.
 
-To run an asymmetric actor/critic under that constraint we make the
-:class:`lsy_drone_racing.control.rl_sbx.env_gym.RLSBXVecEnv` emit a single
-flat-concat array of shape ``(2 * ACTOR_OBS_DIM,)``:
+To run an asymmetric actor/critic under that constraint the training-time env
+emits a single flat-concat array of shape ``(2 * ACTOR_OBS_DIM,)``:
 
 * ``obs[..., :ACTOR_OBS_DIM]`` is the masked actor obs (actor normalizer)
 * ``obs[..., ACTOR_OBS_DIM:]`` is the privileged critic obs (critic normalizer)
@@ -27,6 +26,17 @@ the SBX convention rather than the rl_song split-head/floored-log-std
 convention. Warm-start would therefore need a separate one-time conversion
 step; this file does not implement that.
 
+Deploy-only subset
+------------------
+This is the inference-only branch — the training-side glue
+(``AsymmetricActorCriticPolicy(PPOPolicy)``, ``optax``-built ``TrainState``s,
+SBX's ``PPOPolicy.build`` machinery) is intentionally absent so the deploy
+env does not need ``sbx``, ``optax``, or ``flax.training`` installed. Only
+:class:`Actor` (loaded by :func:`rl_sbx.checkpoint.load_actor_only` and
+called by :class:`lsy_drone_racing.control.sbx_song.RLSBXController`) and
+:class:`Critic` (kept for documentation symmetry; not loaded at deploy)
+remain.
+
 References:
 ----------
 Schuck, J. et al. (2025). A Primer on SO(3) Action Representations in Deep
@@ -39,21 +49,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import flax.linen as nn
-import gymnasium as gym
-import jax
 import jax.numpy as jnp
-import numpy as np
-import optax
 import tensorflow_probability.substrates.jax as tfp
-from flax.training.train_state import TrainState
-from sbx.ppo.policies import PPOPolicy
 
 from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-
-    from stable_baselines3.common.type_aliases import Schedule
 
 tfd = tfp.distributions
 
@@ -81,10 +83,6 @@ LOG_STD_INIT: float = -0.5
 # in late training (sigma ≈ 0.082 at this floor), which would freeze the
 # KL signal and stop the policy from refining.
 LOG_STD_MIN: float = -2.5
-
-# Total flat-concat obs dimension; the env wrapper packs
-# ``[actor (ACTOR_OBS_DIM) | critic (ACTOR_OBS_DIM)]``.
-FLAT_CONCAT_OBS_DIM: int = 2 * ACTOR_OBS_DIM
 
 
 class Actor(nn.Module):
@@ -191,6 +189,10 @@ class Critic(nn.Module):
     Field signature matches :class:`sbx.ppo.policies.Critic` so SBX's
     :meth:`PPOPolicy.build` can construct us with its standard kwargs.
 
+    Kept in the deploy bundle for documentation symmetry with the asymmetric
+    training-time structure; this class is not instantiated by the deploy
+    controller (see :func:`rl_sbx.checkpoint.load_actor_only`).
+
     Parameters
     ----------
     net_arch : Sequence[int]
@@ -237,151 +239,3 @@ class Critic(nn.Module):
             x = nn.Dense(n_units, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
             x = self.activation_fn(x)
         return nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
-
-
-class AsymmetricActorCriticPolicy(PPOPolicy):
-    """PPOPolicy subclass routing flat-concat obs to slice-aware actor/critic.
-
-    The flat-concat layout (env_gym module docstring) means SBX's PPO
-    training loop is unmodified — it passes the single ``observations``
-    tensor to both actor and critic, and each module's ``__call__`` slices
-    its own half. As a result, the bulk of :meth:`PPOPolicy.build`,
-    :meth:`PPOPolicy._predict`, :meth:`PPOPolicy._predict_all`, and the
-    optimizer / ``TrainState`` plumbing are inherited unchanged.
-
-    Parameters
-    ----------
-    observation_space : gym.spaces.Space
-        Must be a flat ``Box`` of shape ``(2 * ACTOR_OBS_DIM,)``.
-    action_space : gym.spaces.Space
-        Raw 4-vec action ``Box``.
-    lr_schedule : Schedule
-        SB3 learning-rate schedule callable.
-    **kwargs : Any
-        Forwarded to :class:`sbx.ppo.policies.PPOPolicy`. Any of these
-        kwargs that this class needs to fix (``actor_class``,
-        ``critic_class``, ``net_arch``) are overridden with our values to
-        keep call sites simple — the parent's behaviour for everything else
-        (optimizer, ortho_init, log_std_init, activation_fn) is preserved.
-
-    Raises:
-    ------
-    ValueError
-        If ``observation_space`` is not a ``Box`` of shape
-        ``(2 * ACTOR_OBS_DIM,)``.
-    """
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        lr_schedule: Schedule,
-        **kwargs: Any,
-    ):
-        """Construct the policy. See class docstring for parameter details."""
-        if not isinstance(observation_space, gym.spaces.Box):
-            raise ValueError(
-                "AsymmetricActorCriticPolicy requires a Box observation space; "
-                f"got {type(observation_space).__name__}."
-            )
-        if observation_space.shape != (FLAT_CONCAT_OBS_DIM,):
-            raise ValueError(
-                "AsymmetricActorCriticPolicy expects observation_space.shape == "
-                f"({FLAT_CONCAT_OBS_DIM},) (= 2 * ACTOR_OBS_DIM); got "
-                f"{observation_space.shape}."
-            )
-
-        # Fix the actor/critic classes and architecture. Caller-supplied
-        # values for these would silently get ignored otherwise, which would
-        # be surprising — raise instead.
-        for forbidden in ("actor_class", "critic_class", "net_arch"):
-            if forbidden in kwargs:
-                raise ValueError(
-                    f"AsymmetricActorCriticPolicy does not accept '{forbidden}'; "
-                    "the slice-aware Actor/Critic and the fixed NET_ARCH are "
-                    "intrinsic to this class."
-                )
-
-        kwargs.setdefault("log_std_init", LOG_STD_INIT)
-        kwargs.setdefault("activation_fn", nn.leaky_relu)
-
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch=list(NET_ARCH),
-            actor_class=Actor,
-            critic_class=Critic,
-            **kwargs,
-        )
-
-    def build(self, key: jax.Array, lr_schedule: Schedule, max_grad_norm: float) -> jax.Array:
-        """Construct ``self.actor`` / ``self.vf`` and their ``TrainState``s.
-
-        Mirrors :meth:`sbx.ppo.policies.PPOPolicy.build` but constructs the
-        Actor without SBX's image-features-extractor kwargs (our Actor and
-        Critic accept ``features_extractor=None`` and ignore it, but SBX's
-        stock build expands ``self.features_extractor_kwargs`` which is
-        empty for a non-image policy — keeping the implementation explicit
-        avoids relying on that emptiness as a load-bearing invariant).
-
-        Parameters
-        ----------
-        key : jax.Array
-            PRNG key; split into ``(actor_key, vf_key, kept_key)``.
-        lr_schedule : Schedule
-            Learning-rate schedule sampled once at ``step=1`` for
-            :func:`optax.inject_hyperparams`; SBX's training loop later
-            mutates ``opt_state[1].hyperparams["learning_rate"]`` per
-            iteration to anneal.
-        max_grad_norm : float
-            Global-norm clip applied before the Adam update.
-
-        Returns:
-        -------
-        jax.Array
-            A fresh PRNG key the caller can continue splitting from.
-        """
-        key, actor_key, vf_key = jax.random.split(key, 3)
-        # SBX uses ``self.key`` for gSDE exploration noise; preserve that
-        # contract even though we don't use gSDE.
-        key, self.key = jax.random.split(key, 2)
-        self.reset_noise()
-
-        dummy_obs = jnp.zeros((1, FLAT_CONCAT_OBS_DIM), dtype=jnp.float32)
-        action_dim = int(np.prod(self.action_space.shape))
-
-        self.actor = self.actor_class(
-            action_dim=action_dim,
-            net_arch=self.net_arch_pi,
-            log_std_init=self.log_std_init,
-            activation_fn=self.activation_fn,
-            ortho_init=self.ortho_init,
-        )
-        # Stub used by SBX's gSDE path; harmless when ``use_sde=False``.
-        self.actor.reset_noise = self.reset_noise
-
-        # ``inject_hyperparams`` lets SBX rewrite the LR in-place per iter.
-        # Adam ``eps=1e-5`` matches PPOPolicy.__init__ default.
-        optimizer = optax.inject_hyperparams(self.optimizer_class)(
-            learning_rate=lr_schedule(1), **self.optimizer_kwargs
-        )
-
-        self.actor_state = TrainState.create(
-            apply_fn=self.actor.apply,
-            params=self.actor.init(actor_key, dummy_obs),
-            tx=optax.chain(optax.clip_by_global_norm(max_grad_norm), optimizer),
-        )
-
-        self.vf = self.critic_class(net_arch=self.net_arch_vf, activation_fn=self.activation_fn)
-        self.vf_state = TrainState.create(
-            apply_fn=self.vf.apply,
-            params=self.vf.init(vf_key, dummy_obs),
-            tx=optax.chain(optax.clip_by_global_norm(max_grad_norm), optimizer),
-        )
-
-        # JIT the apply functions — matches SBX's PPOPolicy.build.
-        self.actor.apply = jax.jit(self.actor.apply)  # type: ignore[method-assign]
-        self.vf.apply = jax.jit(self.vf.apply)  # type: ignore[method-assign]
-
-        return key

@@ -105,8 +105,8 @@ class RLSBXController(Controller):
         # the actor saw in rollout.
         self.prev_action_env_4vec: Array = jnp.zeros((ENV_ACTION_DIM,), dtype=jnp.float32)
 
-        # Constructor args MUST match ``AsymmetricActorCriticPolicy.build``
-        # in ``rl_sbx.policy`` (action_dim, net_arch, log_std_init,
+        # Constructor args MUST match the kwargs the training-side builder
+        # passed to ``Actor`` (action_dim, net_arch, log_std_init,
         # activation_fn, ortho_init). ``activation_fn`` defaults to
         # ``nn.tanh`` and ``ortho_init`` defaults to ``False`` on the Actor
         # dataclass — both match the SBX PPOPolicy defaults used at
