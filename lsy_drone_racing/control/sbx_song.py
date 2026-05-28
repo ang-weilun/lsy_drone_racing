@@ -38,6 +38,7 @@ class RLSBXController(Controller):
     """Deterministic deploy controller for the SBX-trained actor."""
 
     def __init__(self, obs: dict[str, npt.NDArray[np.floating]], info: dict, config: dict) -> None:
+        """Load the actor-only checkpoint and JIT the obs -> action chain."""
         super().__init__(obs, info, config)
 
         checkpoint_path = _resolve_checkpoint_path(
@@ -86,7 +87,7 @@ class RLSBXController(Controller):
     def compute_control(
         self, obs: dict[str, npt.NDArray[np.floating]], info: dict | None = None
     ) -> npt.NDArray[np.floating]:
-        """Run the actor on the masked obs and return a 4-d env action `[roll, pitch, yaw, thrust]`."""
+        """Return a 4-d env action `[roll, pitch, yaw, thrust]` from the masked obs."""
         del info
         jax_obs = {key: jnp.asarray(value) for key, value in obs.items()}
         env_action = self._forward(
@@ -110,8 +111,12 @@ class RLSBXController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        # Base default returns True (despite its comment), which breaks sim.py's
-        # rollout loop after one step. The RL policy has no stopping criterion.
+        """Return False so the env (not the controller) decides termination.
+
+        The base default returns True (despite its comment), which breaks
+        sim.py's rollout loop after one step. The RL policy has no stopping
+        criterion.
+        """
         del action, obs, reward, terminated, truncated, info
         return False
 

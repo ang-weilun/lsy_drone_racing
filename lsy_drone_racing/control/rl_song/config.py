@@ -46,10 +46,12 @@ class PPOConfig:
 
     @property
     def batch_size(self) -> int:
+        """Total transitions per PPO update."""
         return self.n_envs * self.n_steps
 
     @property
     def n_iterations(self) -> int:
+        """PPO updates over the full training budget."""
         return self.total_timesteps // self.batch_size
 
 

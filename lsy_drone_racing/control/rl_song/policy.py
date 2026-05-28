@@ -39,6 +39,7 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, obs: Array) -> tuple[Array, Array]:
+        """Return `(mu_raw, log_std_raw)`."""
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
             x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
@@ -58,6 +59,7 @@ class Critic(nn.Module):
 
     @nn.compact
     def __call__(self, obs: Array) -> Array:
+        """Return the scalar value estimate."""
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
             x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)

@@ -63,7 +63,10 @@ def apply_normalizer(state: NormalizerState, x: Array) -> Array:
 
 
 def _quat_to_matrix(quat_xyzw: Array) -> Array:
-    """xyzw quat -> 3x3 rotation. Hand-rolled: scipy's wrapper adds ~30 ms/call via np.vectorize."""
+    """Convert xyzw quat to a 3x3 rotation matrix.
+
+    Hand-rolled because scipy's wrapper adds ~30 ms/call via np.vectorize.
+    """
     x = quat_xyzw[..., 0]
     y = quat_xyzw[..., 1]
     z = quat_xyzw[..., 2]
@@ -98,7 +101,10 @@ def _gate_corners_world(gate_pos: Array, gate_quat: Array) -> Array:
 def build_actor_obs(
     env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
 ) -> Array:
-    """Encode one env obs as the 52-d actor tensor. `prev_action` accepted for API compat (unused)."""
+    """Encode one env obs as the 52-d actor tensor.
+
+    `prev_action` is accepted for API compatibility with rollout but is unused.
+    """
     pos = env_obs["pos"]
     quat = env_obs["quat"]
     vel = env_obs["vel"]

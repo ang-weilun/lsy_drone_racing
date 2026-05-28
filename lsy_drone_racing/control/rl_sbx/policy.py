@@ -41,6 +41,7 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+        """Return the deterministic action mean `mu`."""
         x = obs[..., :ACTOR_OBS_DIM]
         hidden_kernel_init: Any
         if self.ortho_init:
@@ -79,6 +80,7 @@ class Critic(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+        """Return the scalar value estimate."""
         x = obs[..., ACTOR_OBS_DIM:]
         for n_units in self.net_arch:
             x = nn.Dense(n_units, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
