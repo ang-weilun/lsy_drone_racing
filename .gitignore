@@ -9,6 +9,7 @@ saves
 .pytest_cache
 **/*.json
 !devcontainer.json
+!checkpoints/**/*.json
 **/*.csv
 plots/
 c_generated_code/
