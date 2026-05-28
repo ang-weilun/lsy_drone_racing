@@ -6720,7 +6720,7 @@ packages:
 - pypi: ./
   name: lsy-drone-racing
   version: 0.0.1
-  sha256: fa6c3b25dca27404b1a3f99101c4ac56b24a8bb391579e6a99abfcb0dee306a8
+  sha256: d23ea9351c0783e4f148e2c396da6d90e1e4e93ba982b0a07d7d06eeaefd28a9
   requires_dist:
   - fire>=0.6.0
   - numpy
@@ -6733,6 +6733,7 @@ packages:
   - crazyflow>=0.1.0 ; extra == 'sim'
   - jax>=0.7 ; extra == 'sim'
   - warp-lang ; extra == 'sim'
+  - flax>=0.10 ; extra == 'sim'
   - jax[cuda12] ; extra == 'gpu'
   - cfclient ; extra == 'deploy'
   - drone-estimators ; extra == 'deploy'

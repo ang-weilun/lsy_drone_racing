@@ -35,6 +35,13 @@ sim = [
     "crazyflow>=0.1.0",
     "jax >= 0.7",
     "warp-lang",
+    # Required by the SBX-trained controller (`control/sbx_song.py`) — the
+    # Actor module's flax MLP. Training-side deps (sbx, optax,
+    # flax.training.train_state, tensorflow-probability for the Gaussian
+    # distribution wrap) are intentionally not listed; they live in a
+    # separate training env. Deploy uses the deterministic action mean
+    # directly, so no distribution library is needed at inference.
+    "flax >= 0.10",
 ]
 # option[gpu]: simulation with gpu
 gpu = ["jax[cuda12]"]
