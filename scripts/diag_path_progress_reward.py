@@ -16,12 +16,19 @@ the real gate-pass handoff (r_prog must be zeroed when gate_just_passed=True).
 
 from __future__ import annotations
 
-import jax.numpy as jnp
-import numpy as np
-from scipy.spatial.transform import Rotation
+import os
 
-from lsy_drone_racing.control.rl_song.config import RewardConfig
-from lsy_drone_racing.control.rl_song.reward import step_reward
+# crazyflow (imported transitively via lsy_drone_racing below) raises unless
+# SCIPY_ARRAY_API is set before scipy is imported. Set it here so the diagnostic
+# runs standalone, without needing the env var on the command line.
+os.environ.setdefault("SCIPY_ARRAY_API", "1")
+
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+from scipy.spatial.transform import Rotation  # noqa: E402
+
+from lsy_drone_racing.control.rl_song.config import RewardConfig  # noqa: E402
+from lsy_drone_racing.control.rl_song.reward import step_reward  # noqa: E402
 
 Z = 1.0
 TOL = 0.15
