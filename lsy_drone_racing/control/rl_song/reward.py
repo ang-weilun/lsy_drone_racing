@@ -39,7 +39,7 @@ SEGMENT_AB_SQ_EPS: float = 1e-12
 # Quadratic-Bézier sample count for the guiding-path corner. Static (sets JAX
 # array shapes); not a runtime config field.
 _PATH_SMOOTH_SAMPLES: int = 16
-_BEZIER_T: Array = jnp.linspace(0.0, 1.0, _PATH_SMOOTH_SAMPLES)
+_BEZIER_T: Array = jnp.linspace(0.0, 1.0, _PATH_SMOOTH_SAMPLES, dtype=jnp.float32)
 _BEZIER_W0: Array = jnp.square(1.0 - _BEZIER_T)  # exit_prev weight
 _BEZIER_W1: Array = 2.0 * (1.0 - _BEZIER_T) * _BEZIER_T  # entry_tgt (control) weight
 _BEZIER_W2: Array = jnp.square(_BEZIER_T)  # center_tgt weight
@@ -347,6 +347,8 @@ def step_reward(
         r_prog_path = (
             reward_cfg.progress_coef * (s_cur - s_prev) + reward_cfg.path_progress_ks * s_cur
         )
+        # JAX evaluates both branches: for K=0 prev_idx clamps to 0 so the path
+        # above is a degenerate self-loop, harmlessly discarded by this where.
         r_prog = jnp.where(target_idx > 0, r_prog_path, r_prog_center)
     else:
         r_prog = r_prog_center
