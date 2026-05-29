@@ -248,6 +248,45 @@ class SfcCorridorPlanner:
         b = np.array(self.corridors[seg_idx].b)
         return A, b
 
+    def evaluate_spatial(self, u: float) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+        """Evaluate spatial B-spline derivatives w.r.t parameter u.
+        
+        Args:
+            u: Path parameter [0, 1].
+            
+        Returns:
+            pos: (3,) Position
+            dpos: (3,) First derivative dr/du
+            ddpos: (3,) Second derivative d^2r/du^2
+            dddpos: (3,) Third derivative d^3r/du^3
+        """
+        if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
+            cp_last = np.asarray(self._control_points[-1], dtype=np.float64)
+            return cp_last, np.zeros(3), np.zeros(3), np.zeros(3)
+
+        u_clamped = float(np.clip(u, 0.0, 1.0))
+        
+        pos = np.asarray(self._des_pos_spline(u_clamped), dtype=np.float64)
+        dpos = np.asarray(self._des_pos_spline.derivative(nu=1)(u_clamped), dtype=np.float64)
+        ddpos = np.asarray(self._des_pos_spline.derivative(nu=2)(u_clamped), dtype=np.float64)
+        dddpos = np.asarray(self._des_pos_spline.derivative(nu=3)(u_clamped), dtype=np.float64)
+        
+        return pos, dpos, ddpos, dddpos
+
+    def evaluate_corridor_spatial(self, u: float) -> tuple[NDArray, NDArray] | None:
+        """Returns the (A, b) matrices for the flight corridor at parameter u."""
+        if not hasattr(self, "corridors") or self.corridors is None or len(self.corridors) == 0:
+            return None
+
+        u_clamped = float(np.clip(u, 0.0, 1.0))
+        n_segments = len(self.corridors)
+        seg_idx = int(np.floor(u_clamped * n_segments))
+        seg_idx = min(seg_idx, n_segments - 1)
+        
+        A = np.array(self.corridors[seg_idx].A)
+        b = np.array(self.corridors[seg_idx].b)
+        return A, b
+
     def _find_closest_t(self, pos: NDArray) -> float:
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
             return 0.0

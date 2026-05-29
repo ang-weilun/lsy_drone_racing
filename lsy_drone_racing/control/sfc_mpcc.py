@@ -18,7 +18,9 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 import casadi as cs
 
+from crazyflow.sim.visualize import draw_capsule, draw_line, draw_points
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.sfc_planner_mpc import SfcCorridorPlanner
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -216,27 +218,8 @@ class AttitudeMPC(Controller):
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
 
-        waypoints = np.array(
-            [
-                [-1.5, 0.75, 0.05],
-                [-1.0, 0.55, 0.4],
-                [0.3, 0.35, 0.7],
-                [1.3, -0.15, 0.9],
-                [0.85, 0.85, 1.2],
-                [-0.5, -0.05, 0.7],
-                [-1.2, -0.2, 0.8],
-                [-1.2, -0.2, 1.2],
-                [-0.0, -0.7, 1.2],
-                [0.5, -0.75, 1.2],
-            ]
-        )
-        
-        diffs = np.diff(waypoints, axis=0)
-        chords = np.linalg.norm(diffs, axis=1)
-        s = np.concatenate(([0], np.cumsum(chords)))
-        
-        self._des_pos_spline = CubicSpline(s, waypoints)
-        self._s_total = s[-1]
+        self.planner = SfcCorridorPlanner(obs, config.env.freq)
+        self._update_spline()
 
         obstacles_config = config.env.track.get("obstacles", [])
         self._obstacles = np.zeros((4, 3))
@@ -259,7 +242,21 @@ class AttitudeMPC(Controller):
         self._config = config
         self._finished = False
 
+    def _update_spline(self):
+        u_samples = np.linspace(0, 1, 100)
+        pts = self.planner._des_pos_spline(u_samples)
+        
+        diffs = np.diff(pts, axis=0)
+        chords = np.linalg.norm(diffs, axis=1)
+        s = np.concatenate(([0], np.cumsum(chords)))
+        
+        self._des_pos_spline = CubicSpline(s, pts)
+        self._s_total = float(s[-1])
+
     def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
+        if self.planner.update(obs):
+            self._update_spline()
+
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
 
@@ -324,3 +321,60 @@ class AttitudeMPC(Controller):
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        self.planner.episode_reset()
+
+    def render_callback(self, sim: object) -> None:
+        if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
+            safety_margin = getattr(self.planner, "safety_margin", 0.0)
+            for cap in self.planner.capsules:
+                rgba = (
+                    np.array([1.0, 0.0, 0.0, 0.3])
+                    if cap.is_gate
+                    else np.array([0.5, 0.5, 0.5, 0.5])
+                )
+                draw_capsule(
+                    sim, cap.p1, cap.p2, radius=max(0.01, cap.radius - safety_margin), rgba=rgba
+                )
+
+        if hasattr(self.planner, "skeleton_path") and self.planner.skeleton_path is not None:
+            skeleton_pts = np.array([pt.pos for pt in self.planner.skeleton_path])
+            if len(skeleton_pts) > 1:
+                draw_line(
+                    sim,
+                    skeleton_pts,
+                    rgba=np.array([0.0, 1.0, 1.0, 0.5]),
+                    start_size=0.005,
+                    end_size=0.005,
+                )
+                draw_points(sim, skeleton_pts, rgba=np.array([0.0, 1.0, 1.0, 0.8]), size=0.01)
+
+        if hasattr(self.planner, "control_points") and self.planner.control_points is not None:
+            if len(self.planner.control_points) > 0:
+                draw_points(
+                    sim, self.planner.control_points, rgba=np.array([1.0, 0.0, 1.0, 0.8]), size=0.02
+                )
+                draw_line(
+                    sim,
+                    self.planner.control_points,
+                    rgba=np.array([1.0, 0.0, 1.0, 0.3]),
+                    start_size=0.002,
+                    end_size=0.002,
+                )
+
+        predicted_horizon = []
+        for j in range(self._N + 1):
+            theta_j = self._current_theta + j * self._dt * self._current_v_theta
+            theta_j = np.clip(theta_j, 0, self._s_total)
+            predicted_horizon.append(self._des_pos_spline(theta_j))
+        
+        if len(predicted_horizon) > 1:
+            draw_line(
+                sim,
+                np.array(predicted_horizon),
+                rgba=np.array([0.0, 1.0, 0.0, 0.9]),
+                start_size=0.008,
+                end_size=0.008,
+            )
+
+        if self.planner.gates_pos is not None and len(self.planner.gates_pos) > 0:
+            draw_points(sim, self.planner.gates_pos, rgba=np.array([0.0, 0.0, 1.0, 0.8]), size=0.04)
