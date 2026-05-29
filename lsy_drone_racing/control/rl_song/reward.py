@@ -319,10 +319,44 @@ def step_reward(
     # geometric direction (e.g., drone overshot past the gate plane)
     # without a successful pass, and r_wrong_side below penalizes that.
     x_local_target = jnp.einsum("nj,nj->n", pos - gate_pos, target_gate_xaxis_world)
-    # Unified redesign: keep the direction-blind Song/Kaufmann distance
-    # delta and remove the lookahead branch from the active reward.
-    r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-    r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
+    # Centre-distance progress (pure-Song baseline; also the K=0 path).
+    r_prog_center = reward_cfg.progress_coef * (
+        jnp.linalg.norm(gate_pos - prev_pos, axis=-1) - jnp.linalg.norm(gate_pos - pos, axis=-1)
+    )
+    if reward_cfg.use_path_progress:
+        # Guiding-path arc-length progress (Path A / RANK 1). The leading
+        # center_{K-1} -> exit_{K-1} segment makes a backward step right after
+        # the plane decrease arc length (reverse-out penalised); the Bézier
+        # corner removes the lateral-clip reward. K=0 has no previous gate, so
+        # fall back to centre-distance there. See
+        # docs/research/2026-05-29-reward-myopia-redesign.
+        prev_idx = jnp.maximum(target_idx - 1, 0)
+        prev_gate_pos = gates_pos[env_idx, prev_idx]
+        prev_gate_normal = _quat_to_matrix(gates_quat[env_idx, prev_idx])[..., :, 0]
+        nodes = _guiding_path_nodes(
+            prev_gate_pos,
+            prev_gate_normal,
+            gate_pos,
+            target_gate_xaxis_world,
+            reward_cfg.path_exit_offset_m,
+            reward_cfg.path_entry_offset_m,
+        )
+        s_cur = _path_arclength(nodes, pos)
+        s_prev = _path_arclength(nodes, prev_pos)
+        r_prog_path = (
+            reward_cfg.progress_coef * (s_cur - s_prev) + reward_cfg.path_progress_ks * s_cur
+        )
+        r_prog = jnp.where(target_idx > 0, r_prog_path, r_prog_center)
+    else:
+        r_prog = r_prog_center
+    # Liu zero-on-pass: the guiding path is redefined at the gate hand-off
+    # (target_idx = prev_target on the pass step), so the one-step delta is
+    # meaningless; drop it. Crash-step zeroing happens later (~line 542).
+    r_prog = jnp.where(
+        jnp.asarray(reward_cfg.zero_progress_on_pass, dtype=bool) & gate_just_passed,
+        jnp.zeros_like(r_prog),
+        r_prog,
+    )
 
     # v120: direct wrong-side penalty (see RewardConfig.wrong_side_coef
     # for design rationale). Punishes positive x_local_target — drone
