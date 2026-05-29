@@ -36,6 +36,14 @@ GUIDANCE_DENOM_EPS: float = 1e-8
 # edges; gate corners are well-separated so this only fires on numerical noise).
 SEGMENT_AB_SQ_EPS: float = 1e-12
 
+# Quadratic-Bézier sample count for the guiding-path corner. Static (sets JAX
+# array shapes); not a runtime config field.
+_PATH_SMOOTH_SAMPLES: int = 16
+_BEZIER_T: Array = jnp.linspace(0.0, 1.0, _PATH_SMOOTH_SAMPLES)
+_BEZIER_W0: Array = jnp.square(1.0 - _BEZIER_T)  # exit_prev weight
+_BEZIER_W1: Array = 2.0 * (1.0 - _BEZIER_T) * _BEZIER_T  # entry_tgt (control) weight
+_BEZIER_W2: Array = jnp.square(_BEZIER_T)  # center_tgt weight
+
 # Gate opening corners in gate-local coords (x_through = 0, ±h_y, ±h_z).
 # Same ordering as ``obs._GATE_CORNERS_LOCAL`` so downstream edge pairs
 # stay consistent. Corner indices:
@@ -140,6 +148,78 @@ def _gate_phi(pos: Array, gate_pos: Array, gate_quat: Array, reward_cfg: RewardC
     aperture = jnp.exp(-yz_sq / (2.0 * spread))
     traversal = jax.nn.sigmoid(-x / reward_cfg.guide_kx)
     return aperture * traversal
+
+
+def _guiding_path_nodes(
+    prev_gate_pos: Array,
+    prev_gate_normal: Array,
+    gate_pos: Array,
+    gate_normal: Array,
+    exit_offset: float,
+    entry_offset: float,
+) -> Array:
+    """Build the per-transition guiding-path nodes for each env.
+
+    Path = ``[center_{K-1}] ++ Bézier(exit_{K-1}, entry_K, center_K)`` with a
+    quadratic Bézier rounding the corner (control point = entry waypoint).
+
+    Parameters
+    ----------
+    prev_gate_pos, prev_gate_normal : Array, shape (n_envs, 3)
+        Just-passed gate centre and through-normal (gate-local +x in world).
+    gate_pos, gate_normal : Array, shape (n_envs, 3)
+        Target gate centre and through-normal.
+    exit_offset, entry_offset : float
+        Waypoint offsets (m) along the respective normals.
+
+    Returns:
+    -------
+    Array, shape (n_envs, _PATH_SMOOTH_SAMPLES + 1, 3)
+        Guiding-path node positions in world frame.
+    """
+    exit_prev = prev_gate_pos + exit_offset * prev_gate_normal  # (n,3)
+    entry_tgt = gate_pos - entry_offset * gate_normal  # (n,3)
+    corner = (
+        _BEZIER_W0[None, :, None] * exit_prev[:, None, :]
+        + _BEZIER_W1[None, :, None] * entry_tgt[:, None, :]
+        + _BEZIER_W2[None, :, None] * gate_pos[:, None, :]
+    )  # (n, M, 3)
+    return jnp.concatenate([prev_gate_pos[:, None, :], corner], axis=1)  # (n, M+1, 3)
+
+
+def _path_arclength(nodes: Array, pos: Array) -> Array:
+    """Arc length of the projection of ``pos`` onto the node polyline.
+
+    Vectorised point-to-segment projection over all segments; selects the
+    minimum-distance segment and accumulates path length to the closest point.
+
+    Parameters
+    ----------
+    nodes : Array, shape (n_envs, n_nodes, 3)
+    pos : Array, shape (n_envs, 3)
+
+    Returns:
+    -------
+    Array, shape (n_envs,)
+        Arc length ``s(pos)`` along the polyline.
+    """
+    a = nodes[:, :-1, :]  # (n, S, 3)
+    b = nodes[:, 1:, :]
+    ab = b - a
+    seg_len = jnp.linalg.norm(ab, axis=-1)  # (n, S)
+    ab_sq = jnp.maximum(jnp.sum(ab * ab, axis=-1), SEGMENT_AB_SQ_EPS)  # (n, S)
+    ap = pos[:, None, :] - a  # (n, S, 3)
+    t = jnp.clip(jnp.sum(ap * ab, axis=-1) / ab_sq, 0.0, 1.0)  # (n, S)
+    closest = a + t[..., None] * ab
+    dist = jnp.linalg.norm(pos[:, None, :] - closest, axis=-1)  # (n, S)
+    # Cumulative length to the START of each segment: [0, L0, L0+L1, ...].
+    cum_end = jnp.cumsum(seg_len, axis=-1)
+    cum_start = jnp.concatenate(
+        [jnp.zeros((seg_len.shape[0], 1), seg_len.dtype), cum_end[:, :-1]], axis=-1
+    )
+    s_per_seg = cum_start + t * seg_len  # (n, S)
+    best = jnp.argmin(dist, axis=-1)  # (n,)
+    return jnp.take_along_axis(s_per_seg, best[:, None], axis=-1)[:, 0]  # (n,)
 
 
 def step_reward(
