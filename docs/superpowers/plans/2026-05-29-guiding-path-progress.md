@@ -4,7 +4,9 @@
 
 **Goal:** Replace direction-blind centre-distance progress with **Penička-style arc-length progress along a short, per-transition guiding path** (`center_{K−1} → exit_{K−1} → entry_K → center_K`, Bézier-smoothed corner) so that after a plane crossing the rewarded direction is *forward out of the just-passed frame*, structurally removing the reverse-out and lateral-clip local optima on randomised L3 tracks.
 
-**Architecture:** This is **Path A** — report 2's **RANK 1** (Penička guiding-path) as Stage 1, **RANK 2** (soft gate-frame barrier) as Stage 2 — chosen over the cheap local "augment" hybrid because (i) the reverse-out is only *structurally* fixed by guiding-path progress, (ii) the simple "entry-waypoint" variant was numerically verified inert, and (iii) the newest, most scale-matched literature (Penička 2022; Liu 2024; Pasumarti 2025 on Crazyflie 2.1) ranks guiding-path progress first. Single-lever discipline: only `r_prog`'s geometry changes in Stage 1; the gate-frame barrier (`r_gate_frame`, already in `reward.py`) is a separate Stage-2 cycle.
+**Architecture:** This is **Path A** — report 2's **RANK 1** (Penička guiding-path) + **RANK 2** (soft gate-frame barrier). Chosen over the cheap local "augment" hybrid because (i) the simple "entry-waypoint" variant was numerically verified inert, and (ii) the newest, most scale-matched literature (Penička 2022; Liu 2024; Pasumarti 2025 on Crazyflie 2.1) ranks guiding-path progress first.
+
+**RANK 1 and RANK 2 ship together in the first experiment** (not staged), because arc-length progress `r = progress_coef·Δs` is **telescoping** — `Σ_t r_t = progress_coef·(s_end − s_start)`, i.e. *route-independent*. Geometry-solo therefore only penalizes the *immediate* reverse step (the leading-segment sign); it provably **cannot** prevent the bank-around-vs-reverse-back-through-frame choice on its own (both routes reach gate K at the same arc length). The gate-frame barrier (`r_gate_frame`, already in `reward.py`, windows the just-passed frame) is the term that clears the frame. Report 2 also endorses adding RANK 1+2 concurrently. We relax single-lever purity deliberately and with eyes open: each term's role is known a priori (geometry → myopic/immediate-reverse gradient; barrier → frame clearance), and the expanded diagnostic (Task 5) demonstrates the telescoping result before any GPU. See `docs/superpowers/reviews/2026-05-29-guiding-path-plan-codex-review.md`.
 
 **Tech stack:** JAX (`jax.numpy`, vmap-clean vectorised projection — no Python loops in the hot path), SBX PPO, `fire` CLI, scipy for the diagnostic's gate quaternions. No new dependencies.
 
@@ -33,7 +35,9 @@ path nodes = [ center_P ,  Bézier_samples(exit_P, entry_K (control), center_K) 
 - **Liu zero-on-pass:** `r_prog = where(zero_progress_on_pass & gate_just_passed, 0, r_prog)` — the path redefinition at the gate hand-off makes the one-step delta meaningless.
 - **Sample count `M`** is a module-level constant (`_PATH_SMOOTH_SAMPLES = 16`), not a config float — it sets JAX array shapes and must be static.
 
-**Residual caveat (documented, not implemented in v1):** on the *return leg* of a near-collinear U-turn the smoothed path can self-overlap, where closest-point projection is ambiguous. The leading segment handles the critical just-passed region without it. If Stage-1 renders show return-leg progress glitches, the fix is a **stateful monotonic segment index** (per-env "furthest segment reached", threaded through the env wrapper) — a follow-on, not v1.
+**Telescoping caveat (Codex finding #1, the load-bearing reason RANK 2 ships with RANK 1):** with `path_progress_ks = 0`, `Σ_t r_prog = progress_coef·(s_end − s_start)` — route-independent. So arc-length progress *cannot* distinguish "bank around the just-passed frame" from "reverse back through it" once the drone is past `exit_P`; both reach gate K at the same arc length. On a near-collinear 180° the Bézier even folds back *through* the just-passed aperture, so the back-through-frame route is locally rewarded as forward progress. The leading `center_{K-1}→exit_{K-1}` segment still penalizes the *immediate* reverse (validated), and on realistically-offset ~180° the path bows out laterally and routes around the frame — but the **frame is cleared by `r_gate_frame`, not by the progress term**. Hence RANK 2 is in the first experiment.
+
+**Projection-ambiguity caveat (documented, not v1):** on the return leg of a near-collinear U-turn the folded path can self-overlap, where closest-point projection is ambiguous. The leading segment handles the critical just-passed region without it. If renders show return-leg progress glitches, the fix is a **stateful monotonic segment index** (per-env "furthest segment reached", threaded through the env wrapper) — a follow-on, gated on the diagnostic, not v1.
 
 **Training:** actor-only warm-start + **critic reset** + **Phase-2 replay cleared** (`phase2_prob=0.0`) — the old critic/replay encode the old reward geometry.
 
@@ -44,8 +48,8 @@ path nodes = [ center_P ,  Bézier_samples(exit_P, entry_K (control), center_K) 
 | File | Change | Responsibility |
 |---|---|---|
 | `lsy_drone_racing/control/rl_song/config.py` | Modify `RewardConfig` (+5 fields) | `use_path_progress`, `path_exit_offset_m`, `path_entry_offset_m`, `path_progress_ks`, `zero_progress_on_pass`. |
-| `lsy_drone_racing/control/rl_song/reward.py` | Add `_guiding_path_nodes` + `_path_arclength` helpers; rewrite `r_prog` block (~242–245) | Guiding-path arc-length progress + K=0 fallback + zero-on-pass. |
-| `lsy_drone_racing/control/rl_sbx/train.py` | Modify (kwargs + `RewardConfig(...)` + warm-start gate) | Thread the 5 reward knobs + `init_actor_only` through `fire` CLI. |
+| `lsy_drone_racing/control/rl_song/reward.py` | Add `_guiding_path_nodes` + `_path_arclength` helpers; rewrite `r_prog` block (~242–245); sum `r_gate_frame` (~578) | Guiding-path arc-length progress + K=0 fallback + zero-on-pass (RANK 1) and the gated gate-frame barrier in the scalar (RANK 2). |
+| `lsy_drone_racing/control/rl_sbx/train.py` | Modify (kwargs + `RewardConfig(...)` + warm-start gate) | Thread the 5 path knobs + `use_gate_frame_barrier` + `init_actor_only` through `fire` CLI. |
 | `scripts/diag_path_progress_reward.py` | Create | Scripted-trajectory diagnostic calling the real `step_reward` (the pre-PPO gate). |
 
 ---
@@ -292,31 +296,95 @@ git commit -m "rl_song/reward: guiding-path arc-length progress in r_prog (Path 
 
 ---
 
+## Task 3b: Activate the gate-frame barrier in the summed scalar (RANK 2)
+
+**Files:**
+- Modify: `lsy_drone_racing/control/rl_song/reward.py:578` (the `reward = ...` sum)
+
+Bundles RANK 2 with RANK 1 (see Architecture — the telescoping property makes the
+barrier necessary to clear the frame). `r_gate_frame` is already computed and is
+gated by `use_gate_frame_barrier` (`jnp.where(...)` → 0 when disabled), so adding it
+to the sum is backward-compatible: with `use_gate_frame_barrier=False` the scalar is
+unchanged from the pure-Song baseline.
+
+- [ ] **Step 1: Add `r_gate_frame` to the summed reward**
+
+Replace (line ~578):
+```python
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time
+```
+with:
+```python
+    # r_gate_frame is gated by use_gate_frame_barrier (-> 0 when disabled), so this
+    # is identical to the pure-Song baseline unless the barrier is turned on. Bundled
+    # with guiding-path progress because arc-length progress is telescoping and cannot
+    # clear the just-passed frame on its own — see the plan Architecture / Codex review.
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame
+```
+
+- [ ] **Step 2: Update the `step_reward` docstring** (~line 202–208) so the "terms
+  summed into `reward`" list includes `r_gate_frame` (it currently lists it as
+  diagnostic-only). Change the sentence listing summed terms to add `r_gate_frame`,
+  and remove it from the "NOT summed" list.
+
+- [ ] **Step 3: Confirm baseline equivalence (barrier off ⇒ unchanged)**
+
+Run:
+```bash
+cd /home/exedev/lsy_drone_racing && python - <<'PY'
+import jax.numpy as jnp
+from lsy_drone_racing.control.rl_song.reward import step_reward
+from lsy_drone_racing.control.rl_song.config import RewardConfig
+n=1
+def obs(p,t): return {"pos":jnp.asarray([p],jnp.float32),"vel":jnp.zeros((n,3),jnp.float32),
+  "quat":jnp.asarray([[0,0,0,1]],jnp.float32),"ang_vel":jnp.zeros((n,3),jnp.float32),
+  "target_gate":jnp.asarray([t],jnp.int32),"gates_pos":jnp.asarray([[[0,0,1.],[0,2,1.]]],jnp.float32),
+  "gates_quat":jnp.asarray([[[0,0,0,1],[0,0,0,1]]],jnp.float32),"obstacles_pos":jnp.asarray([[[9,9,9.]]],jnp.float32)}
+prev,cur=obs([-1.,0,1.],0),obs([-.5,0,1.],0)
+f=dict(terminated=jnp.zeros(n,bool),truncated=jnp.zeros(n,bool),finished=jnp.zeros(n,bool),gate_just_passed=jnp.zeros(n,bool))
+r,_=step_reward(cur,prev,**f,reward_cfg=RewardConfig(),true_gates_pos=cur["gates_pos"],true_gates_quat=cur["gates_quat"])
+print("baseline total reward:",float(r[0]))  # barrier off -> r_gate_frame=0; unchanged
+PY
+```
+Expected: a finite scalar with `use_gate_frame_barrier=False` (default) — the barrier contributes 0.
+
+- [ ] **Step 4: Lint + commit**
+
+```bash
+ruff format lsy_drone_racing/control/rl_song/reward.py && ruff check lsy_drone_racing/control/rl_song/reward.py
+git add lsy_drone_racing/control/rl_song/reward.py
+git commit -m "rl_song/reward: sum r_gate_frame (gated) to activate RANK 2 barrier"
+```
+
+---
+
 ## Task 4: Thread knobs + actor-only warm-start through `train.py`
 
 **Files:**
 - Modify: `lsy_drone_racing/control/rl_sbx/train.py` (signature ~131–157; `RewardConfig(...)` ~242; warm-start ~420–423)
 
-- [ ] **Step 1: Add kwargs to `train(...)`** — after `dipole_sigma: float = 0.5,` (line 144):
+- [ ] **Step 1: Add kwargs to `train(...)`** — after `dipole_sigma: float = 0.5,` (line 144). (`gate_frame_weight` is already a kwarg at line 135; only `use_gate_frame_barrier` is missing.)
 ```python
     use_path_progress: bool = False,
     path_exit_offset_m: float = 0.4,
     path_entry_offset_m: float = 0.4,
     path_progress_ks: float = 0.0,
     zero_progress_on_pass: bool = False,
+    use_gate_frame_barrier: bool = False,
 ```
 and after `init_from: str | None = None,` (line 155):
 ```python
     init_actor_only: bool = False,
 ```
 
-- [ ] **Step 2: Pass into `RewardConfig(...)`** — after `dipole_sigma=dipole_sigma,` (line 256):
+- [ ] **Step 2: Pass into `RewardConfig(...)`** — after `dipole_sigma=dipole_sigma,` (line 256). (`gate_frame_weight=gate_frame_weight` is already passed at line 247.)
 ```python
         use_path_progress=use_path_progress,
         path_exit_offset_m=path_exit_offset_m,
         path_entry_offset_m=path_entry_offset_m,
         path_progress_ks=path_progress_ks,
         zero_progress_on_pass=zero_progress_on_pass,
+        use_gate_frame_barrier=use_gate_frame_barrier,
 ```
 
 - [ ] **Step 3: Gate the critic load** — replace lines 420–423:
@@ -330,22 +398,27 @@ with:
 ```python
         model.policy.actor_state = model.policy.actor_state.replace(params=loaded["actor_params"])
         env.set_actor_normalizer(loaded["actor_normalizer"])
+        # The critic normalizer is observation-distribution state (Welford stats
+        # over the critic obs; see checkpoint.py), NOT reward geometry, so always
+        # load it — a cold normalizer would feed the fresh critic unnormalized
+        # inputs (Codex review #2).
+        env.set_critic_normalizer(loaded["critic_normalizer"])
         if init_actor_only:
-            # Reward geometry changed (guiding-path progress): the old critic and
-            # its normalizer encode value estimates for the old reward, so leave
-            # both freshly initialized and let them relearn. See Codex warm-start
-            # note in docs/research/2026-05-29-reward-myopia-redesign.
-            print("actor-only warm-start: critic + critic-normalizer left fresh", flush=True)
+            # Reward geometry changed (guiding-path progress): only the critic
+            # PARAMS encode value estimates for the old reward, so leave them
+            # freshly initialized and let the critic relearn. The actor and the
+            # critic-obs normalizer (loaded above) are kept. See
+            # docs/superpowers/reviews/2026-05-29-guiding-path-plan-codex-review.md.
+            print("actor-only warm-start: critic params reset, normalizers kept", flush=True)
         else:
             model.policy.vf_state = model.policy.vf_state.replace(
                 params=loaded["critic_params"]
             )
-            env.set_critic_normalizer(loaded["critic_normalizer"])
 ```
 
 - [ ] **Step 4: Verify CLI surface**
 
-Run: `cd /home/exedev/lsy_drone_racing && python -c "import inspect; from lsy_drone_racing.control.rl_sbx.train import train; p=inspect.signature(train).parameters; print(all(k in p for k in ['use_path_progress','path_exit_offset_m','path_entry_offset_m','path_progress_ks','zero_progress_on_pass','init_actor_only']))"`
+Run: `cd /home/exedev/lsy_drone_racing && python -c "import inspect; from lsy_drone_racing.control.rl_sbx.train import train; p=inspect.signature(train).parameters; print(all(k in p for k in ['use_path_progress','path_exit_offset_m','path_entry_offset_m','path_progress_ks','zero_progress_on_pass','use_gate_frame_barrier','init_actor_only']))"`
 Expected: `True`
 
 - [ ] **Step 5: Lint + commit**
@@ -353,7 +426,7 @@ Expected: `True`
 ```bash
 ruff format lsy_drone_racing/control/rl_sbx/train.py && ruff check lsy_drone_racing/control/rl_sbx/train.py
 git add lsy_drone_racing/control/rl_sbx/train.py
-git commit -m "rl_sbx/train: guiding-path CLI knobs + --init-actor-only"
+git commit -m "rl_sbx/train: guiding-path + gate-frame CLI knobs, --init-actor-only"
 ```
 
 ---
@@ -375,6 +448,11 @@ Run BEFORE any PPO. Pass criteria encode the validated sign behaviour:
   reverse-out reverse step  : baseline > 0 (rewards reversing); guiding < 0
   side-clip lateral step    : baseline > 0 (rewards clipping);  guiding ~ 0
   forward-to-exit / approach : guiding > 0
+
+Multi-step checks (Codex review #1, #3): a telescoping demonstration (integrated
+r_prog is route-independent for shared start/end -> the progress term alone cannot
+clear the just-passed frame, which is why the gate-frame barrier ships with it) and
+the real gate-pass handoff (r_prog must be zeroed when gate_just_passed=True).
 """
 
 from __future__ import annotations
@@ -426,6 +504,33 @@ def r_prog(prev_pos, cur_pos, target, gates_pos, gates_quat, cfg):
     return float(comp["r_prog"][0])
 
 
+def integrated_rprog(positions, target, gates_pos, gates_quat, cfg):
+    """Sum r_prog over consecutive positions along a scripted trajectory."""
+    return sum(
+        r_prog(positions[i], positions[i + 1], target, gates_pos, gates_quat, cfg)
+        for i in range(len(positions) - 1)
+    )
+
+
+def r_prog_passstep(prev_pos, cur_pos, prev_target, cur_target, gates_pos, gates_quat, cfg):
+    """r_prog on the real gate-pass handoff step (gate_just_passed=True)."""
+    n = 1
+    cur = obs(cur_pos, cur_target, gates_pos, gates_quat)
+    prev = obs(prev_pos, prev_target, gates_pos, gates_quat)
+    _, comp = step_reward(
+        cur,
+        prev,
+        terminated=jnp.zeros(n, bool),
+        truncated=jnp.zeros(n, bool),
+        finished=jnp.zeros(n, bool),
+        gate_just_passed=jnp.ones(n, bool),
+        reward_cfg=cfg,
+        true_gates_pos=cur["gates_pos"],
+        true_gates_quat=cur["gates_quat"],
+    )
+    return float(comp["r_prog"][0])
+
+
 def main() -> None:
     base = RewardConfig()
     fix = RewardConfig(use_path_progress=True, path_exit_offset_m=0.4, path_entry_offset_m=0.4)
@@ -460,6 +565,41 @@ def main() -> None:
     # K=0 (centre-distance fallback): spawn approach to gate0.
     row("K=0: approach gate0 (+x)", [-1.0, 0, Z], [-0.7, 0, Z], 0, gp_rev, gq_rev, "pos")
 
+    # --- Multi-step checks (Codex review #1, #3) ---
+    fix_ks0 = RewardConfig(
+        use_path_progress=True,
+        path_exit_offset_m=0.4,
+        path_entry_offset_m=0.4,
+        path_progress_ks=0.0,
+        zero_progress_on_pass=True,
+    )
+    # Offset ~180deg: gate1 behind and to the +y side of gate0.
+    gp_u = [[0, 0, Z], [-1.5, 0.6, Z]]
+    gq_u = [yaw_quat(0.0), yaw_quat(np.pi)]
+    start = [0.3, 0.0, Z]
+    end = [-1.4, 0.6, Z]  # near gate1 centre
+    bank = [start, [0.45, 0.0, Z], [0.5, 0.6, Z], [-0.5, 1.0, Z], [-1.4, 0.8, Z], end]
+    rev = [start, [0.1, 0.1, Z], [-0.3, 0.2, Z], [-0.9, 0.4, Z], end]
+    s_bank = integrated_rprog(bank, 1, gp_u, gq_u, fix_ks0)
+    s_rev = integrated_rprog(rev, 1, gp_u, gq_u, fix_ks0)
+    print(
+        f"\n[telescoping] integrated r_prog  bank-around={s_bank:+.2f}  "
+        f"reverse-through-frame={s_rev:+.2f}  (k_s=0, shared start/end)"
+    )
+    print(
+        "  -> route-independent (telescoping): the progress term alone does NOT "
+        "clear the frame; r_gate_frame is required (this is WHY RANK 2 ships now)."
+    )
+
+    # Real pass-step handoff: r_prog must be 0 (zero-on-pass).
+    rp_pass = r_prog_passstep([0.0, 0, Z], [0.05, 0, Z], 0, 1, gp_u, gq_u, fix_ks0)
+    pass_ok = abs(rp_pass) <= 1e-6
+    print(
+        f"[pass-step] r_prog on gate_just_passed = {rp_pass:+.4f}  "
+        f"{'PASS (zeroed)' if pass_ok else 'FAIL (should be 0)'}"
+    )
+    ok = ok and pass_ok
+
     print("\nALL PASS" if ok else "\nSOME FAIL — inspect before PPO")
     raise SystemExit(0 if ok else 1)
 
@@ -485,7 +625,7 @@ git commit -m "scripts: scripted-trajectory diagnostic for guiding-path progress
 - [ ] **Step 1: Run it**
 
 Run: `cd /home/exedev/lsy_drone_racing && JAX_PLATFORMS=cpu python scripts/diag_path_progress_reward.py`
-Expected: every row `PASS`, `ALL PASS` (exit 0). In particular reverse-out reverse step `guiding < 0` while `baseline > 0`, and side-clip lateral step `guiding ≈ 0` while `baseline > 0`.
+Expected: every single-step row `PASS` and the pass-step `PASS (zeroed)`, `ALL PASS` (exit 0). In particular reverse-out reverse step `guiding < 0` while `baseline > 0`, and side-clip lateral step `guiding ≈ 0` while `baseline > 0`. The `[telescoping]` line should show bank-around ≈ reverse-through-frame (route-independence) — this is the expected confirmation that `r_gate_frame` is needed, not a failure.
 
 - [ ] **Step 2: If any row FAILs — diagnose before GPU**
 
@@ -505,19 +645,25 @@ Do NOT train. Check: sign of the gate normals (`_quat_to_matrix(...)[:, 0]`), th
 
 ```bash
 python -m lsy_drone_racing.control.rl_sbx.train \
-  --run-name pathprog04_actoronly_spd6 \
+  --run-name pathprog04_gf05_actoronly_spd6 \
   --init-from snapshots/sbx_spd6_a120_om005_tp20_200M \
   --init-actor-only True \
   --use-path-progress True \
   --path-exit-offset-m 0.4 \
   --path-entry-offset-m 0.4 \
   --zero-progress-on-pass True \
+  --use-gate-frame-barrier True \
+  --gate-frame-weight 0.5 \
   --alpha-max-rad 1.2 \
   --omega-coef 0.005 \
   --phase2-prob 0.0 \
   --total-timesteps 200000000
 ```
-Expected at startup: `warm-start from .../step_000201326592` and `actor-only warm-start: critic + critic-normalizer left fresh`. `reward/r_prog` finite from iteration 1.
+`gate-frame-weight 0.5` is a small starting value (`gate_frame_sigma=0.08 m` is a
+large fraction of the 0.20 m half-aperture — Codex scale note; historical runs used
+1.2). Expected at startup: `warm-start from .../step_000201326592` and `actor-only
+warm-start: critic params reset, normalizers kept`. Confirm `reward/r_prog` and
+`reward/r_gate_frame` are both finite and logged from iteration 1.
 
 - [ ] **Step 3: Sanity-watch ~20M steps.** Confirm no NaNs; `reward/r_prog` recovers after the critic-reset dip; episode length does not collapse to the hover/timeout attractor. If it collapses, stop — try a non-zero `path_progress_ks` (small), a warm critic at low LR, or revisit the offsets.
 
@@ -529,25 +675,34 @@ Expected at startup: `warm-start from .../step_000201326592` and `actor-only war
 
 **Files:** none.
 
-- [ ] **Step 1: Real-lap eval L2 (n=50):** `bash /root/eval_l2.sh pathprog04_actoronly_spd6 50`. Compare vs spd6 (3.47 s @ 96%). Geometry fix should hold/raise SR; small lap-time regression acceptable if SR holds.
-- [ ] **Step 2: Render the reverse-out / side-successor L3 seeds** (numpy controller, `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl`); confirm no reverse-out and no just-passed-frame clipping.
-- [ ] **Step 3: Keep/discard.** If reverse-out/clip reduced AND L2 SR held → keep: back up the checkpoint to `gdrive:DroneRacing/checkpoints/`, then start **Stage 2** (gate-frame barrier). Else → discard, log why, try the `path_progress_ks` / offset / monotonic-index levers.
+- [ ] **Step 1: Real-lap eval L2 (n=50):** `bash /root/eval_l2.sh pathprog04_gf05_actoronly_spd6 50`. Compare vs spd6 (3.47 s @ 96%). The combined fix should hold/raise SR; a small lap-time regression is acceptable if SR holds (the barrier trades a little speed for fewer frame contacts — Song 2021 documents this).
+- [ ] **Step 2: Render the reverse-out / side-successor L3 seeds** (numpy controller, `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl`); confirm no reverse-out (geometry: drone carries forward through the exit rather than reversing at the plane) and no just-passed-frame clipping (barrier).
+- [ ] **Step 3: Keep/discard.** If reverse-out/clip reduced AND L2 SR held → keep: back up the checkpoint to `gdrive:DroneRacing/checkpoints/`. Else → discard, log why, and turn the levers: raise `gate_frame_weight` if frame contact persists, raise `path_progress_ks` (small) or `path_*_offset_m` if the drone still reverses at the plane, or implement the monotonic segment index if renders show return-leg progress glitches.
 - [ ] **Step 4: Record** eval table + render notes + verdict in README §7; commit.
 
 ---
 
-## Stage 2 (separate cycle, after Stage 1 lands) — soft gate-frame barrier (RANK 2)
+## Follow-on levers (after the first experiment lands)
 
-`r_gate_frame` already exists (`reward.py:426`; windows `{target_idx−1, target_idx, target_idx+1}`, so the just-passed frame is priced). One cycle: add `+ r_gate_frame` to the summed scalar (`reward.py:578`); set `use_gate_frame_barrier=True` and a **small** `gate_frame_weight` (`gate_frame_sigma=0.08 m` is a large fraction of the 0.20 m half-aperture — Codex scale note); extend the diagnostic with a frame-grazing trajectory; verify; warm-start train; eval. This catches residual frame contact the progress geometry alone leaves.
-
-**Stateful monotonic segment index** (return-leg robustness) and **wrong-side rejection** (`r_wrong_side`) are further follow-on levers if Stage 1+2 leave residual reverse-out on near-collinear layouts.
+- **Attribution ablations** (if you need to separate the two bundled terms): a
+  geometry-only run (`use_gate_frame_barrier=False`) and a barrier-only run
+  (`use_path_progress=False`), each warm-started, to quantify each term's share. The
+  telescoping argument predicts geometry-only fixes the immediate reverse but leaves
+  frame clips; barrier-only reduces clips but keeps the myopic progress gradient.
+- **Stateful monotonic segment index** — return-leg projection robustness on
+  near-collinear U-turns; implement only if renders/diagnostic show return-leg glitches.
+- **Wrong-side rejection** (`r_wrong_side`, already in `reward.py`) — add to the sum if
+  residual overshoot remains after geometry + barrier.
+- **`gate_frame_weight` / offset sweep** — tune the barrier strength and exit/entry
+  offsets at Crazyflie scale (literature coefficients are for big quads).
 
 ---
 
 ## Self-review notes
 
-- **Spec coverage:** path construction + leading segment + Bézier (T2), arc-length + k_s + K=0 fallback + zero-on-pass (T1–T3), CLI + actor-only warm-start + replay-clear (T4, T7), pre-PPO diagnostic gate (T5–T6), measurement (T8), Stage-2 gate-frame (follow-on).
+- **Spec coverage:** path construction + leading segment + Bézier (T2), arc-length + k_s + K=0 fallback + zero-on-pass (T1–T3), gate-frame barrier summed (T3b), CLI + actor-only-warm-start (critic params only) + replay-clear (T4, T7), pre-PPO diagnostic gate incl. telescoping + pass-step (T5–T6), measurement (T8), ablations/monotonic-index/wrong-side (follow-on).
 - **No pytest:** intentional (`CLAUDE.md` overrides TDD); verification = diagnostic (T5–T6) + sim eval (T8).
-- **Type/name consistency:** `use_path_progress`, `path_exit_offset_m`, `path_entry_offset_m`, `path_progress_ks`, `zero_progress_on_pass`, `init_actor_only` identical across `RewardConfig`, `train(...)`, the `RewardConfig(...)` call, and CLI (`--use-path-progress`, `--path-exit-offset-m`, …; fire maps `_`↔`-`). Helpers `_guiding_path_nodes`/`_path_arclength` and constants `_PATH_SMOOTH_SAMPLES`/`_BEZIER_W{0,1,2}` referenced exactly as defined.
-- **Single-lever discipline:** Stage 1 changes only `r_prog`'s geometry; `r_gate_frame` is Stage 2.
-- **Numerically validated** before writing (sign-flip table in Design); diagnostic (T5) re-checks against the real `step_reward`.
+- **Type/name consistency:** `use_path_progress`, `path_exit_offset_m`, `path_entry_offset_m`, `path_progress_ks`, `zero_progress_on_pass`, `use_gate_frame_barrier`, `init_actor_only` identical across `RewardConfig`, `train(...)`, the `RewardConfig(...)` call, and CLI (fire maps `_`↔`-`). Helpers `_guiding_path_nodes`/`_path_arclength` and constants `_PATH_SMOOTH_SAMPLES`/`_BEZIER_W{0,1,2}` referenced exactly as defined.
+- **Codex review applied** (`docs/superpowers/reviews/2026-05-29-guiding-path-plan-codex-review.md`): (#1) bundle RANK 2 with RANK 1 because arc-length progress is telescoping → barrier needed to clear the frame; (#2) `init_actor_only` resets critic params only, keeps the critic-obs normalizer; (#3) diagnostic expanded with telescoping demo + real pass-step + reverse-through-frame.
+- **Single-lever relaxation (deliberate):** the first experiment changes `r_prog` geometry AND sums the gated `r_gate_frame`. Justified: each term's role is known a priori and the follow-on ablations can separate them; geometry-solo provably can't clear the frame (telescoping).
+- **Numerically validated** before writing (sign-flip table in Design); diagnostic (T5) re-checks against the real `step_reward`, incl. the telescoping property.
