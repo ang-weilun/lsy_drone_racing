@@ -353,6 +353,30 @@ class RewardConfig:
     # bonus +100 below) vs crash -15, restoring the v42 positive
     # gradient that produced 100% L0 gate-0 traversal.
     progress_coef: float = 10.0
+    # 2026-05-29 (geometric fix, Path A / RANK 1): Penička-style arc-length
+    # progress along a per-transition guiding path
+    #   [center_{K-1}, exit_{K-1}, entry_K, center_K]   (Bézier-smoothed corner)
+    # exit_{K-1} = center_{K-1} + path_exit_offset_m * normal_{K-1}  (forward of
+    # the just-passed gate); entry_K = center_K - path_entry_offset_m * normal_K
+    # (approach side of the target). Arc-length progress makes a backward step
+    # right after the plane DECREASE progress (reverse-out penalised) and a
+    # forward step increase it. False -> centre-distance (pure-Song) baseline.
+    # K=0 always uses centre-distance (no previous gate; spawn approach is
+    # pathology-free). See docs/research/2026-05-29-reward-myopia-redesign.
+    use_path_progress: bool = False
+    # Exit waypoint distance beyond the just-passed gate along its +normal (m).
+    # Crazyflie ~0.45 m gates -> 0.3-0.5 m; tuning knob (Penička scale caveat).
+    path_exit_offset_m: float = 0.4
+    # Entry waypoint distance before the target gate along its -normal (m).
+    path_entry_offset_m: float = 0.4
+    # Penička anti-singularity term k_s in r = k_p*(s_t - s_{t-1}) + k_s*s_t.
+    # 0.0 = pure arc-length delta (Bézier smoothing handles most corner
+    # singularities). Keep small: large k_s rewards loitering at high arc length.
+    path_progress_ks: float = 0.0
+    # 2026-05-29: zero r_prog on the gate-pass step (Liu 2024 ~wp_passing). The
+    # guiding path is redefined at the hand-off, so the one-step delta is
+    # meaningless there. Default False preserves current behaviour.
+    zero_progress_on_pass: bool = False
     # v20: switch r_prog from the legacy distance-delta formulation
     # (||g - p_prev|| - ||g - p||) to the Song-2023 / Kaufmann-2023
     # velocity-projection variant: project the world-frame displacement
