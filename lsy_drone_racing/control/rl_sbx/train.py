@@ -142,6 +142,12 @@ def train(
     wrong_side_target_min: int = 1,
     dipole_coef: float = 0.0,
     dipole_sigma: float = 0.5,
+    use_path_progress: bool = False,
+    path_exit_offset_m: float = 0.4,
+    path_entry_offset_m: float = 0.4,
+    path_progress_ks: float = 0.0,
+    zero_progress_on_pass: bool = False,
+    use_gate_frame_barrier: bool = False,
     omega_coef: float = 0.01,
     ortho_init: bool = True,
     log_std_init: float = -0.5,
@@ -153,6 +159,7 @@ def train(
     checkpoint_root: str = "lsy_drone_racing/control/rl_sbx/checkpoints",
     save_freq_steps: int = 20_000_000,
     init_from: str | None = None,
+    init_actor_only: bool = False,
     curriculum: str = "default",
     stage_idx: int = 0,
     wandb_project: str = WANDB_PROJECT,
@@ -254,6 +261,12 @@ def train(
         wrong_side_target_min=wrong_side_target_min,
         dipole_coef=dipole_coef,
         dipole_sigma=dipole_sigma,
+        use_path_progress=use_path_progress,
+        path_exit_offset_m=path_exit_offset_m,
+        path_entry_offset_m=path_entry_offset_m,
+        path_progress_ks=path_progress_ks,
+        zero_progress_on_pass=zero_progress_on_pass,
+        use_gate_frame_barrier=use_gate_frame_barrier,
         omega_coef=omega_coef,
     )
 
@@ -418,9 +431,21 @@ def train(
         # Replace the TrainState params (preserves optimizer state with the
         # new shapes intact). Apply_fn / opt_state remain from model setup.
         model.policy.actor_state = model.policy.actor_state.replace(params=loaded["actor_params"])
-        model.policy.vf_state = model.policy.vf_state.replace(params=loaded["critic_params"])
         env.set_actor_normalizer(loaded["actor_normalizer"])
+        # The critic normalizer is observation-distribution state (Welford stats
+        # over the critic obs; see checkpoint.py), NOT reward geometry, so always
+        # load it — a cold normalizer would feed the fresh critic unnormalized
+        # inputs (Codex review #2).
         env.set_critic_normalizer(loaded["critic_normalizer"])
+        if init_actor_only:
+            # Reward geometry changed (guiding-path progress): only the critic
+            # PARAMS encode value estimates for the old reward, so leave them
+            # freshly initialized and let the critic relearn. The actor and the
+            # critic-obs normalizer (loaded above) are kept. See
+            # docs/superpowers/reviews/2026-05-29-guiding-path-plan-codex-review.md.
+            print("actor-only warm-start: critic params reset, normalizers kept", flush=True)
+        else:
+            model.policy.vf_state = model.policy.vf_state.replace(params=loaded["critic_params"])
 
     run_dir = Path(checkpoint_root) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
