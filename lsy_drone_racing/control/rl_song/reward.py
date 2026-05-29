@@ -280,12 +280,13 @@ def step_reward(
         Total replacement reward.
     components : dict[str, Array]
         Per-component rewards. Terms summed into ``reward`` are ``r_prog``,
-        ``r_omega``, ``r_smooth``, ``r_crash``, ``r_finish``, and ``r_time``
-        (the last is identically 0 when ``time_penalty == 0``). All other
-        component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``,
-        ``r_gate_frame``, ``r_obs``, ``r_gate_bonus``, ``r_exit_vel``,
-        ``r_vel``, ``r_caution``, ``r_terminal``) are diagnostic only and NOT
-        summed — add them to the ``reward = ...`` line to activate.
+        ``r_omega``, ``r_smooth``, ``r_crash``, ``r_finish``, ``r_time``
+        (identically 0 when ``time_penalty == 0``), and ``r_gate_frame``
+        (identically 0 unless ``use_gate_frame_barrier`` is set). All other
+        component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``, ``r_obs``,
+        ``r_gate_bonus``, ``r_exit_vel``, ``r_vel``, ``r_caution``,
+        ``r_terminal``) are diagnostic only and NOT summed — add them to the
+        ``reward = ...`` line to activate.
 
     Notes:
     -----
@@ -682,12 +683,9 @@ def step_reward(
         "r_caution": r_caution,
         "r_dipole": r_dipole,
     }
-    # 2026-05-29: re-activate the per-step time penalty on top of the pure-Song
-    # baseline. ``r_time`` is the only shaping term added back to the summed
-    # scalar; when ``time_penalty == 0`` it is identically 0, so the pure-Song
-    # baseline is preserved exactly. All other shaping terms remain intentionally
-    # unsummed — see docs/research/2026-05-29-reward-myopia-redesign. (Verified
-    # 2026-05-29 that the earlier tp "chain" was a no-op because r_time was not
-    # summed; lap-time gains there were progress+gamma over continued training.)
-    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time
+    # r_gate_frame is gated by use_gate_frame_barrier (-> 0 when disabled), so this
+    # is identical to the pure-Song baseline unless the barrier is turned on. Bundled
+    # with guiding-path progress because arc-length progress is telescoping and cannot
+    # clear the just-passed frame on its own — see the plan Architecture / Codex review.
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame
     return reward, components
