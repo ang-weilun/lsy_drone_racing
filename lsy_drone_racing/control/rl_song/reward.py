@@ -354,7 +354,7 @@ def step_reward(
         r_prog = r_prog_center
     # Liu zero-on-pass: the guiding path is redefined at the gate hand-off
     # (target_idx = prev_target on the pass step), so the one-step delta is
-    # meaningless; drop it. Crash-step zeroing happens later (~line 542).
+    # meaningless; drop it. Crash-step zeroing is applied later via crash_mask.
     r_prog = jnp.where(
         jnp.asarray(reward_cfg.zero_progress_on_pass, dtype=bool) & gate_just_passed,
         jnp.zeros_like(r_prog),
