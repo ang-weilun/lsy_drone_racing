@@ -24,15 +24,11 @@ Architecture diff vs rl_song:
   :class:`tfd.MultivariateNormalDiag`. We call ``dist.sample`` /
   ``dist.log_prob`` here instead of rl_song's
   ``sample_and_log_prob(actor_params, ...)`` helper.
-* **pure-jax seg-init, no Phase 2, no per-source tracking** — milestone-2
-  re-enables the Song 2023 §III-B Phase-1 segment-init re-spawn inside
-  the scan body so the policy is exposed to mid-track states from step
-  zero. Without it, cold-trains on bare ``r_prog + r_omega + r_terminal``
-  collapse to the hover attractor (v112 trained without seg-init
-  produced sub-hover collective thrust; see ``project_v99_coldtrain_
-  stage3_fails`` memory). Phase 2 successful-state replay is deferred —
-  ``_apply_reset_perturbation`` is invoked with ``phase2_prob=0`` and a
-  dummy buffer so the Phase-2 branch is statically pruned.
+* **pure-jax Phase 1 + Phase 2 reset curriculum** — the scan body calls
+  rl_song's reset-perturbation adapter for Song 2023 §III-B Phase-1
+  segment-init and Phase-2 successful-state replay. Per-env episode
+  source codes are threaded across rollout boundaries so Phase-2 writes
+  can avoid replay-buffer self-feeding.
 * **no in-scan timeout bootstrap** — SBX's stock collector mutates
   ``rewards[idx] += gamma * V(s_terminal)`` per truncated env in
   Python. We skip that for milestone-1 (small bias on truncating
@@ -64,9 +60,17 @@ from lsy_drone_racing.control.rl_song.config import (
     TANGENT_ALPHA_MAX_RAD,
     RewardConfig,
 )
-from lsy_drone_racing.control.rl_song.policy import raw_to_env_action
+from lsy_drone_racing.control.rl_song.policy import raw_to_env_action, raw_to_physical_action
 from lsy_drone_racing.control.rl_song.reward import step_reward
-from lsy_drone_racing.control.rl_song.rollout import Phase2Buffer, _apply_reset_perturbation
+from lsy_drone_racing.control.rl_song.rollout import (
+    SRC_PHASE1_SEG,
+    SRC_PHASE2_REPLAY,
+    SRC_TRUE_START,
+    Phase2Buffer,
+    _apply_phase2_writes,
+    _apply_reset_perturbation,
+    _compute_phase2_event,
+)
 from lsy_drone_racing.control.rl_song.rollout import (
     RolloutStaticConfig as RLSongRolloutStaticConfig,
 )
@@ -134,6 +138,9 @@ class RLSBXRolloutStaticConfig(NamedTuple):
     segment_init_prob: float = 0.0
     segment_init_perturb_m: float = 0.10
     segment_init_vel_mps: float = 0.0
+    phase2_prob: float = 0.0
+    phase2_warmup_steps: int = 0
+    phase2_capacity_per_gate: int = 1
 
 
 class RLSBXRolloutOutputs(NamedTuple):
@@ -164,6 +171,25 @@ class RLSBXRolloutOutputs(NamedTuple):
     episode_starts: Array  # (n_steps, n_envs)  float32
     values: Array  # (n_steps, n_envs)
     log_probs: Array  # (n_steps, n_envs)
+    # v125+: diagnostic outputs. Not consumed by SB3's rollout buffer or
+    # GAE machinery — purely for wandb logging via the SB3 logger record
+    # path. Aggregated in JitScanPPO.collect_rollouts and pushed to
+    # ``reward/*`` and ``env/*`` namespaces in wandb.
+    target_gate: Array  # (n_steps, n_envs) int, current_target after the step
+    terminated: Array  # (n_steps, n_envs) bool
+    finished: Array  # (n_steps, n_envs) bool — race-complete signal
+    truncated: Array  # (n_steps, n_envs) bool
+    reward_components: dict[str, Array]  # name -> (n_steps, n_envs) per-term reward
+    p2_event_valid: Array  # (n_steps, n_envs) bool
+    p2_event_slot: Array  # (n_steps, n_envs) int32
+    p2_event_data: Array  # (n_steps, n_envs, phase2_state_dim)
+    # Per-step episode-source code (int8, see SRC_* constants in
+    # rl_song.rollout). Holds the source of the active episode AT this
+    # step; on done steps it is still the dying episode's source (the
+    # carry update to ``next_source`` happens after this output is built).
+    # Used by JitScanPPO.collect_rollouts to break finish_rate down by
+    # source so Phase-2-replay finishes don't mask true-start performance.
+    source: Array  # (n_steps, n_envs) int8
 
 
 class RLSBXScanResult(NamedTuple):
@@ -202,14 +228,17 @@ class RLSBXScanResult(NamedTuple):
     rng_key: Array
     next_done: Array
     last_values: Array
+    phase2_buffer: Phase2Buffer
+    source: Array
     outputs: RLSBXRolloutOutputs
 
 
 class _ScanCarry(NamedTuple):
-    """Mutable scan carry. Kept minimal — no per-source / phase2 state."""
+    """Mutable scan carry for rollout collection."""
 
     env_data: EnvData
     prev_action: Array  # env-action 4-vec, (n_envs, ENV_ACTION_DIM)
+    prev_physical_action: Array  # [tau_scaled, thrust], (n_envs, RAW_ACTION_DIM)
     rng_key: Array  # policy-sampling key
     # Independent PRNG stream for seg-init / drone-state perturbation.
     # Keeping it separate from the action key means a stage that
@@ -218,6 +247,8 @@ class _ScanCarry(NamedTuple):
     # and invalidate run-to-run comparability.
     reset_rng_key: Array
     next_done: Array  # bool, (n_envs,) — done at end of previous step
+    phase2_buffer: Phase2Buffer
+    source: Array  # int8, (n_envs,)
 
 
 def _build_flat_obs(
@@ -269,35 +300,6 @@ def _single_drone_obs(env_obs: dict[str, Array]) -> dict[str, Array]:
     return {key: value[:, SINGLE_DRONE_INDEX] for key, value in env_obs.items()}
 
 
-def _build_dummy_phase2_buffer(n_envs: int) -> Phase2Buffer:
-    """Return a minimal-capacity :class:`Phase2Buffer` with no entries.
-
-    ``_apply_reset_perturbation`` accepts the buffer unconditionally but only
-    reads it inside the ``static_cfg.phase2_prob > 0`` branch. We invoke that
-    function with ``phase2_prob=0`` so the buffer is never sampled or written;
-    a single-slot, single-capacity, zero-state-dim instance keeps the carry
-    cost negligible and the shape contract satisfied.
-
-    Parameters
-    ----------
-    n_envs : int
-        Vec width; unused by the dummy buffer fields but kept in the
-        signature so a future "promote to real buffer" diff is a
-        one-line swap at the call site.
-
-    Returns:
-    -------
-    Phase2Buffer
-        ``data`` shape ``(1, 1, 0)``, ``ptr``/``fill`` shape ``(1,)``.
-    """
-    del n_envs  # documented; see Notes above.
-    return Phase2Buffer(
-        data=jnp.zeros((1, 1, 0), dtype=jnp.float32),
-        ptr=jnp.zeros((1,), dtype=jnp.int32),
-        fill=jnp.zeros((1,), dtype=jnp.int32),
-    )
-
-
 def _to_rl_song_static_cfg(static_cfg: RLSBXRolloutStaticConfig) -> RLSongRolloutStaticConfig:
     """Build the rl_song :class:`RolloutStaticConfig` slice ``_apply_reset_perturbation`` reads.
 
@@ -308,9 +310,10 @@ def _to_rl_song_static_cfg(static_cfg: RLSBXRolloutStaticConfig) -> RLSongRollou
     reset path. We forward what overlaps and stub the rest with the
     rl_sbx values — the function never observes them.
 
-    Phase 2 is hard-disabled (``phase2_prob=0.0``) so the Phase 2 branch
-    is statically pruned; the dummy buffer passed alongside is never
-    sampled.
+    ``phase2_prob`` is the configured stage probability. The per-iteration
+    warmup gate is applied by masking the buffer's ``fill`` at runtime in
+    ``_seg_init_pure_jax``; this keeps the static config stable across the
+    warmup boundary.
     """
     return RLSongRolloutStaticConfig(
         n_steps=static_cfg.n_steps,
@@ -326,19 +329,24 @@ def _to_rl_song_static_cfg(static_cfg: RLSBXRolloutStaticConfig) -> RLSongRollou
         segment_init_prob=static_cfg.segment_init_prob,
         segment_init_perturb_m=static_cfg.segment_init_perturb_m,
         segment_init_vel_mps=static_cfg.segment_init_vel_mps,
-        phase2_prob=0.0,
-        phase2_capacity_per_gate=1,
+        phase2_prob=static_cfg.phase2_prob,
+        phase2_capacity_per_gate=static_cfg.phase2_capacity_per_gate,
     )
 
 
 def _seg_init_pure_jax(
-    env_data: EnvData, done_mask: Array, rng_key: Array, static_cfg: RLSBXRolloutStaticConfig
-) -> tuple[EnvData, Array]:
-    """Apply drone-state perturbation + Phase-1 seg-init to just-reset envs.
+    env_data: EnvData,
+    done_mask: Array,
+    rng_key: Array,
+    phase2_buffer: Phase2Buffer,
+    effective_phase2_prob: Array,
+    static_cfg: RLSBXRolloutStaticConfig,
+) -> tuple[EnvData, Array, Array, Array, Array]:
+    """Apply drone-state perturbation + reset curriculum to just-reset envs.
 
     Thin adapter around :func:`rl_song.rollout._apply_reset_perturbation`
-    that drops the Phase 2 outputs and the per-source masks (rl_sbx
-    does not carry per-source bookkeeping for milestone-2 scope).
+    that keeps all reset-source masks so the SBX scan can mirror rl_song's
+    source tracking and Phase-2 prev-action restoration.
 
     Parameters
     ----------
@@ -350,30 +358,40 @@ def _seg_init_pure_jax(
     rng_key : Array, shape (2,)
         PRNG key for the perturbation + seg-init draws; consumed and
         returned advanced.
+    phase2_buffer : Phase2Buffer
+        Successful-state replay buffer carried from the previous rollout.
+    effective_phase2_prob : Array, shape ()
+        Runtime warmup-gated Phase-2 probability. A zero value masks the
+        buffer empty without changing static JIT cache keys.
     static_cfg : RLSBXRolloutStaticConfig
         Sources seg-init / perturbation knobs.
 
     Returns:
     -------
     env_data : EnvData
-        Env state with the perturbation + seg-init overrides applied.
+        Env state with the perturbation, seg-init, and Phase-2 overrides
+        applied.
     rng_key : Array
         Advanced PRNG key.
 
     Notes:
     -----
-    The all-zero / disabled fast path is taken statically inside
-    ``_apply_reset_perturbation`` (Python ``if`` on ``static_cfg`` floats),
-    so a stage with ``segment_init_prob=0`` and all-zero perturbation
-    pays no in-trace cost beyond the ``_reset_env_data`` call already
-    issued by ``env_reset_fn`` upstream.
+    rl_song's helper branches on the static configured probability. To
+    avoid recompiling when the warmup gate opens, SBX keeps that branch
+    compiled and masks ``buffer.fill`` to zero while the effective runtime
+    probability is zero.
     """
     rl_song_cfg = _to_rl_song_static_cfg(static_cfg)
-    dummy_buffer = _build_dummy_phase2_buffer(static_cfg.n_envs)
-    env_data, rng_key, _do_seg, _do_phase2, _replay = _apply_reset_perturbation(
-        env_data, done_mask, rng_key, dummy_buffer, rl_song_cfg
+    replay_enabled = effective_phase2_prob > 0.0
+    gated_buffer = Phase2Buffer(
+        data=phase2_buffer.data,
+        ptr=phase2_buffer.ptr,
+        fill=jnp.where(replay_enabled, phase2_buffer.fill, jnp.zeros_like(phase2_buffer.fill)),
     )
-    return env_data, rng_key
+    env_data, rng_key, do_seg, do_phase2, replay_prev_action = _apply_reset_perturbation(
+        env_data, done_mask, rng_key, gated_buffer, rl_song_cfg
+    )
+    return env_data, rng_key, do_seg, do_phase2, replay_prev_action
 
 
 @partial(jax.jit, static_argnames=("env_step_fn", "env_reset_fn", "static_cfg"))
@@ -387,6 +405,9 @@ def scan_rollout(
     rng_key: Array,
     reset_rng_key: Array,
     next_done: Array,
+    phase2_buffer: Phase2Buffer,
+    source: Array,
+    effective_phase2_prob: Array,
     env_step_fn: EnvStepFn,
     env_reset_fn: EnvResetFn,
     static_cfg: RLSBXRolloutStaticConfig,
@@ -415,6 +436,12 @@ def scan_rollout(
     next_done : Array, shape (n_envs,), bool
         Done flag carried from the previous rollout. Becomes the
         ``episode_starts[0]`` of this rollout.
+    phase2_buffer : Phase2Buffer
+        Phase-2 successful-state buffer carried by the env wrapper.
+    source : Array, shape (n_envs,), int8
+        Per-env episode-source code carried across rollout boundaries.
+    effective_phase2_prob : Array, shape ()
+        Runtime warmup-gated Phase-2 probability.
     env_step_fn : callable
         JIT-compatible ``RaceCoreEnv._step``.
     env_reset_fn : callable
@@ -434,9 +461,10 @@ def scan_rollout(
     ``env_reset_fn(stepped_data, seed=None, mask=done_bool)`` and then
     fed through :func:`_seg_init_pure_jax` for the Song 2023 §III-B
     Phase-1 seg-init re-spawn + drone-state perturbation. Phase-2
-    successful-state replay remains disabled (see module docstring).
+    successful-state replay is read during resets and written after the
+    scan body, matching rl_song's no in-rollout feedback pattern.
     """
-    _validate_inputs(prev_action_env_4vec, next_done, reset_rng_key, static_cfg)
+    _validate_inputs(prev_action_env_4vec, next_done, reset_rng_key, source, static_cfg)
 
     actor = Actor(
         action_dim=RAW_ACTION_DIM, net_arch=NET_ARCH, log_std_init=LOG_STD_INIT, ortho_init=False
@@ -464,6 +492,12 @@ def scan_rollout(
             static_cfg.thrust_max,
             alpha_max=static_cfg.tangent_alpha_max_rad,
         )
+        physical_action = raw_to_physical_action(
+            raw_action,
+            static_cfg.thrust_min,
+            static_cfg.thrust_max,
+            alpha_max=static_cfg.tangent_alpha_max_rad,
+        )
 
         stepped_data, (next_obs_full, _, term_full, trunc_full, _) = env_step_fn(
             carry.env_data, env_action
@@ -486,7 +520,7 @@ def scan_rollout(
         # Masked-geometry reward (v85): no ``true_*`` kwargs. The reward
         # sees only the actor's observation so gradients can't exploit
         # randomization the policy is denied at deploy.
-        reward, _components = step_reward(
+        reward, components = step_reward(
             next_env_obs,
             env_obs,
             terminated,
@@ -494,6 +528,8 @@ def scan_rollout(
             finished,
             gate_just_passed,
             static_cfg.reward_cfg,
+            physical_action=physical_action,
+            prev_physical_action=carry.prev_physical_action,
         )
 
         done_bool = terminated | truncated
@@ -507,13 +543,44 @@ def scan_rollout(
         # envs. ``_seg_init_pure_jax`` is a no-op on envs with
         # ``done_bool=False`` and a fast static no-op when both seg-init
         # and the perturbation knobs are disabled in ``static_cfg``.
-        reset_data, reset_rng_key = _seg_init_pure_jax(
-            reset_data, done_bool, carry.reset_rng_key, static_cfg
+        (reset_data, reset_rng_key, do_seg, do_phase2, replay_prev_action) = _seg_init_pure_jax(
+            reset_data,
+            done_bool,
+            carry.reset_rng_key,
+            carry.phase2_buffer,
+            effective_phase2_prob,
+            static_cfg,
         )
 
-        # Zero ``prev_action`` on done envs so the next episode starts
-        # with the same "no prior command" condition as a true reset.
+        reset_source = jnp.where(
+            do_phase2,
+            jnp.asarray(SRC_PHASE2_REPLAY, dtype=carry.source.dtype),
+            jnp.where(
+                do_seg,
+                jnp.asarray(SRC_PHASE1_SEG, dtype=carry.source.dtype),
+                jnp.asarray(SRC_TRUE_START, dtype=carry.source.dtype),
+            ),
+        )
+        next_source = jnp.where(done_bool, reset_source, carry.source)
+
+        p2_event_valid, p2_event_slot, p2_event_data = _compute_phase2_event(
+            stepped_data=stepped_data,
+            next_env_obs=next_env_obs,
+            env_action=env_action,
+            current_target=current_target,
+            gate_just_passed=gate_just_passed,
+            done_bool=done_bool,
+            source=carry.source,
+        )
+
+        # True-start / Phase-1 resets begin with no prior command; Phase-2
+        # replays restore the action stored alongside the replayed state so
+        # the autoregressive input matches the respawned pose.
         next_prev_action = jnp.where(done_bool[:, None], jnp.zeros_like(env_action), env_action)
+        next_prev_action = jnp.where(do_phase2[:, None], replay_prev_action, next_prev_action)
+        next_prev_physical_action = jnp.where(
+            done_bool[:, None], jnp.zeros_like(physical_action), physical_action
+        )
 
         transition = RLSBXRolloutOutputs(
             observations=flat_obs,
@@ -526,26 +593,50 @@ def scan_rollout(
             episode_starts=carry.next_done.astype(jnp.float32),
             values=value,
             log_probs=log_prob,
+            target_gate=current_target,
+            terminated=terminated,
+            finished=finished,
+            truncated=truncated,
+            reward_components=components,
+            source=carry.source,
+            p2_event_valid=p2_event_valid,
+            p2_event_slot=p2_event_slot,
+            p2_event_data=p2_event_data,
         )
         next_carry = _ScanCarry(
             env_data=reset_data,
             prev_action=next_prev_action,
+            prev_physical_action=next_prev_physical_action,
             rng_key=rng_key,
             reset_rng_key=reset_rng_key,
             next_done=done_bool,
+            phase2_buffer=carry.phase2_buffer,
+            source=next_source,
         )
         return next_carry, transition
 
     initial_carry = _ScanCarry(
         env_data=env_data,
         prev_action=prev_action_env_4vec,
+        prev_physical_action=jnp.zeros((static_cfg.n_envs, RAW_ACTION_DIM), dtype=jnp.float32),
         rng_key=rng_key,
         reset_rng_key=reset_rng_key,
         next_done=next_done,
+        phase2_buffer=phase2_buffer,
+        source=source,
     )
     final_carry, stacked_outputs = jax.lax.scan(
         scan_step, initial_carry, None, length=static_cfg.n_steps
     )
+    n_gates_python_int = int(env_data.gates_pos.shape[1])
+    updated_buffer = _apply_phase2_writes(
+        final_carry.phase2_buffer,
+        stacked_outputs.p2_event_valid,
+        stacked_outputs.p2_event_slot,
+        stacked_outputs.p2_event_data,
+        n_gates_python_int,
+    )
+    final_carry = final_carry._replace(phase2_buffer=updated_buffer)
 
     # Bootstrap value V(s_{T+1}) for GAE on the post-reset env state.
     # SB3's ``compute_returns_and_advantage`` uses this as ``last_values``
@@ -569,6 +660,8 @@ def scan_rollout(
         rng_key=final_carry.rng_key,
         next_done=final_carry.next_done,
         last_values=last_values,
+        phase2_buffer=final_carry.phase2_buffer,
+        source=final_carry.source,
         outputs=stacked_outputs,
     )
 
@@ -587,6 +680,9 @@ def make_static_config(
     segment_init_prob: float = 0.0,
     segment_init_perturb_m: float = 0.10,
     segment_init_vel_mps: float = 0.0,
+    phase2_prob: float = 0.0,
+    phase2_warmup_steps: int = 0,
+    phase2_capacity_per_gate: int = 1,
 ) -> RLSBXRolloutStaticConfig:
     """Construct a :class:`RLSBXRolloutStaticConfig` with the project defaults.
 
@@ -608,6 +704,9 @@ def make_static_config(
         segment_init_prob=float(segment_init_prob),
         segment_init_perturb_m=float(segment_init_perturb_m),
         segment_init_vel_mps=float(segment_init_vel_mps),
+        phase2_prob=float(phase2_prob),
+        phase2_warmup_steps=int(phase2_warmup_steps),
+        phase2_capacity_per_gate=int(phase2_capacity_per_gate),
     )
 
 
@@ -615,6 +714,7 @@ def _validate_inputs(
     prev_action_env_4vec: Array,
     next_done: Array,
     reset_rng_key: Array,
+    source: Array,
     static_cfg: RLSBXRolloutStaticConfig,
 ) -> None:
     """Validate static rollout input shapes before tracing the scan."""
@@ -626,5 +726,9 @@ def _validate_inputs(
         )
     if next_done.shape != (n_envs,):
         raise ValueError(f"next_done must have shape {(n_envs,)}; got {next_done.shape}")
+    if source.shape != (n_envs,):
+        raise ValueError(f"source must have shape {(n_envs,)}; got {source.shape}")
+    if source.dtype != jnp.int8:
+        raise ValueError(f"source must have dtype int8; got {source.dtype}")
     if reset_rng_key.shape != (2,):
         raise ValueError(f"reset_rng_key must have shape (2,); got {reset_rng_key.shape}")

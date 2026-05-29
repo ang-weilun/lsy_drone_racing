@@ -102,13 +102,22 @@ class NormalizerUpdateCallback(BaseCallback):
         actor_normalized = flat_obs[:, ACTOR_SLICE]
         critic_normalized = flat_obs[:, CRITIC_SLICE]
 
+        # v126: single-normalizer ablation. Both halves of the flat-concat obs
+        # are normalized against the same Welford state (``actor_normalizer``
+        # is the canonical state; ``critic_normalizer`` is an alias). Update
+        # statistics from the actor batch only — this matches rl_song's
+        # reference behaviour where ``rollout.scan_rollout`` runs the Welford
+        # update from a single sample stream. The critic-side raw values
+        # (privileged gate positions) cover a subset of the actor's masked
+        # values (nominal default → revealed truth as sensor range fires), so
+        # adding them as a second update would double-count the post-reveal
+        # samples in the running mean/var. ``set_actor_normalizer`` rebinds
+        # both attributes; the explicit ``set_critic_normalizer`` call is
+        # unnecessary but kept for clarity at the assignment site.
         actor_raw = self._invert(actor_normalized, env.actor_normalizer)
-        critic_raw = self._invert(critic_normalized, env.critic_normalizer)
-
-        new_actor = update_normalizer(env.actor_normalizer, jnp.asarray(actor_raw))
-        new_critic = update_normalizer(env.critic_normalizer, jnp.asarray(critic_raw))
-        env.set_actor_normalizer(new_actor)
-        env.set_critic_normalizer(new_critic)
+        _ = critic_normalized  # privileged values intentionally not folded in
+        new_norm = update_normalizer(env.actor_normalizer, jnp.asarray(actor_raw))
+        env.set_actor_normalizer(new_norm)
 
     @staticmethod
     def _invert(normalized: np.ndarray, state: NormalizerState) -> np.ndarray:

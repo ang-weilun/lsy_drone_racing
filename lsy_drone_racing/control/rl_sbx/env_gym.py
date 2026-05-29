@@ -49,8 +49,14 @@ from lsy_drone_racing.control.rl_song.config import (
     TANGENT_ALPHA_MAX_RAD,
     RewardConfig,
 )
-from lsy_drone_racing.control.rl_song.policy import raw_to_env_action
+from lsy_drone_racing.control.rl_song.policy import raw_to_env_action, raw_to_physical_action
 from lsy_drone_racing.control.rl_song.reward import step_reward
+from lsy_drone_racing.control.rl_song.rollout import (
+    SRC_TRUE_START,
+    Phase2Buffer,
+    empty_phase2_buffer,
+    phase2_state_dim,
+)
 from lsy_drone_racing.envs.race_core import obs as race_core_obs
 
 if TYPE_CHECKING:
@@ -130,7 +136,8 @@ class RLSBXVecEnv(VecEnv):
         n_envs: int,
         seed: int,
         reset_done_hook: Callable[[Array], None] | None = None,
-        seg_init_kwargs: dict[str, float] | None = None,
+        seg_init_kwargs: dict[str, float | int] | None = None,
+        phase2_capacity_per_gate: int = 1,
     ):
         """Construct the wrapper. See the class docstring for parameter details.
 
@@ -151,10 +158,7 @@ class RLSBXVecEnv(VecEnv):
             low=OBS_LOW, high=OBS_HIGH, shape=(2 * ACTOR_OBS_DIM,), dtype=np.float32
         )
         action_space = spaces.Box(
-            low=-RAW_ACTION_BOUND,
-            high=RAW_ACTION_BOUND,
-            shape=(RAW_ACTION_DIM,),
-            dtype=np.float32,
+            low=-RAW_ACTION_BOUND, high=RAW_ACTION_BOUND, shape=(RAW_ACTION_DIM,), dtype=np.float32
         )
         super().__init__(
             num_envs=n_envs, observation_space=observation_space, action_space=action_space
@@ -167,14 +171,36 @@ class RLSBXVecEnv(VecEnv):
         self.thrust_max = float(thrust_max)
         self.seed_value = int(seed)
         self.reset_done_hook = reset_done_hook
-        self.seg_init_kwargs: dict[str, float] = (
+        self.seg_init_kwargs: dict[str, float | int] = (
             dict(seg_init_kwargs) if seg_init_kwargs is not None else {}
         )
+        self.phase2_prob = float(self.seg_init_kwargs.get("phase2_prob", 0.0))
+        self.phase2_warmup_steps = int(self.seg_init_kwargs.get("phase2_warmup_steps", 0))
+        self.phase2_capacity_per_gate = int(phase2_capacity_per_gate)
 
+        n_obstacles = int(self.jax_env.data.obstacles_pos.shape[1])
+        n_gates = int(self.jax_env.data.gates_pos.shape[1])
+        state_dim = phase2_state_dim(n_obstacles, n_gates)
+        self.phase2_buffer = empty_phase2_buffer(
+            n_gates=n_gates, capacity=self.phase2_capacity_per_gate, state_dim=state_dim
+        )
+        self.episode_source = jnp.full((self.num_envs,), SRC_TRUE_START, dtype=jnp.int8)
+
+        # v126 (2026-05-26): single-normalizer ablation. ``critic_normalizer``
+        # is aliased to ``actor_normalizer`` so both halves of the flat-concat
+        # obs are normalized against the same Welford statistics — matches
+        # rl_song's reference behaviour (`rl_song/rollout.py` uses one
+        # ``normalizer`` for both ``build_actor_obs`` and ``build_critic_obs``).
+        # The SBX migration default had been two independent normalizers; the
+        # v56-step163M replay (2026-05-26) confirmed env stability and pointed
+        # to the framework diffs (two normalizers + halved PPO update geometry)
+        # as the regression source for v113h-v124. The alias is kept valid on
+        # every ``set_actor_normalizer`` call.
         self.actor_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
-        self.critic_normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
+        self.critic_normalizer = self.actor_normalizer
 
         self._prev_action: Array = jnp.zeros((n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+        self._prev_physical_action: Array = jnp.zeros((n_envs, RAW_ACTION_DIM), dtype=jnp.float32)
         self._prev_env_obs: dict[str, Array] | None = None
         self._pending_actions: np.ndarray | None = None
 
@@ -194,6 +220,8 @@ class RLSBXVecEnv(VecEnv):
         env_obs = _to_jax_obs(env_obs)
         self._prev_env_obs = env_obs
         self._prev_action = jnp.zeros((self.num_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+        self._prev_physical_action = jnp.zeros((self.num_envs, RAW_ACTION_DIM), dtype=jnp.float32)
+        self.episode_source = jnp.full((self.num_envs,), SRC_TRUE_START, dtype=jnp.int8)
         return self._build_obs(env_obs)
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -230,6 +258,9 @@ class RLSBXVecEnv(VecEnv):
             self.thrust_max,
             alpha_max=self.alpha_max,
         )
+        physical_action = raw_to_physical_action(
+            raw_action, self.thrust_min, self.thrust_max, alpha_max=self.alpha_max
+        )
 
         env_obs, _env_reward, terminated, truncated, _env_info = self.jax_env.step(env_action)
         env_obs = _to_jax_obs(env_obs)
@@ -256,6 +287,8 @@ class RLSBXVecEnv(VecEnv):
             finished,
             gate_just_passed,
             self.reward_cfg,
+            physical_action=physical_action,
+            prev_physical_action=self._prev_physical_action,
         )
 
         done = terminated | truncated
@@ -282,6 +315,10 @@ class RLSBXVecEnv(VecEnv):
 
         reset_prev_action = jnp.zeros_like(env_action)
         self._prev_action = jnp.where(done[:, None], reset_prev_action, env_action)
+        reset_prev_physical_action = jnp.zeros_like(physical_action)
+        self._prev_physical_action = jnp.where(
+            done[:, None], reset_prev_physical_action, physical_action
+        )
         self._prev_env_obs = env_obs
 
         obs_array = self._build_obs(env_obs)
@@ -353,12 +390,31 @@ class RLSBXVecEnv(VecEnv):
     # Normalizer accessors (consumed by the Task 6 callback)
     # ------------------------------------------------------------------
     def set_actor_normalizer(self, normalizer: obs_encoding.NormalizerState) -> None:
-        """Replace the running actor-obs normalizer."""
+        """Replace the running actor-obs normalizer.
+
+        v126: also rebinds ``critic_normalizer`` to maintain the
+        single-normalizer alias established at ``__init__``.
+        """
         self.actor_normalizer = normalizer
+        self.critic_normalizer = normalizer
 
     def set_critic_normalizer(self, normalizer: obs_encoding.NormalizerState) -> None:
-        """Replace the running critic-obs normalizer."""
-        self.critic_normalizer = normalizer
+        """Forward to :meth:`set_actor_normalizer` (single-normalizer alias).
+
+        v126: in two-normalizer mode this would set ``self.critic_normalizer``
+        independently. Under the single-normalizer ablation, any update to
+        the critic stats must also update the actor stats (they are the same
+        object), so we route through :meth:`set_actor_normalizer`.
+        """
+        self.set_actor_normalizer(normalizer)
+
+    def set_phase2_buffer(self, buffer: Phase2Buffer) -> None:
+        """Replace the Phase-2 replay buffer carried between JIT rollouts."""
+        self.phase2_buffer = buffer
+
+    def set_episode_source(self, source: Array) -> None:
+        """Replace the per-env episode-source codes carried between rollouts."""
+        self.episode_source = jnp.asarray(source, dtype=jnp.int8)
 
     # ------------------------------------------------------------------
     # Internals

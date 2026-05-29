@@ -85,7 +85,7 @@ class Actor(nn.Module):
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
             x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
-            x = nn.tanh(x)
+            x = nn.leaky_relu(x)
 
         # v44 (paper-faithful action head): tanh on the last layer per Song
         # 2023 §"Network". With unbounded ``mu_raw``, v43 saturation diagnostics
@@ -101,21 +101,11 @@ class Actor(nn.Module):
         # ``raw_to_env_action`` tanh-on-thrust and norm-clip-on-tangent still
         # bring the *sample* into the valid env range when noise pushes it
         # past ±1.
-        thrust_mean = nn.tanh(
-            nn.Dense(THRUST_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
-        )
-        tangent_mean = nn.tanh(
-            nn.Dense(TANGENT_RAW_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x)
-        )
-        mu_raw = jnp.concatenate([thrust_mean, tangent_mean], axis=-1)
+        mu_raw = nn.tanh(nn.Dense(RAW_ACTION_DIM, kernel_init=nn.initializers.orthogonal(0.01))(x))
 
-        thrust_log_std = self.param(
-            "log_std_thrust", nn.initializers.constant(self.init_log_std), (THRUST_RAW_DIM,)
+        log_std_raw = self.param(
+            "log_std", nn.initializers.constant(self.init_log_std), (RAW_ACTION_DIM,)
         )
-        tangent_log_std = self.param(
-            "log_std_tangent", nn.initializers.constant(self.init_log_std), (TANGENT_RAW_DIM,)
-        )
-        log_std_raw = jnp.concatenate([thrust_log_std, tangent_log_std], axis=-1)
         log_std_raw = jnp.maximum(log_std_raw, LOG_STD_MIN)
         return mu_raw, jnp.broadcast_to(log_std_raw, mu_raw.shape)
 
@@ -140,7 +130,7 @@ class Critic(nn.Module):
         x = obs
         for _ in range(N_HIDDEN_LAYERS):
             x = nn.Dense(HIDDEN_SIZE, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
-            x = nn.tanh(x)
+            x = nn.leaky_relu(x)
         value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
         return jnp.squeeze(value, axis=-1)
 
@@ -216,6 +206,42 @@ def deterministic_raw_action(actor_params: dict, obs: Array) -> Array:
     mu_raw, _ = Actor().apply({"params": actor_params}, obs)
     _validate_last_dim(mu_raw, RAW_ACTION_DIM, "mu_raw")
     return mu_raw
+
+
+def raw_to_physical_action(
+    raw_action: Array,
+    thrust_min: float,
+    thrust_max: float,
+    alpha_max: float = TANGENT_ALPHA_MAX_RAD,
+) -> Array:
+    """Project a raw action to the smoothness-penalty action space.
+
+    Parameters
+    ----------
+    raw_action : Array, shape (..., RAW_ACTION_DIM)
+        Raw policy action ``[T_raw, tau_x, tau_y, tau_z]``.
+    thrust_min : float
+        Minimum total thrust in newtons.
+    thrust_max : float
+        Maximum total thrust in newtons.
+    alpha_max : float, optional
+        Per-step rotation budget in radians.
+
+    Returns:
+    -------
+    Array, shape (..., RAW_ACTION_DIM)
+        Physical intermediate ``[tau_scaled_x, tau_scaled_y, tau_scaled_z,
+        thrust]`` with tangent components in radians and thrust in newtons.
+    """
+    _validate_last_dim(raw_action, RAW_ACTION_DIM, "raw_action")
+    thrust_raw = raw_action[..., :THRUST_RAW_DIM]
+    tangent_raw = raw_action[..., THRUST_RAW_DIM:]
+    thrust_range = thrust_max - thrust_min
+    thrust = thrust_min + thrust_range * 0.5 * (jnp.tanh(thrust_raw) + 1.0)
+    tau_scaled = scale_tangent(tangent_raw, alpha_max)
+    physical_action = jnp.concatenate([tau_scaled, thrust], axis=-1)
+    _validate_last_dim(physical_action, RAW_ACTION_DIM, "physical_action")
+    return physical_action
 
 
 def raw_to_env_action(

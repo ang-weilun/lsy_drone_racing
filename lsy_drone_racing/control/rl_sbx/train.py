@@ -31,12 +31,13 @@ Song, Y. et al. (2023). Reaching the limit in autonomous racing.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import fire
+import wandb
 from stable_baselines3.common.callbacks import BaseCallback
 
-import wandb
 from lsy_drone_racing.control.rl_sbx.callbacks import (
     EntropyAnnealCallback,
     NormalizerUpdateCallback,
@@ -46,8 +47,20 @@ from lsy_drone_racing.control.rl_sbx.checkpoint import save_step
 from lsy_drone_racing.control.rl_sbx.env_gym import RLSBXVecEnv
 from lsy_drone_racing.control.rl_sbx.jit_scan_ppo import JitScanPPO
 from lsy_drone_racing.control.rl_sbx.policy import AsymmetricActorCriticPolicy
-from lsy_drone_racing.control.rl_song.config import TANGENT_ALPHA_MAX_RAD, RewardConfig, TrainConfig
+from lsy_drone_racing.control.rl_song.config import (
+    TANGENT_ALPHA_MAX_RAD,
+    RewardConfig,
+    TrainConfig,
+    _full_curriculum,
+)
 from lsy_drone_racing.control.rl_song.env_wrapper import RLSongVecEnv
+
+# Curriculum selector for the ``--curriculum`` CLI flag. ``"default"`` keeps
+# TrainConfig's baked-in ``default_curriculum`` (single-stage L2 + seg-init +
+# phase-2). ``"full"`` swaps in :func:`_full_curriculum`, the v9/v10 seven-
+# stage curriculum that exposes L3-relevant stages (stage3a/b/c, stage4_dr)
+# via ``--stage-idx``.
+_CURRICULUM_FACTORIES = {"default": None, "full": _full_curriculum}
 
 
 class WandbScalarCallback(BaseCallback):
@@ -110,13 +123,28 @@ def train(
     ent_coef: float = DEFAULT_ENT_COEF,
     ent_coef_final: float | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
+    gamma: float | None = None,
+    segment_init_prob: float | None = None,
+    segment_init_vel_mps: float | None = None,
+    phase2_prob: float | None = None,
+    phase2_warmup_steps: int | None = None,
     progress_coef: float = 15.0,
     time_penalty: float = 0.10,
     guide_coef: float = 0.5,
     gate_pass_bonus: float = 10.0,
     gate_frame_weight: float = 0.0,
     obstacle_weight: float = 0.0,
+    use_velocity_progress: bool = False,
+    lookahead_coef: float = 0.0,
+    lookahead_mask_through: int = 0,
+    lookahead_near_plane_m: float = 0.5,
+    wrong_side_coef: float = 0.0,
+    wrong_side_target_min: int = 1,
+    dipole_coef: float = 0.0,
+    dipole_sigma: float = 0.5,
+    omega_coef: float = 0.01,
     ortho_init: bool = True,
+    log_std_init: float = -0.5,
     n_envs: int | None = None,
     n_steps: int = DEFAULT_N_STEPS,
     n_epochs: int = DEFAULT_N_EPOCHS,
@@ -125,6 +153,8 @@ def train(
     checkpoint_root: str = "lsy_drone_racing/control/rl_sbx/checkpoints",
     save_freq_steps: int = 20_000_000,
     init_from: str | None = None,
+    curriculum: str = "default",
+    stage_idx: int = 0,
     wandb_project: str = WANDB_PROJECT,
     wandb_entity: str | None = None,
     no_wandb: bool = False,
@@ -175,6 +205,21 @@ def train(
     → SBX PPO) is load-bearing — see the module docstring.
     """
     train_cfg = TrainConfig()
+    if curriculum not in _CURRICULUM_FACTORIES:
+        raise ValueError(
+            f"Unknown curriculum {curriculum!r}; expected one of {sorted(_CURRICULUM_FACTORIES)}."
+        )
+    factory = _CURRICULUM_FACTORIES[curriculum]
+    if factory is not None:
+        train_cfg = replace(train_cfg, curriculum=factory())
+    if gamma is not None:
+        train_cfg = replace(train_cfg, ppo=replace(train_cfg.ppo, gamma=float(gamma)))
+    n_stages = len(train_cfg.curriculum.stages)
+    if not 0 <= stage_idx < n_stages:
+        raise ValueError(
+            f"stage_idx={stage_idx} out of range for curriculum "
+            f"{curriculum!r} (n_stages={n_stages})."
+        )
     effective_n_envs = train_cfg.ppo.n_envs if n_envs is None else int(n_envs)
     # 2026-05-25: v112 (`reward_cfg = RewardConfig()`) cold-trained without
     # seg-init and converged to the "barely-not-hover thrust, drone falls
@@ -201,11 +246,22 @@ def train(
         gate_pass_bonus=gate_pass_bonus,
         gate_frame_weight=gate_frame_weight,
         obstacle_weight=obstacle_weight,
+        use_velocity_progress=use_velocity_progress,
+        lookahead_coef=lookahead_coef,
+        lookahead_mask_through=lookahead_mask_through,
+        lookahead_near_plane_m=lookahead_near_plane_m,
+        wrong_side_coef=wrong_side_coef,
+        wrong_side_target_min=wrong_side_target_min,
+        dipole_coef=dipole_coef,
+        dipole_sigma=dipole_sigma,
+        omega_coef=omega_coef,
     )
 
     # The wrapper's __init__ instantiates the inner JAX env via set_stage and
     # runs its own reset(seed=seed+stage_idx) — no second reset call needed.
-    wrapper = RLSongVecEnv(train_cfg, n_envs=effective_n_envs, stage_idx=0, seed=seed, device="gpu")
+    wrapper = RLSongVecEnv(
+        train_cfg, n_envs=effective_n_envs, stage_idx=stage_idx, seed=seed, device="gpu"
+    )
 
     # Inherit thrust bounds from the wrapper, which already loaded them via
     # ``load_params(level_toml.sim.physics, level_toml.sim.drone_model)``
@@ -221,14 +277,25 @@ def train(
     # below is the legacy step_wait path; JIT-scan bypasses ``step_wait``
     # entirely so the in-scan path is the one that matters here.
     stage = wrapper.stage
-    seg_init_kwargs: dict[str, float] = {
+    seg_init_kwargs: dict[str, float | int] = {
         "reset_pos_perturb_m": float(stage.reset_pos_perturb_m),
         "reset_vel_perturb_mps": float(stage.reset_vel_perturb_mps),
         "reset_yaw_perturb_rad": float(stage.reset_yaw_perturb_rad),
         "segment_init_prob": float(stage.segment_init_prob),
         "segment_init_perturb_m": float(stage.segment_init_perturb_m),
         "segment_init_vel_mps": float(stage.segment_init_vel_mps),
+        "phase2_prob": float(stage.phase2_prob),
+        "phase2_warmup_steps": int(stage.phase2_warmup_steps),
+        "phase2_capacity_per_gate": int(stage.phase2_capacity_per_gate),
     }
+    if segment_init_prob is not None:
+        seg_init_kwargs["segment_init_prob"] = float(segment_init_prob)
+    if segment_init_vel_mps is not None:
+        seg_init_kwargs["segment_init_vel_mps"] = float(segment_init_vel_mps)
+    if phase2_prob is not None:
+        seg_init_kwargs["phase2_prob"] = float(phase2_prob)
+    if phase2_warmup_steps is not None:
+        seg_init_kwargs["phase2_warmup_steps"] = int(phase2_warmup_steps)
 
     wandb_run = None
     if not no_wandb:
@@ -271,6 +338,7 @@ def train(
         seed=seed,
         reset_done_hook=wrapper._apply_reset_perturbation,
         seg_init_kwargs=seg_init_kwargs,
+        phase2_capacity_per_gate=stage.phase2_capacity_per_gate,
     )
 
     # SBX 0.26 PPO kwargs: confirmed via inspect.signature on remote. ``device``
@@ -299,7 +367,7 @@ def train(
     # v113b/v113d/v113e all 0/10 across L0/L1/L2 with ortho_init=False.
     # Settable to False to preserve the original v112 architecture for
     # reproducibility comparisons.
-    policy_kwargs = {"ortho_init": bool(ortho_init)}
+    policy_kwargs = {"ortho_init": bool(ortho_init), "log_std_init": float(log_std_init)}
     model = JitScanPPO(
         policy=AsymmetricActorCriticPolicy,
         env=env,
@@ -311,6 +379,12 @@ def train(
         gamma=train_cfg.ppo.gamma,
         gae_lambda=train_cfg.ppo.gae_lambda,
         clip_range=train_cfg.ppo.clip_coef,
+        # Pessimistic value-loss clip range. Same scalar as the policy ratio
+        # clip per rl_song convention (rl_song/train.py:925, 945 both use
+        # ``ppo_cfg.clip_coef``). Threaded into JitScanPPO's overridden
+        # ``train`` -> ``_one_update_clipped_vf`` (see jit_scan_ppo.py).
+        # Stock SBX accepts this kwarg but never used it; we wire it through.
+        clip_range_vf=train_cfg.ppo.clip_coef,
         ent_coef=ent_coef,
         vf_coef=train_cfg.ppo.vf_coef,
         max_grad_norm=train_cfg.ppo.max_grad_norm,
@@ -343,12 +417,8 @@ def train(
         loaded = load_all(init_path, actor_template, critic_template)
         # Replace the TrainState params (preserves optimizer state with the
         # new shapes intact). Apply_fn / opt_state remain from model setup.
-        model.policy.actor_state = model.policy.actor_state.replace(
-            params=loaded["actor_params"]
-        )
-        model.policy.vf_state = model.policy.vf_state.replace(
-            params=loaded["critic_params"]
-        )
+        model.policy.actor_state = model.policy.actor_state.replace(params=loaded["actor_params"])
+        model.policy.vf_state = model.policy.vf_state.replace(params=loaded["critic_params"])
         env.set_actor_normalizer(loaded["actor_normalizer"])
         env.set_critic_normalizer(loaded["critic_normalizer"])
 
@@ -357,10 +427,7 @@ def train(
     callbacks: list = [
         NormalizerUpdateCallback(),
         PeriodicCheckpointCallback(
-            run_dir=run_dir,
-            alpha_max_rad=alpha_max_rad,
-            save_freq_steps=save_freq_steps,
-            verbose=1,
+            run_dir=run_dir, alpha_max_rad=alpha_max_rad, save_freq_steps=save_freq_steps, verbose=1
         ),
     ]
     if ent_coef_final is not None:

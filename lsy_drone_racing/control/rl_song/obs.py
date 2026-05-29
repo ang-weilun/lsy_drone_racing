@@ -1,41 +1,27 @@
 """Observation encoding for the Song-2023 RL prototype.
 
-Builds the 65-dimensional actor observation and the (Week-1-equivalent)
+Builds the 52-dimensional actor observation and the (Week-1-equivalent)
 critic observation from the racing env's observation dict. Pure JAX, designed
 to be ``jit``- and ``vmap``-friendly.
 
 Layout
 ------
-The actor observation is
-``[drone | gates | visited | target_onehot | prev_action | obstacles | proximity]``:
+The actor observation is ``[drone | gates | obstacles]``:
 
-* drone (13): 6D rotation rep (first two columns of ``R_wb``), body-frame
-  linear velocity (3), body-frame angular velocity (3), drone z (1).
-* gates (24): the next ``N_FUTURE_GATES = 2`` gates' four opening corners. The
-  target-gate corners are expressed in the **drone body frame**; the next
-  gate's corners are expressed in the **target gate's frame** (Song 2021's
-  recursive trick, used unchanged by Song 2023 / Romero 2024 / Wang 2025).
-* visited (2): float flags for whether each of the two future gates has been
-  revealed.
-* target_onehot (4): v45 — explicit one-hot encoding of the current
-  ``target_gate`` index. Disambiguates the OOD true-start eval state (where
-  the geometric drone configuration may resemble Phase-1/2 mid-track training
-  states that had a different target_gate). ``target_gate = -1`` (finished)
-  → all-zeros; the actor output on that step is discarded by the rollout
-  buffer anyway.
-* prev_action (4): the previous env-action 4-vec ``[roll, pitch, yaw, thrust]``.
-* obstacles (16): four obstacles' body-frame relative positions (3 each) and
-  visited flags (1 each).
-* proximity (2): scalar danger features — XY clearance to the nearest
-  obstacle, and the signed closing speed along the direction to that
-  obstacle (positive when approaching). Pre-computes the cross-channel
-  interaction that v33b / v34 evaluations showed the policy was failing
-  to learn from the raw obstacle channel alone.
+* drone (12): full 9D rotation matrix and body-frame linear velocity (3).
+* gates (24): target gate corners in body frame (12), then the next-gate
+  minus target-gate corner deltas in body frame (12).
+* obstacles (16): the ``N_NEAREST_OBSTACLES = 2`` nearest obstacles in
+  body-frame XY distance, packed into permutation-stable slots. Per slot:
+  body-frame XY relative position (2), body-frame velocity projected onto
+  the unit vector toward the obstacle (1, positive when closing in), a
+  ``N_OBSTACLES``-wide identity one-hot for which physical obstacle this
+  slot points to (4), and the visited flag (1). Replaces the v33-v124
+  per-obstacle 16-float block + 2-float global proximity pair; rationale
+  in ``build_actor_obs``.
 
 Cyclic shift: the gate list is rotated so that ``gates[0]`` is always the
-current target. v45 also adds the explicit target_onehot above so the
-policy has both signals — the cyclic-shifted gate geometry and the explicit
-target index — to disambiguate OOD states.
+current target.
 """
 
 from __future__ import annotations
@@ -46,13 +32,10 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, ENV_ACTION_DIM
+from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, N_NEAREST_OBSTACLES, N_OBSTACLES
 
 # Number of future gates encoded in the actor observation (target + 1).
 N_FUTURE_GATES: int = 2
-# Number of obstacles encoded. Hard-coded to the level-1 / level-3 layout
-# (4 obstacles); raises at runtime if the env exposes a different count.
-N_OBSTACLES: int = 4
 # Half extents of the gate opening in the gate's local (y, z) plane. The
 # track configs specify a 0.4 m x 0.4 m opening; see e.g. ``config/level1.toml``
 # header comment "Gates are square. Gates are 0.72m wide ... with a 0.4m wide
@@ -204,7 +187,7 @@ def _gate_corners_world(gate_pos: Array, gate_quat: Array) -> Array:
 def build_actor_obs(
     env_obs: dict[str, Array], prev_action: Array, normalizer: NormalizerState
 ) -> Array:
-    """Encode one (un-batched) env observation as the 61-d actor tensor.
+    """Encode one (un-batched) env observation as the ``ACTOR_OBS_DIM``-d actor tensor.
 
     Parameters
     ----------
@@ -214,7 +197,8 @@ def build_actor_obs(
         ``gates_quat``, ``gates_visited``, ``obstacles_pos``,
         ``obstacles_visited``.
     prev_action : Array, shape (4,)
-        Previously commanded env action ``[roll, pitch, yaw, thrust]``.
+        Accepted for API compatibility with rollout and controller call sites.
+        The actor observation no longer includes a previous-action channel.
     normalizer : NormalizerState
         Running mean/std applied to the assembled raw observation.
 
@@ -231,11 +215,9 @@ def build_actor_obs(
     pos = env_obs["pos"]
     quat = env_obs["quat"]
     vel = env_obs["vel"]
-    ang_vel = env_obs["ang_vel"]
     target = env_obs["target_gate"]
     gates_pos = env_obs["gates_pos"]
     gates_quat = env_obs["gates_quat"]
-    gates_visited = env_obs["gates_visited"]
     obstacles_pos = env_obs["obstacles_pos"]
     obstacles_visited = env_obs["obstacles_visited"]
 
@@ -248,120 +230,93 @@ def build_actor_obs(
 
     # Drone channel.
     rot_wb = _quat_to_matrix(quat)
-    rot_6d = rot_wb[:, :2].reshape(6)  # first two columns
+    rot_9d = rot_wb.reshape(9)
     rot_bw = rot_wb.T
     vel_body = rot_bw @ vel
-    z = pos[2:3]
-    drone_chan = jnp.concatenate([rot_6d, vel_body, ang_vel, z])
+    drone_chan = jnp.concatenate([rot_9d, vel_body])
 
-    # Target gate corners in drone body frame.
+    # Song's recursive gate channel keeps both 12-float blocks in body
+    # frame so the target and inter-gate geometry share one rotation basis.
     g_target_pos = gates_pos[gate_indices[0]]
     g_target_quat = gates_quat[gate_indices[0]]
     g_target_corners_w = _gate_corners_world(g_target_pos, g_target_quat)
+    # Target-gate corners expressed in drone body frame.
     target_corners_body = (g_target_corners_w - pos) @ rot_bw.T  # (4, 3)
 
-    # Next gate corners expressed in the target gate's frame (Song 2021 trick).
     g_next_pos = gates_pos[gate_indices[1]]
     g_next_quat = gates_quat[gate_indices[1]]
     g_next_corners_w = _gate_corners_world(g_next_pos, g_next_quat)
-    rot_target_world = _quat_to_matrix(g_target_quat)
-    next_corners_in_target = (g_next_corners_w - g_target_pos) @ rot_target_world
+    inter_gate_delta_body = (g_next_corners_w - g_target_corners_w) @ rot_bw.T
+
     gate_chan = jnp.concatenate(
-        [target_corners_body.reshape(-1), next_corners_in_target.reshape(-1)]
+        [target_corners_body.reshape(-1), inter_gate_delta_body.reshape(-1)]
     )
 
-    # v74: just-passed gate corners in drone body frame. Lets the policy
-    # observe the gate frame the reward is penalising it for grazing on exit
-    # (the gate-3 rim graze failure mode in v56 — see
-    # ``reference_wang_env_as_policy`` and the v73a investigation handoff).
-    # Clamp ``target_idx - 1`` to >=0; on the first gate this aliases to
-    # the target gate (redundant signal, harmless — no exit graze risk yet).
-    prev_gate_idx = jnp.maximum(target_idx - 1, 0)
-    g_prev_pos = gates_pos[prev_gate_idx]
-    g_prev_quat = gates_quat[prev_gate_idx]
-    g_prev_corners_w = _gate_corners_world(g_prev_pos, g_prev_quat)
-    prev_corners_body = (g_prev_corners_w - pos) @ rot_bw.T  # (4, 3)
+    _ = prev_action
 
-    visited_chan = gates_visited[gate_indices].astype(jnp.float32)
-
-    # v45: explicit one-hot target_gate. ``jax.nn.one_hot`` requires a
-    # static ``num_classes`` — gates_pos.shape[0] is known at trace time so
-    # passing it works inside vmap/jit. ``target_idx`` was clamped to 0
-    # above when ``target == -1`` (finished); mask the resulting one-hot
-    # back to all-zeros for that case so a finished episode is distinct
-    # from an active episode targeting gate 0.
-    target_onehot_raw = jax.nn.one_hot(target_idx, n_gates, dtype=jnp.float32)
-    target_active_mask = (target >= 0).astype(jnp.float32)
-    target_onehot = target_onehot_raw * target_active_mask
-
-    prev_action_chan = jnp.asarray(prev_action, dtype=jnp.float32).reshape(ENV_ACTION_DIM)
-
-    # Obstacle channel: body-frame relative position + visited flag, per
-    # obstacle.
+    # Obstacle channel: the ``N_NEAREST_OBSTACLES`` nearest obstacles in
+    # body-frame XY distance, packed into permutation-stable slots. Per slot
+    # the actor sees [xy_body (2), vel_proj (1), identity_onehot (N_OBSTACLES),
+    # visited (1)].
     #
     # v33: project the obstacle's world-frame XY onto the drone's altitude
-    # plane (replace ``obs_z`` with ``pos_z``) before rotating into the
-    # body frame. Obstacles are vertical capsules from the floor to
-    # z≈1.55 (see ``envs/assets/obstacle.xml`` and the level-3 toml
-    # header); the relevant collision surface is at the drone's altitude,
-    # not at the top marker. ``reward.step_reward`` already uses
-    # XY-only distance for ``r_obs`` (treating obstacles as infinite
-    # vertical poles); pre-v33 the actor saw the body-frame vector to
-    # the top marker (z≈1.55) instead, so the geometry the policy was
-    # graded on disagreed with the geometry it could observe. Same
-    # 3 floats per obstacle, so the obs dimensionality (and the
-    # observation normalizer it interacts with) is unchanged.
+    # plane before rotating into the body frame. Obstacles are vertical
+    # capsules from the floor to z≈1.55 (see ``envs/assets/obstacle.xml`` and
+    # the level-3 toml header); the relevant collision surface is at the
+    # drone's altitude, not at the top marker. ``reward.step_reward`` uses
+    # XY-only distance for ``r_obs`` (infinite vertical poles), so the z
+    # dimension carries no information the policy is graded on and is
+    # dropped entirely in this layout.
+    #
+    # v??? (slot layout): replaces the v33-v124 16-float per-obstacle block
+    # + 2-float global proximity pair (total 18). The raw block was 16/59 ≈
+    # 27% of the actor obs but encoded the cross-channel "am I approaching
+    # a hazard" signal indirectly — v33b / v34 evaluations showed the
+    # policy failed to learn it from the block alone, which v35 patched
+    # with hand-rolled proximity scalars. The per-slot velocity projection
+    # makes that signal explicit for each of the K tracked obstacles
+    # (subsumes the v35 scalars), and the identity one-hot lets the
+    # network handle the rank-flip discontinuity: when the drone passes
+    # obstacle A and B becomes the new nearest, the xy / vel-proj values
+    # in slot 0 jump; without an identity label the policy reads the jump
+    # as a physics event and the observation normalizer treats it as
+    # variance, inflating σ on those channels. The visited flag per slot
+    # guards against ranking an unobserved obstacle (at its possibly-stale
+    # nominal position) into a slot.
     obstacles_at_alt = obstacles_pos.at[:, 2].set(pos[2])
     obstacles_rel_body = (obstacles_at_alt - pos) @ rot_bw.T  # (N_OBSTACLES, 3)
+    obstacles_xy_body = obstacles_rel_body[:, :2]  # (N_OBSTACLES, 2)
+    obstacles_dist_xy = jnp.linalg.norm(obstacles_xy_body, axis=-1)  # (N_OBSTACLES,)
+
+    # Sort by body-frame XY distance and keep the K nearest. ``argsort`` is
+    # O(N log N) on a 4-element vector — negligible inside the jit graph.
+    nearest_indices = jnp.argsort(obstacles_dist_xy)[:N_NEAREST_OBSTACLES]
+    nearest_xy_body = obstacles_xy_body[nearest_indices]  # (K, 2)
+    nearest_dist = obstacles_dist_xy[nearest_indices]  # (K,)
+    nearest_visited = obstacles_visited[nearest_indices].astype(jnp.float32)
+
+    # Body-frame velocity projected onto unit-to-obstacle in the same frame.
+    # Positive when the drone is closing in on that slot's obstacle. Guard
+    # the unit vector against the (numerically negligible) co-located case
+    # so the projection stays finite.
+    safe_norm = jnp.maximum(nearest_dist, 1e-6)[:, None]
+    unit_to_obstacle = nearest_xy_body / safe_norm  # (K, 2)
+    vel_xy_body = vel_body[:2]
+    vel_proj = unit_to_obstacle @ vel_xy_body  # (K,)
+
+    # Identity one-hot among the N_OBSTACLES physical obstacles. Obstacle i
+    # is the same physical capsule across all episodes, so the network can
+    # learn "when the one-hot in this slot flips, the xy/vel-proj jump is
+    # a slot reassignment, not motion."
+    identity_onehot = jax.nn.one_hot(
+        nearest_indices, num_classes=N_OBSTACLES, dtype=jnp.float32
+    )  # (K, N_OBSTACLES)
+
     obstacle_chan = jnp.concatenate(
-        [obstacles_rel_body, obstacles_visited.astype(jnp.float32)[..., None]], axis=-1
+        [nearest_xy_body, vel_proj[:, None], identity_onehot, nearest_visited[:, None]], axis=-1
     ).reshape(-1)
 
-    # v35: scalar proximity features. The raw obstacle channel already
-    # contains the body-frame relative positions, so in principle the
-    # network could infer ``min over obstacles of |Δxy|`` and the closing
-    # speed itself. v33b / v34 evaluations showed that does not happen:
-    # the policy generates near-zero roll commands as it approaches an
-    # obstacle on the spawn→gate-0 line. Pre-computing two scalars gives
-    # PPO a direct gradient on the danger signal instead of requiring it
-    # to learn the multiplicative cross-channel interaction
-    # (self_velocity · obstacle_direction) from sparse reward.
-    obstacle_delta_xy = obstacles_pos[:, :2] - pos[:2]  # (N_OBSTACLES, 2), world XY
-    obstacle_dist_xy = jnp.linalg.norm(obstacle_delta_xy, axis=-1)  # (N_OBSTACLES,)
-    min_clearance_xy = jnp.min(obstacle_dist_xy)
-    nearest_idx = jnp.argmin(obstacle_dist_xy)
-    # Unit vector from drone XY to nearest obstacle, in world frame. Guarded
-    # for the (numerically negligible) co-located case so the dot product
-    # below is well-defined.
-    dir_to_nearest = obstacle_delta_xy[nearest_idx]
-    dir_norm = jnp.linalg.norm(dir_to_nearest)
-    safe_norm = jnp.maximum(dir_norm, 1e-6)
-    unit_to_nearest = dir_to_nearest / safe_norm
-    # Closing speed: positive when drone XY velocity has a component pointing
-    # toward the nearest obstacle. Built from world-frame velocity, not body
-    # frame, since the unit vector is in world frame.
-    closing_speed = jnp.dot(vel[:2], unit_to_nearest)
-    proximity_chan = jnp.stack(
-        [min_clearance_xy.astype(jnp.float32), closing_speed.astype(jnp.float32)]
-    )
-
-    # v74: prev-gate corners appended at the end so the obs-grow padding
-    # in ``_pad_first_dense_for_obs_grow`` works on a v56-era warm-start
-    # (which was saved with the 65-dim layout). New channels at the END
-    # get zero-initialised weights in the first dense layer, preserving
-    # the prior policy's behaviour at warm-start.
-    raw = jnp.concatenate(
-        [
-            drone_chan,
-            gate_chan,
-            visited_chan,
-            target_onehot,
-            prev_action_chan,
-            obstacle_chan,
-            proximity_chan,
-            prev_corners_body.reshape(-1),
-        ]
-    )
+    raw = jnp.concatenate([drone_chan, gate_chan, obstacle_chan])
     return apply_normalizer(normalizer, raw)
 
 

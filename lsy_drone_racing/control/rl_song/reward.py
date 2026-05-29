@@ -16,12 +16,16 @@ to ``env_obs["gates_pos"]`` for callers that intentionally use masked poses.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import jax
 import jax.numpy as jnp
 from jax import Array
 
-from lsy_drone_racing.control.rl_song.config import RewardConfig
 from lsy_drone_racing.control.rl_song.obs import GATE_HALF_SIZE_M, _quat_to_matrix
+
+if TYPE_CHECKING:
+    from lsy_drone_racing.control.rl_song.config import RewardConfig
 
 # Squared-meter tolerance for detecting positions on the gate guidance axis.
 GUIDANCE_AXIS_EPS_M2: float = 1e-8
@@ -150,6 +154,8 @@ def step_reward(
     true_gates_pos: Array | None = None,
     true_gates_quat: Array | None = None,
     true_obstacles_pos: Array | None = None,
+    physical_action: Array | None = None,
+    prev_physical_action: Array | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute one vectorized Song-style reward step.
 
@@ -182,23 +188,30 @@ def step_reward(
     true_obstacles_pos : Array, shape (n_envs, n_obstacles, 3), optional
         Unmasked obstacle positions. If omitted, ``env_obs["obstacles_pos"]``
         is used.
+    physical_action : Array, shape (n_envs, 4), optional
+        Current physical action intermediate ``[tau_scaled, thrust]`` where
+        ``tau_scaled`` is radians and thrust is newtons.
+    prev_physical_action : Array, shape (n_envs, 4), optional
+        Previous physical action intermediate with the same layout.
 
     Returns:
     -------
     reward : Array, shape (n_envs,)
         Total replacement reward.
     components : dict[str, Array]
-        Per-component rewards with keys ``r_prog``, ``r_omega``, ``r_obs``,
-        ``r_gate_bonus``, ``r_exit_vel``, ``r_terminal``, ``r_time``,
-        ``r_vel``, and ``r_guid``. Every value has shape ``(n_envs,)``.
+        Per-component rewards. Terms summed into ``reward`` are ``r_prog``,
+        ``r_omega``, ``r_smooth``, ``r_crash``, ``r_finish``, and ``r_time``
+        (the last is identically 0 when ``time_penalty == 0``). All other
+        component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``,
+        ``r_gate_frame``, ``r_obs``, ``r_gate_bonus``, ``r_exit_vel``,
+        ``r_vel``, ``r_caution``, ``r_terminal``) are diagnostic only and NOT
+        summed — add them to the ``reward = ...`` line to activate.
 
     Notes:
     -----
-    ``r_obs`` and ``r_gate_frame`` use the already-masked ``env_obs``
-    fields (post upstream PR #91, ``race_core.obs`` masks gate and
-    obstacle positions between the wobbled physics state and the
-    Layer-1 nominal snapshot via the visited flags), so the actor is
-    graded against the same poses it observes.
+    Smoothness is computed on the physical action intermediate rather than
+    on Euler env actions, whose angle wrapping would make local command
+    changes discontinuous.
     """
     _ = truncated, true_obstacles_pos
     gates_pos = env_obs["gates_pos"] if true_gates_pos is None else true_gates_pos
@@ -217,81 +230,61 @@ def step_reward(
 
     prev_pos = prev_env_obs["pos"]
     pos = env_obs["pos"]
-    # v20: Song-2023 / Kaufmann-2023 velocity-projection progress, gated
-    # by ``use_velocity_progress``. The drone enters each gate's local
-    # frame from x_local < 0, passes the aperture at x_local ≈ 0, and
-    # exits at x_local > 0, so the gate-frame x-component of the world-
-    # frame displacement is the signed progress along the gate normal.
-    # Reward direction is fixed in gate frame (the gate's traversal
-    # axis), rather than rotating with the line from drone to gate as
-    # in the legacy distance-delta formulation. The two are equal in
-    # the limit of small displacements along that line; they diverge
-    # when motion has a lateral component, where velocity-projection
-    # only credits the traversal-aligned part — encouraging cleaner
-    # nose-first passes.
-    if reward_cfg.use_velocity_progress:
-        rot_gw = _quat_to_matrix(gate_quat)
-        delta_local = jnp.einsum("nji,nj->ni", rot_gw, pos - prev_pos)
-        r_prog = reward_cfg.progress_coef * delta_local[..., 0]
-    else:
-        # v41: reverted to gate-center distance-delta. The v40 exit-waypoint
-        # variant was diagnosed as counter-productive on this layout: the
-        # gate-1 exit waypoint sits in world (-x, +y) from gate 1's center,
-        # which means a drone exiting gate 0 with +x momentum (the natural
-        # gate-0 traversal direction) receives *negative* r_prog after the
-        # target_idx flips to 1 — actively training the policy to suppress
-        # the +x overshoot that is required to set up the U-turn entry.
-        # The post-gate-0 plateau is now addressed structurally via
-        # ``phase2_prob=0.10`` (replay from successful post-gate-K states)
-        # and the v41 seg-init fix in ``rollout._apply_segment_init`` (spawn
-        # at gate's entry waypoint, velocity in gate's +x_local direction).
-        # Both attack the value-function-baseline trap rather than trying
-        # to shape it away via dense reward.
-        r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
-        r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
+    rot_gw = _quat_to_matrix(gate_quat)
+    target_gate_xaxis_world = rot_gw[..., :, 0]
+    # Drone's gate-local x coordinate relative to the current target.
+    # Convention (see ``gate_passed`` in envs/utils.py): drone enters at
+    # x_local < 0, passes at x_local ≈ 0, exits at x_local > 0. The
+    # exit-side region (x_local_target > 0) is reachable from the wrong
+    # geometric direction (e.g., drone overshot past the gate plane)
+    # without a successful pass, and r_wrong_side below penalizes that.
+    x_local_target = jnp.einsum("nj,nj->n", pos - gate_pos, target_gate_xaxis_world)
+    # Unified redesign: keep the direction-blind Song/Kaufmann distance
+    # delta and remove the lookahead branch from the active reward.
+    r_prog = jnp.linalg.norm(gate_pos - prev_pos, axis=-1)
+    r_prog = reward_cfg.progress_coef * (r_prog - jnp.linalg.norm(gate_pos - pos, axis=-1))
 
-    # v38k: pre-gate-0 entry-position shaping. v38j tried distance-
-    # closing to gate 1's *center* and failed: as the drone coasts +x
-    # past gate 0, the Euclidean distance to gate 1's center naturally
-    # decreases, so look-ahead at gate-1-center paid positive reward
-    # for the wrong behaviour. The Oct-2025 gate-frame standardization
-    # (``Update gate orientation and pass check``, commit ``23415dc``)
-    # makes gate 1's +x_local axis point world (-0.70, +0.71); gate 1
-    # is geometrically reachable only from x_local_g1 > 0 with motion
-    # in the +x_local direction (= world (-x, +y)). The natural +x
-    # coast after gate 0 lands the drone on x_local_g1 < 0 and OOBs
-    # there. v38k aims look-ahead at the *entry waypoint*
-    # ``gate_pos - lookahead_entry_offset_m * gate_xaxis_world``,
-    # which sits ~0.5 m on the -x_local side of gate 1 (i.e., on the
-    # +x side of gate 1 in world). Reward gradient biases the gate-0
-    # approach to exit gate 0 with momentum already pointed at that
-    # apex, after which the base ``r_prog`` distance-closing to gate
-    # 1's center can complete the U-turn. Masked to ``target_idx == 0``
-    # only (pre-gate-0 + the gate-0 pass step); after that, base r_prog
-    # handles gate 1. This is *entry-position shaping*, not a post-
-    # gate-0 overshoot brake — the bootstrap problem post-gate-0 is
-    # still left to the base reward gradient.
-    # ``_quat_to_matrix`` returns the body->world rotation, so its
-    # first column is the gate-local +x axis expressed in world coords
-    # (see ``obs._quat_to_matrix``).
-    if reward_cfg.lookahead_coef > 0.0:
-        n_gates_lk = gates_pos.shape[1]
-        next_idx = jnp.minimum(target_idx + 1, n_gates_lk - 1)
-        next_gate_pos = gates_pos[env_idx, next_idx]
-        next_gate_quat = gates_quat[env_idx, next_idx]
-        rot_next_gw = _quat_to_matrix(next_gate_quat)
-        next_gate_xaxis_world = rot_next_gw[..., :, 0]
-        entry_wp = next_gate_pos - reward_cfg.lookahead_entry_offset_m * next_gate_xaxis_world
-        closing_wp = jnp.linalg.norm(entry_wp - prev_pos, axis=-1) - jnp.linalg.norm(
-            entry_wp - pos, axis=-1
-        )
-        lookahead = reward_cfg.progress_coef * reward_cfg.lookahead_coef * closing_wp
-        r_prog = r_prog + jnp.where(target_idx == 0, lookahead, jnp.zeros_like(r_prog))
+    # v120: direct wrong-side penalty (see RewardConfig.wrong_side_coef
+    # for design rationale). Punishes positive x_local_target — drone
+    # past the target gate's plane on the exit side without a successful
+    # pass. r_prog (any variant) is geometrically blind to this attractor,
+    # and lookahead only shapes the approach trajectory.
+    r_wrong_side = -reward_cfg.wrong_side_coef * jnp.maximum(x_local_target, 0.0)
+    r_wrong_side = jnp.where(
+        target_idx >= reward_cfg.wrong_side_target_min, r_wrong_side, jnp.zeros_like(r_wrong_side)
+    )
+
+    # v122: dipole progress reward. A signed Gaussian-localized potential
+    # around the target gate: positive lobe in front of the gate plane
+    # (approach side, x_local < 0), negative lobe behind (post-plane, the
+    # same region r_wrong_side punishes). Field equation:
+    #   r_dipole = -coef * x_local * exp(-||p - gate||^2 / sigma^2)
+    # Replaces the geometric asymmetry that bare r_prog has — distance-
+    # delta to the gate center is direction-agnostic, so the policy can
+    # accumulate r_prog by sliding into the wrong-side region whenever
+    # that path is geometrically shorter than the correct-side approach.
+    # The dipole charges per-step for being in the back lobe, breaking
+    # the wrong-side attractor structurally. Masked on the gate-pass step
+    # (target_idx in reward.py is the pre-step target, so the drone is
+    # already in the back lobe on the pass step — would otherwise inject
+    # a one-step negative reward at every gate clearance) and on the
+    # finish step (analogous).
+    pos_to_gate = pos - gate_pos
+    dist_sq = jnp.sum(pos_to_gate * pos_to_gate, axis=-1)
+    dipole_envelope = jnp.exp(-dist_sq / jnp.square(reward_cfg.dipole_sigma))
+    r_dipole = -reward_cfg.dipole_coef * x_local_target * dipole_envelope
+    r_dipole = jnp.where(gate_just_passed | finished, jnp.zeros_like(r_dipole), r_dipole)
 
     # v43: switch from L1 to L2 norm on body rates. Song 2023's
     # ``b · ‖ω_k‖`` is the L2 (Euclidean) magnitude; our L1 default was
     # historical drift with no documented rationale.
     r_omega = -reward_cfg.omega_coef * jnp.linalg.norm(env_obs["ang_vel"], axis=-1)
+
+    if physical_action is None or prev_physical_action is None:
+        r_smooth = jnp.zeros_like(r_prog)
+    else:
+        action_delta = physical_action - prev_physical_action
+        r_smooth = -reward_cfg.r_smooth_coef * jnp.sum(jnp.square(action_delta), axis=-1)
 
     # v10: forward-flight bias (Liu eq. 8). Penalize lateral and backward
     # body-frame velocity. Symmetric ``r_prog`` cannot distinguish a drone
@@ -376,7 +369,10 @@ def step_reward(
     # for keeping its distance whether or not the obstacle has been
     # "discovered" by the sensor.
     obstacle_barrier = jnp.exp(-obstacle_dist_sq / jnp.square(reward_cfg.obstacle_sigma))
-    r_obs = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier, axis=-1)
+    r_obs_raw = -reward_cfg.obstacle_weight * jnp.sum(obstacle_barrier, axis=-1)
+    r_obs = jnp.where(
+        jnp.asarray(reward_cfg.use_obstacle_barrier, dtype=bool), r_obs_raw, jnp.zeros_like(r_prog)
+    )
 
     # v32: Gate-frame soft barrier. Each gate's 4 opening corners (from
     # ``obs.GATE_HALF_SIZE_M``) form 4 line-segment edges in world frame.
@@ -427,7 +423,12 @@ def step_reward(
     gate_frame_barrier = gate_frame_barrier * gate_window[..., None].astype(
         gate_frame_barrier.dtype
     )
-    r_gate_frame = -reward_cfg.gate_frame_weight * jnp.sum(gate_frame_barrier, axis=(-1, -2))
+    r_gate_frame_raw = -reward_cfg.gate_frame_weight * jnp.sum(gate_frame_barrier, axis=(-1, -2))
+    r_gate_frame = jnp.where(
+        jnp.asarray(reward_cfg.use_gate_frame_barrier, dtype=bool),
+        r_gate_frame_raw,
+        jnp.zeros_like(r_prog),
+    )
 
     # Per-gate jackpot scaling (v7). At a crossing, ``target_idx`` is still the
     # pre-step target index because of the ``prev_target >= 0`` branch above,
@@ -501,9 +502,7 @@ def step_reward(
     )
     caution_target_dist = jnp.linalg.norm(gate_pos - pos, axis=-1)
     caution_kernel = jnp.exp(
-        -jnp.square(
-            (caution_target_dist - reward_cfg.caution_peak_m) / reward_cfg.caution_kernel_m
-        )
+        -jnp.square((caution_target_dist - reward_cfg.caution_peak_m) / reward_cfg.caution_kernel_m)
     )
     caution_speed = jnp.linalg.norm(env_obs["vel"], axis=-1)
     r_caution_raw = (
@@ -545,31 +544,36 @@ def step_reward(
     r_gate_frame = jnp.where(not_crash, r_gate_frame, jnp.zeros_like(r_gate_frame))
     r_guid = jnp.where(not_crash, r_guid, jnp.zeros_like(r_guid))
     r_caution = jnp.where(not_crash, r_caution, jnp.zeros_like(r_caution))
+    # v120: r_wrong_side is position-dependent (uses pos), same rationale
+    # as r_prog/r_obs/r_gate_frame/r_guid — zero on crash step to avoid
+    # spurious signal from the warp location.
+    r_wrong_side = jnp.where(not_crash, r_wrong_side, jnp.zeros_like(r_wrong_side))
+    r_dipole = jnp.where(not_crash, r_dipole, jnp.zeros_like(r_dipole))
 
     components = {
         "r_prog": r_prog,
         "r_omega": r_omega,
+        "r_smooth": r_smooth,
         "r_obs": r_obs,
         "r_gate_frame": r_gate_frame,
         "r_gate_bonus": r_gate_bonus,
         "r_exit_vel": r_exit_vel,
         "r_terminal": r_terminal,
+        "r_crash": r_crash,
+        "r_finish": r_finish,
         "r_time": r_time,
         "r_vel": r_vel,
         "r_guid": r_guid,
+        "r_wrong_side": r_wrong_side,
         "r_caution": r_caution,
+        "r_dipole": r_dipole,
     }
-    reward = (
-        r_prog
-        + r_omega
-        + r_obs
-        + r_gate_frame
-        + r_gate_bonus
-        + r_exit_vel
-        + r_terminal
-        + r_time
-        + r_vel
-        + r_guid
-        + r_caution
-    )
+    # 2026-05-29: re-activate the per-step time penalty on top of the pure-Song
+    # baseline. ``r_time`` is the only shaping term added back to the summed
+    # scalar; when ``time_penalty == 0`` it is identically 0, so the pure-Song
+    # baseline is preserved exactly. All other shaping terms remain intentionally
+    # unsummed — see docs/research/2026-05-29-reward-myopia-redesign. (Verified
+    # 2026-05-29 that the earlier tp "chain" was a no-op because r_time was not
+    # summed; lap-time gains there were progress+gamma over continued training.)
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time
     return reward, components

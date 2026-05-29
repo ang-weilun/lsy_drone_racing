@@ -20,6 +20,7 @@ from lsy_drone_racing.control.rl_song.config import (
 from lsy_drone_racing.control.rl_song.policy import (
     Critic,
     raw_to_env_action,
+    raw_to_physical_action,
     sample_and_log_prob,
     scale_tangent,
 )
@@ -373,6 +374,7 @@ class _ScanCarry(NamedTuple):
 
     env_data: EnvData
     prev_action_env_4vec: Array
+    prev_physical_action: Array
     rng_key: Array
     reset_rng_key: Array
     next_done: Array
@@ -462,13 +464,13 @@ def scan_rollout(
     static_cfg : RolloutStaticConfig
         Static rollout, reward, action, and reset configuration.
 
-    Returns
+    Returns:
     -------
     RolloutScanResult
         New env state, RNG keys, final observations, stacked rollout buffers,
         and completed-episode metric sums.
 
-    Notes
+    Notes:
     -----
     The scan calls the race-core step function directly, then computes the
     Song reward from the pre-reset post-step observation and unmasked true gate
@@ -494,6 +496,7 @@ def scan_rollout(
     initial_carry = _ScanCarry(
         env_data=env_data,
         prev_action_env_4vec=prev_action_env_4vec,
+        prev_physical_action=jnp.zeros((static_cfg.n_envs, ENV_ACTION_DIM), dtype=jnp.float32),
         rng_key=rng_key,
         reset_rng_key=reset_rng_key,
         next_done=next_done,
@@ -538,6 +541,12 @@ def scan_rollout(
             static_cfg.thrust_max,
             alpha_max=static_cfg.tangent_alpha_max_rad,
         )
+        physical_action = raw_to_physical_action(
+            raw_action,
+            static_cfg.thrust_min,
+            static_cfg.thrust_max,
+            alpha_max=static_cfg.tangent_alpha_max_rad,
+        )
         # Tangent-norm diagnostics. Kept here (rather than computed
         # post-hoc from ``raw_actions``) so the scaled-norm reuses the
         # same ``alpha_max`` the env action was projected with.
@@ -578,6 +587,8 @@ def scan_rollout(
             finished,
             gate_just_passed,
             static_cfg.reward_cfg,
+            physical_action=physical_action,
+            prev_physical_action=carry.prev_physical_action,
         )
 
         done_bool = terminated | truncated
@@ -655,6 +666,9 @@ def scan_rollout(
         # respawned pose.
         next_prev_action = jnp.where(done_bool[:, None], jnp.zeros_like(env_action), env_action)
         next_prev_action = jnp.where(do_phase2[:, None], replay_prev_action, next_prev_action)
+        next_prev_physical_action = jnp.where(
+            done_bool[:, None], jnp.zeros_like(physical_action), physical_action
+        )
         next_episode_returns = jnp.where(done_bool, 0.0, episode_returns)
         next_episode_lengths = jnp.where(done_bool, 0.0, episode_lengths)
         next_episode_max_gate = jnp.where(done_bool, 0.0, episode_max_gate)
@@ -663,6 +677,7 @@ def scan_rollout(
         next_carry = _ScanCarry(
             env_data=reset_data,
             prev_action_env_4vec=next_prev_action,
+            prev_physical_action=next_prev_physical_action,
             rng_key=rng_key,
             reset_rng_key=reset_rng_key,
             next_done=done,
@@ -936,9 +951,7 @@ def _apply_reset_perturbation(
     # segment anchors, which the framework sets to the placed layout in
     # ``build_full_track_randomization_fn`` (upstream PR #91).
     if static_cfg.segment_init_prob > 0.0:
-        env_data, rng_key = _apply_segment_init(
-            env_data, do_seg_desired, rng_key, static_cfg
-        )
+        env_data, rng_key = _apply_segment_init(env_data, do_seg_desired, rng_key, static_cfg)
         do_seg = do_seg_desired
     else:
         do_seg = jnp.zeros_like(mask, dtype=jnp.bool_)
@@ -967,7 +980,7 @@ def _apply_phase2_replay(
        nominal_gates_pos,nominal_obstacles_pos}`` for the selected envs;
        refresh aux fields via :func:`_refresh_aux_fields_after_respawn`.
 
-    Returns
+    Returns:
     -------
     env_data : EnvData
         Env state with the Phase 2 overrides (drone state + layout) applied.
@@ -1103,10 +1116,7 @@ def _apply_phase2_replay(
 
 
 def _apply_segment_init(
-    env_data: EnvData,
-    do_seg: Array,
-    rng_key: Array,
-    static_cfg: RolloutStaticConfig,
+    env_data: EnvData, do_seg: Array, rng_key: Array, static_cfg: RolloutStaticConfig
 ) -> tuple[EnvData, Array]:
     """Re-spawn the envs identified by ``do_seg`` at the target gate's entry waypoint.
 
@@ -1147,7 +1157,7 @@ def _apply_segment_init(
         Provides ``segment_init_perturb_m``, ``segment_init_vel_mps``,
         and ``reward_cfg.lookahead_entry_offset_m``.
 
-    Returns
+    Returns:
     -------
     env_data : EnvData
         Env state with ``sim_data.states.pos / vel / quat`` and ``target_gate``
@@ -1230,8 +1240,7 @@ def _apply_segment_init(
     yaw = jnp.arctan2(gate_xaxis_world[..., 1], gate_xaxis_world[..., 0])
     half_yaw = yaw * 0.5
     seg_quat = jnp.stack(
-        [jnp.zeros_like(yaw), jnp.zeros_like(yaw), jnp.sin(half_yaw), jnp.cos(half_yaw)],
-        axis=-1,
+        [jnp.zeros_like(yaw), jnp.zeros_like(yaw), jnp.sin(half_yaw), jnp.cos(half_yaw)], axis=-1
     )
     seg_quat_b = seg_quat[:, None, :]
     new_ang_vel_b = jnp.zeros_like(states.ang_vel)
@@ -1286,7 +1295,7 @@ def _refresh_aux_fields_after_respawn(
         New target-gate index. ``gates_visited`` is reconstructed
         deterministically as ``[i < new_target_gate for i in range(n_gates)]``.
 
-    Returns
+    Returns:
     -------
     EnvData
         Env state with aux fields consistent with the respawned position
@@ -1357,7 +1366,7 @@ def _compute_phase2_event(
     * the dying episode's source was not itself a Phase 2 replay (avoid
       buffer feeding itself).
 
-    Returns
+    Returns:
     -------
     event_valid : Array, shape (n_envs,), bool
     event_slot  : Array, shape (n_envs,), int32 (the new target gate index)
@@ -1435,7 +1444,7 @@ def _apply_phase2_writes(
         Number of gates on the track. Loop bound (Python int, unrolled
         by the JIT trace).
 
-    Returns
+    Returns:
     -------
     Phase2Buffer
         Updated buffer with ``ptr`` and ``fill`` advanced per slot.
@@ -1475,7 +1484,7 @@ def _apply_phase2_writes(
 def _apply_yaw_delta(quat: Array, yaw_delta: Array, mask: Array) -> Array:
     """Apply a world-frame yaw delta to xyzw quaternions in pure JAX.
 
-    Notes
+    Notes:
     -----
     The Python wrapper uses SciPy for this reset perturbation. The scanned
     rollout needs the same operation to be JAX-traceable inside ``lax.scan``.

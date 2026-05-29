@@ -11,8 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 from drone_models.core import load_params
 from jax import Array
-from ml_collections import ConfigDict
 from jax.scipy.spatial.transform import Rotation as JaxRotation
+from ml_collections import ConfigDict
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.rl_song import obs as obs_encoding
@@ -25,7 +25,7 @@ from lsy_drone_racing.control.rl_song.config import (
     TrainConfig,
     default_curriculum,
 )
-from lsy_drone_racing.control.rl_song.policy import raw_to_env_action
+from lsy_drone_racing.control.rl_song.policy import raw_to_env_action, raw_to_physical_action
 from lsy_drone_racing.control.rl_song.reward import step_reward
 from lsy_drone_racing.control.rl_song.rollout import _refresh_aux_fields_after_respawn
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
@@ -56,7 +56,7 @@ class RLSongVecEnv:
     device : {"cpu", "gpu"}, optional
         JAX device string passed to ``VecDroneRaceEnv``.
 
-    Notes
+    Notes:
     -----
     The wrapped env still autoresets internally. This wrapper observes the
     env's reset mask and applies curriculum reset perturbations to newly reset
@@ -72,6 +72,7 @@ class RLSongVecEnv:
         seed: int | None = None,
         device: str = "gpu",
     ):
+        """Initialize wrapper state and select the configured curriculum stage."""
         self.train_cfg = TrainConfig() if train_cfg is None else train_cfg
         self.curriculum = self.train_cfg.curriculum
         self.reward_cfg = self.train_cfg.reward
@@ -82,6 +83,7 @@ class RLSongVecEnv:
         self.rng_key = jax.random.PRNGKey(self.seed)
         self.normalizer = obs_encoding.init_normalizer(ACTOR_OBS_DIM)
         self.prev_action_env_4vec = jnp.zeros((self.n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+        self.prev_physical_action = jnp.zeros((self.n_envs, RAW_ACTION_DIM), dtype=jnp.float32)
         self.env: VecDroneRaceEnv | None = None
         self.stage_idx = -1
         self.stage = self._stage_from_index(
@@ -107,7 +109,7 @@ class RLSongVecEnv:
             Env seed. When provided, the wrapper's JAX reset-perturbation key is
             also reset to this seed.
 
-        Returns
+        Returns:
         -------
         observations : dict[str, Array]
             ``actor_obs`` and ``critic_obs`` arrays, each shaped
@@ -125,6 +127,7 @@ class RLSongVecEnv:
         reset_mask = jnp.ones((self.n_envs,), dtype=bool)
         self._apply_reset_perturbation(reset_mask)
         self.prev_action_env_4vec = jnp.zeros((self.n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+        self.prev_physical_action = jnp.zeros((self.n_envs, RAW_ACTION_DIM), dtype=jnp.float32)
         self.current_env_obs = self._read_env_obs()
         self.prev_env_obs = self.current_env_obs
         return self.build_observations(), info
@@ -141,7 +144,7 @@ class RLSongVecEnv:
             policy. The log probability must have already been computed
             before this call.
 
-        Returns
+        Returns:
         -------
         observations : dict[str, Array]
             Next ``actor_obs`` and ``critic_obs`` tensors.
@@ -163,6 +166,7 @@ class RLSongVecEnv:
         env_action = raw_to_env_action(
             jnp.asarray(raw_action), jnp.asarray(prev_env_obs["quat"]), thrust_min, thrust_max
         )
+        physical_action = raw_to_physical_action(jnp.asarray(raw_action), thrust_min, thrust_max)
         _validate_action_shape(env_action, self.n_envs, ENV_ACTION_DIM, "env_action")
 
         env_obs, _, terminated, truncated, env_info = self.env.step(env_action)
@@ -189,6 +193,8 @@ class RLSongVecEnv:
             true_gates_pos=self.true_gates_pos(),
             true_gates_quat=self.true_gates_quat(),
             true_obstacles_pos=self.true_obstacles_pos(),
+            physical_action=physical_action,
+            prev_physical_action=self.prev_physical_action,
         )
 
         done = terminated | truncated
@@ -198,6 +204,10 @@ class RLSongVecEnv:
 
         reset_prev_action = jnp.zeros_like(env_action)
         self.prev_action_env_4vec = jnp.where(done[:, None], reset_prev_action, env_action)
+        reset_prev_physical_action = jnp.zeros_like(physical_action)
+        self.prev_physical_action = jnp.where(
+            done[:, None], reset_prev_physical_action, physical_action
+        )
         self.prev_env_obs = self.current_env_obs
         n_gates = prev_env_obs["gates_pos"].shape[1]
         target_gate_progress = jnp.where(finished, n_gates, current_target)
@@ -219,7 +229,7 @@ class RLSongVecEnv:
     def build_observations(self) -> dict[str, Array]:
         """Build normalized actor and critic observations for current env state.
 
-        Returns
+        Returns:
         -------
         observations : dict[str, Array]
             ``actor_obs`` and ``critic_obs`` arrays with shape
@@ -241,7 +251,7 @@ class RLSongVecEnv:
         normalized_actor_obs : Array, shape (n_samples, ACTOR_OBS_DIM)
             Actor observations built with the previous normalizer state.
 
-        Notes
+        Notes:
         -----
         ``obs.py`` currently exposes only the normalized builder. The wrapper
         inverts the affine normalization before the Welford update; clipped
@@ -271,6 +281,7 @@ class RLSongVecEnv:
             self.env.close()
         self.env = self._make_env(self.stage)
         self.prev_action_env_4vec = jnp.zeros((self.n_envs, ENV_ACTION_DIM), dtype=jnp.float32)
+        self.prev_physical_action = jnp.zeros((self.n_envs, RAW_ACTION_DIM), dtype=jnp.float32)
         self.reset(seed=self.seed + stage_idx)
 
     def get_thrust_bounds(self) -> tuple[float, float]:
@@ -600,7 +611,7 @@ def make_env(
     n_envs, stage_idx, seed, device
         Forwarded to :class:`RLSongVecEnv`.
 
-    Returns
+    Returns:
     -------
     RLSongVecEnv
         Wrapped vectorized racing environment.

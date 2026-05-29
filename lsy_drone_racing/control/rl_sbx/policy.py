@@ -57,10 +57,15 @@ if TYPE_CHECKING:
 
 tfd = tfp.distributions
 
-# Hidden-layer widths for actor and critic MLPs. Match
-# ``lsy_drone_racing.control.rl_song.policy.HIDDEN_SIZE`` / ``N_HIDDEN_LAYERS``
-# so the layer geometry is identical to the v83-line policy and a manual
-# warm-start (Dense kernels copied one-for-one) is possible in principle.
+# Hidden-layer widths for actor and critic MLPs.
+# v132 (2026-05-27): reverted 512 -> 256 to match rl_song.policy.HIDDEN_SIZE.
+# Diagnosis from the rl_song-20M-vs-v131-300M trace diff: v131's deterministic
+# mean |tau|/alpha_max = 0.47 (saturating) vs rl_song's 0.08 (committed)
+# despite same env, obs encoder, and physics. Codex review localized the
+# pathology to the larger 512-wide trunk + single coupled 4D head; the
+# additional capacity drives PPO's actor mean against the tanh boundary
+# under SBX's update geometry. Pairs with the split thrust/tangent head
+# below.
 HIDDEN_SIZE: int = 256
 N_HIDDEN_LAYERS: int = 2
 NET_ARCH: tuple[int, ...] = (HIDDEN_SIZE,) * N_HIDDEN_LAYERS
@@ -113,7 +118,7 @@ class Actor(nn.Module):
     action_dim: int
     net_arch: Sequence[int]
     log_std_init: float = LOG_STD_INIT
-    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.tanh
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.leaky_relu
     ortho_init: bool = False
     features_extractor: type[nn.Module] | None = None
     features_dim: int = 0
@@ -159,31 +164,22 @@ class Actor(nn.Module):
             x = nn.Dense(n_units, kernel_init=hidden_kernel_init)(x)
             x = self.activation_fn(x)
 
-        # ``tanh`` on the mean per Song 2023 §Network and ``rl_song.policy.Actor``.
-        # Bounds the policy mean to (-1, 1) so PPO's gradient w.r.t. ``mu``
-        # stays informative — without tanh the v43 saturation diagnostics
-        # showed ``raw_norm_mean=1.87`` and 49% sample saturation, with the
-        # mean sitting outside the downstream clip boundary. The Gaussian
-        # *sample* still goes through ℝ⁴ (so log-prob is unchanged); the
-        # downstream ``raw_to_env_action`` squashes the sample into the env
-        # action range.
         if self.ortho_init:
-            mu_pre = nn.Dense(
-                self.action_dim,
-                kernel_init=nn.initializers.orthogonal(scale=0.01),
-                bias_init=nn.initializers.zeros,
-            )(x)
+            head_kernel_init = nn.initializers.orthogonal(scale=0.01)
         else:
-            mu_pre = nn.Dense(self.action_dim)(x)
-        mu = nn.tanh(mu_pre)
+            head_kernel_init = nn.initializers.lecun_normal()
+        mu = nn.tanh(
+            nn.Dense(
+                self.action_dim, kernel_init=head_kernel_init, bias_init=nn.initializers.zeros
+            )(x)
+        )
 
         log_std_raw = self.param(
             "log_std", nn.initializers.constant(self.log_std_init), (self.action_dim,)
         )
         # Floor ``log_std`` at ``LOG_STD_MIN = -2.5`` (sigma ≈ 0.082) per
         # ``rl_song.policy.LOG_STD_MIN`` — prevents PPO from collapsing the
-        # exploration noise to zero in late training, which would freeze the
-        # KL signal and stop the policy from refining.
+        # exploration noise to zero in late training.
         log_std = jnp.maximum(log_std_raw, LOG_STD_MIN)
         log_std = jnp.broadcast_to(log_std, mu.shape)
         return tfd.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_std))
@@ -206,7 +202,7 @@ class Critic(nn.Module):
     """
 
     net_arch: Sequence[int]
-    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.tanh
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.leaky_relu
     features_extractor: type[nn.Module] | None = None
     features_dim: int = 0
 
@@ -228,11 +224,19 @@ class Critic(nn.Module):
             stock SBX :class:`sbx.ppo.policies.Critic`; SBX's training loop
             calls ``.flatten()`` on the result.
         """
+        # v127 (2026-05-26): match rl_song.policy.Critic's orthogonal init.
+        # The default ``nn.Dense`` uses Flax ``lecun_normal``; on a 512→1
+        # output that gives ``V(s_0) ≈ 0`` at init, so advantages ≈ raw
+        # returns for the first ~100M steps until the critic catches up.
+        # Biases early PPO updates toward whatever pays immediate reward
+        # (hover, low body rate) — exactly the v113h-v125 failure attractor.
+        # rl_song uses ``orthogonal(sqrt(2))`` for hidden + ``orthogonal(1.0)``
+        # for the value head (`rl_song/policy.py:142-144`).
         x = obs[..., ACTOR_OBS_DIM:]
         for n_units in self.net_arch:
-            x = nn.Dense(n_units)(x)
+            x = nn.Dense(n_units, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(x)
             x = self.activation_fn(x)
-        return nn.Dense(1)(x)
+        return nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
 
 
 class AsymmetricActorCriticPolicy(PPOPolicy):
@@ -294,11 +298,12 @@ class AsymmetricActorCriticPolicy(PPOPolicy):
             if forbidden in kwargs:
                 raise ValueError(
                     f"AsymmetricActorCriticPolicy does not accept '{forbidden}'; "
-                    "the slice-aware Actor/Critic and rl_song-matched NET_ARCH are "
+                    "the slice-aware Actor/Critic and the fixed NET_ARCH are "
                     "intrinsic to this class."
                 )
 
         kwargs.setdefault("log_std_init", LOG_STD_INIT)
+        kwargs.setdefault("activation_fn", nn.leaky_relu)
 
         super().__init__(
             observation_space,

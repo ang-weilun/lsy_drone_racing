@@ -176,6 +176,10 @@ def _run_episode(
         )
 
         if video_writer is not None:
+            # First frame's viewer doesn't exist yet (Sim.render lazily creates
+            # it), so the draw_* helpers no-op silently and the first frame
+            # has no overlay. Subsequent frames overlay correctly.
+            controller.render_callback(env.unwrapped.sim)
             frame = _grab_offscreen_frame(env, camera, width, height)
             if frame is not None:
                 video_writer.append_data(frame)

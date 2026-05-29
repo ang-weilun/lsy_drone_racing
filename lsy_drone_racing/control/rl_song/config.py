@@ -37,51 +37,34 @@ ENV_ACTION_DIM: int = 4
 # raw-norm at init stays in the linear regime of the norm-tanh squash.
 TANGENT_ALPHA_MAX_RAD: float = 0.16
 
-# Actor obs decomposition (cf. design doc §6). Total 65 floats.
-ACTOR_OBS_DRONE_DIM: int = 13  # 6D rot + body-vel + body-omega + z
-ACTOR_OBS_GATE_DIM: int = 24  # 2 gates * 4 corners * 3 coords
-ACTOR_OBS_VISITED_DIM: int = 2  # visited flags for the 2 future gates
-# v45: explicit one-hot encoding of the current target_gate index. v44 video
-# evidence showed the policy hovering near gate-1's exit / gate-2's entry
-# from a true-ground-start eval (target_gate=0) — a learned attractor at a
-# geometric position the training distribution heavily reinforced as
-# "high value" via Phase-1 segment_idx=2 hovering. The cyclic-shift trick
-# (gates[0] in obs = current target) was the only "which gate is target"
-# signal; the explicit one-hot disambiguates the OOD eval state from
-# geometrically-similar Phase-1/2 training states. ``target_gate = -1``
-# (race finished) maps to all-zeros — the actor output on that step is
-# discarded by the rollout buffer.
-ACTOR_OBS_TARGET_GATE_DIM: int = 4  # one-hot over n_gates (track has 4 gates)
-ACTOR_OBS_PREV_ACTION_DIM: int = ENV_ACTION_DIM
-ACTOR_OBS_OBSTACLE_DIM: int = 16  # 4 obstacles * (3 body-frame xyz + 1 visited)
-# v35: pre-computed obstacle-danger scalars to short-circuit a cross-channel
-# interaction the policy was failing to learn from the raw obstacle channel.
-# Layout: [min_clearance_xy_m, closing_speed_to_nearest_obs_mps]. See
-# ``obs.build_actor_obs`` for the construction.
-ACTOR_OBS_PROXIMITY_DIM: int = 2
-# v74: just-passed gate corners in drone body frame. Mirrors the existing
-# target-gate corner block but for ``gate_indices[-1] = max(target_idx - 1, 0)``.
-# Added after gate-3 rim-graze investigation (2026-05-23) showed the policy
-# could not learn to clear the frame it was exiting because the actor obs
-# only included {target, next} gates — the just-passed gate the reward was
-# penalising proximity to was literally unobserved. Appended at the END of
-# the obs vector so ``_pad_first_dense_for_obs_grow`` can warm-start v56
-# weights (65 -> 77) with zero-initialised input weights for this block.
-# On ``target_idx == 0`` the clamp yields the target gate itself — degenerate
-# (redundant with target_corners_body) but valid; the policy isn't grazing
-# its own target during approach so the signal is uninformative there anyway.
-ACTOR_OBS_PREV_GATE_DIM: int = 12  # 4 corners * 3 coords
+# Track geometry: number of physical obstacles in the level-1 / level-3
+# layouts. Hard-coded; raises at runtime if the env exposes a different count.
+N_OBSTACLES: int = 4
+# Number of obstacles the actor's slot-based channel exposes (sorted by
+# body-frame XY distance). v124+ reduces from "all N_OBSTACLES in a fixed
+# per-obstacle block + global proximity scalars" to "K nearest in
+# permutation-stable slots with identity one-hot." See
+# ``obs.build_actor_obs`` for the rank-flip / discontinuity rationale.
+N_NEAREST_OBSTACLES: int = 2
+
+# Actor obs decomposition. Total 52 floats.
+ACTOR_OBS_DRONE_DIM: int = 12  # full 9D rotation matrix + body-frame velocity
+# v124 reverted the gate channel from Wang 2025's world-frame corner deltas
+# back to body-frame target corners + target-gate-frame next-gate corners
+# (the pre-Wang scheme). Same 24-d; only semantics changed. World-frame
+# forced the network to learn world->body rotation and gate-orientation
+# extraction implicitly; the recursive body/target-frame layout exposes
+# both directly. See ``obs.build_actor_obs`` lines for the v124 commentary.
+ACTOR_OBS_GATE_DIM: int = 24
+ACTOR_OBS_PREV_ACTION_DIM: int = 0
+# Per-slot obstacle: 2 body-frame xy + 1 body-frame velocity projected onto
+# unit-to-obstacle + N_OBSTACLES one-hot identity + 1 visited flag.
+_PER_OBSTACLE_SLOT_DIM: int = 2 + 1 + N_OBSTACLES + 1
+ACTOR_OBS_OBSTACLE_DIM: int = N_NEAREST_OBSTACLES * _PER_OBSTACLE_SLOT_DIM
 ACTOR_OBS_DIM: int = (
-    ACTOR_OBS_DRONE_DIM
-    + ACTOR_OBS_GATE_DIM
-    + ACTOR_OBS_VISITED_DIM
-    + ACTOR_OBS_TARGET_GATE_DIM
-    + ACTOR_OBS_PREV_ACTION_DIM
-    + ACTOR_OBS_OBSTACLE_DIM
-    + ACTOR_OBS_PROXIMITY_DIM
-    + ACTOR_OBS_PREV_GATE_DIM
+    ACTOR_OBS_DRONE_DIM + ACTOR_OBS_GATE_DIM + ACTOR_OBS_PREV_ACTION_DIM + ACTOR_OBS_OBSTACLE_DIM
 )
-assert ACTOR_OBS_DIM == 77, "Actor obs layout drifted from design doc §6"
+assert ACTOR_OBS_DIM == 52, "Actor obs layout drift"
 
 
 @dataclass(frozen=True)
@@ -454,6 +437,67 @@ class RewardConfig:
     # (degenerates back to v38j), larger pulls the drone further past
     # gate 0 before any reward gradient flips sign.
     lookahead_entry_offset_m: float = 0.5
+    # v118 (2026-05-26): upper bound on ``target_idx`` at which the
+    # next-gate entry-waypoint lookahead fires. Default 0 preserves the
+    # historical v38k semantics — only fires while approaching gate 0,
+    # biasing the gate-0 exit toward gate-1's entry. Setting to 1 also
+    # fires while approaching gate 1, biasing the gate-1 exit toward
+    # gate-2's entry — the lever for the v113h gate-2 wrong-side overshoot.
+    # The lookahead is *additionally* plane-gated by
+    # ``lookahead_near_plane_m`` to avoid the v42 mode where the
+    # next-gate pull contradicts r_prog at the current target's plane.
+    lookahead_mask_through: int = 0
+    # v118: lookahead disabled within ``lookahead_near_plane_m`` of the
+    # *target* gate's plane (on the entry side: ``x_local_target >
+    # -lookahead_near_plane_m``). At-plane is exactly the v42 failure
+    # mode where the next-gate pull bent the drone off the target's
+    # natural exit axis and clipped the target's frame. With 0.5 m the
+    # lookahead carries the early-approach shaping through to ~entry-
+    # waypoint distance, then hands off cleanly to base r_prog for the
+    # gate-pass itself.
+    lookahead_near_plane_m: float = 0.5
+    # v120 (2026-05-26): direct wrong-side penalty. Punishes the drone for
+    # being on the *exit* side of the current target gate (x_local_target > 0)
+    # — i.e., the drone has overshot the target gate's plane without passing
+    # through. This is exactly the v113h gate-2 failure mode: post-gate-1
+    # NW momentum carries the drone past gate-2's plane on the +x_local
+    # side, then it tries to come back east through the frame. r_prog (any
+    # variant tested) does not punish this attractor; lookahead shapes only
+    # the *approach* trajectory. r_wrong_side directly punishes the failure
+    # state.
+    # Per-step penalty: ``-wrong_side_coef * max(x_local_target, 0)``.
+    # At wrong_side_coef=1.0 and avg x_local=0.5 m, that's -0.5/step,
+    # integrating to ~-30 over a 60-step wrong-side episode — large
+    # relative to r_prog's +18 wrong-side gain. Tuned so that net reward
+    # of "partial+wrong-side-crash" stays above the "hover" attractor
+    # (else the policy would abandon gate-2 entirely): with gate-pass
+    # bonuses (+10 for g0, +20 for g1) and time penalty (-24 over 240
+    # steps), net ≈ -9, still above hover's -50.
+    wrong_side_coef: float = 0.0
+    # Target index at which wrong-side penalty starts applying. Default 1
+    # skips gate 0 (the spawn-side, where x_local_g0 is solidly negative
+    # by construction and an overshoot is unlikely). For diagnostic
+    # sweeps that want to penalize gate-0 overshoots too, set to 0.
+    wrong_side_target_min: int = 1
+    # v122 (2026-05-25): Dipole progress reward — a signed Gaussian-
+    # localized potential around the current target gate. Replaces
+    # r_prog's direction-agnostic distance-delta with a field that is
+    # *positive* on the approach side (x_local_target < 0) and
+    # *negative* on the exit side (x_local_target > 0), both localized
+    # within ``dipole_sigma`` of the gate center. Formula:
+    #   r_dipole = -coef * x_local_target * exp(-||p - gate||^2 / sigma^2)
+    # Designed to fix v113h/v117/v120/v121's gate-2 wrong-side attractor:
+    # bare r_prog rewards the geometrically-shortest path to gate center
+    # regardless of side, so when gate-1 exit momentum points toward
+    # gate-2's back side, the policy accumulates positive r_prog by
+    # sliding into the wrong-side region. The dipole's back lobe charges
+    # per-step for being there, breaking the attractor structurally.
+    # Default 0.0 leaves the term inert; v122 launches with coef≈1-3.
+    dipole_coef: float = 0.0
+    # Gaussian envelope length scale. ``sigma=0.5 m`` makes the lobes
+    # essentially zero beyond ~1 m from the gate center, comparable to
+    # the gate aperture diameter (0.4 m) plus a near-field margin.
+    dipole_sigma: float = 0.5  # m
     # v15: down to 0.01 to match Song 2023's exact body-rate coefficient.
     # The 0.02 value here was justified earlier as the 50 Hz analogue of
     # Song's 100 Hz 0.01, but Song 2023 quotes b = 0.01 without specifying
@@ -493,6 +537,10 @@ class RewardConfig:
     # r_omega at ‖ω‖₂ ≈ 3 rad/s is ~-0.06 vs r_prog ~0.1 — within Song's
     # own balance.
     omega_coef: float = 0.02
+    # Coefficient for action smoothness on the physical action intermediate
+    # ``[tau_scaled_rad, thrust_N]``. Left at zero so launch configs can tune
+    # the mixed radian/newton scale explicitly.
+    r_smooth_coef: float = 0.0
     # v15: 5.0 -> 10.0 to match Song 2023 r_crash = -10.0.
     # v17: back to 5.0. The v15 raise to 10.0 (combined with progress_coef
     # = 1) made the per-episode crash penalty dominate the per-episode
@@ -640,6 +688,7 @@ class RewardConfig:
     # learns avoidance only through the -10 crash penalty without this
     # term — this is exactly the test of whether Song's minimum recipe
     # generalizes to a track with obstacles.
+    use_obstacle_barrier: bool = False
     obstacle_weight: float = 0.0
     # v34: 0.3 -> 0.5. v33b eval traces showed the policy was effectively
     # ignoring the obstacle channel: in 3/8 eval episodes the drone flew a
@@ -699,6 +748,17 @@ class RewardConfig:
     # commitment behaviour. v7a's recipe had no gate-frame barrier and
     # solved level 1 to 100 % deterministic finish in 100M steps.
     # Disabled for v38f cold-train.
+    # v121 (2026-05-25): the obs channel that supported r_gate_frame
+    # (v74's ``prev_corners_body``, just-passed gate corners in drone
+    # body frame) was removed when the obs was stripped to the Wang 2025
+    # §IV-A layout. ``r_gate_frame`` still computes correctly from
+    # ``env_obs.gates_pos/quat``, but the policy no longer observes the
+    # geometry it is being penalized for — turning this back on without
+    # re-adding the supporting obs channel produces a free-floating
+    # negative gradient correlated with a state the policy has no
+    # representation of. Keep at 0.0; re-enable only with a coupled
+    # obs-channel restoration.
+    use_gate_frame_barrier: bool = False
     gate_frame_weight: float = 0.0
     gate_frame_sigma: float = 0.08  # m
     # v9: shrink gate jackpot from 20 to 2. The v7/v8 jackpot of 20×(idx+1)
@@ -773,7 +833,7 @@ class RewardConfig:
     # place, the jackpot provides the *positive* gradient toward
     # gate-passing that bare Song's distance-delta r_prog (which
     # plateaus at the gate plane) doesn't.
-    use_gate_pass_bonus: bool = True
+    use_gate_pass_bonus: bool = False
     # v9: disable per-gate scaling. Uniform 2/2/2/2 instead of 2/4/6/8 removes
     # the incentive to rush past earlier gates to bank the larger later-gate
     # jackpot. The dense progress reward already pulls the policy through
@@ -956,7 +1016,7 @@ class RewardConfig:
     # hovering's per-episode return drops from ~-5 to ~-30, strictly
     # worse than even a crash (-10). Policy is now incentivised to either
     # finish (+16.6 net at progress_coef=1.0) or attempt-and-crash (-10).
-    time_penalty: float = 0.05
+    time_penalty: float = 0.0
     # v10: forward-flight bias in body frame (Liu eq. 8). Off by default.
     # Liu motivation is sensor-cone alignment under a 90 deg FPV depth camera
     # (the drone must point its FOV where it is going to perceive obstacles).
@@ -1029,7 +1089,7 @@ class RewardConfig:
     # rather than over-fly-and-hover. guide_coef=0.5 is the v21-validated
     # working magnitude; field shape uses default guide_k0=3.0, k1=1.0,
     # k2=0.3.
-    use_guide: bool = True
+    use_guide: bool = False
     # v13B: bumped 0.15 -> 2.0 in tandem with the switch to Δ-potential
     # shaping (see ``use_guide_delta_phi`` below). Under ΔΦ the integrated
     # r_guid over a perfectly centered pass is approximately guide_coef,
