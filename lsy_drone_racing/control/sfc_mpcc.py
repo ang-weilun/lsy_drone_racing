@@ -51,10 +51,9 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     p_c_x = cs.MX.sym("c_x", 4)
     p_c_y = cs.MX.sym("c_y", 4)
     p_c_z = cs.MX.sym("c_z", 4)
-    p_obs = cs.MX.sym("obs", 12)
-    p_rsafe = cs.MX.sym("rsafe")
+    p_capsules = cs.MX.sym("capsules", 10 * 7)
     
-    p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_obs, p_rsafe)
+    p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules)
 
     t_val = theta - p_theta_i
     p_d_x = p_c_x[0]*t_val**3 + p_c_x[1]*t_val**2 + p_c_x[2]*t_val + p_c_x[3]
@@ -93,12 +92,25 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         X[9:12]
     )
 
-    h_expr = cs.MX.zeros(4)
-    for i in range(4):
-        obs_x = p_obs[i*3 + 0]
-        obs_y = p_obs[i*3 + 1]
-        obs_z = p_obs[i*3 + 2]
-        h_expr[i] = (pos[0] - obs_x)**2 + (pos[1] - obs_y)**2 + (pos[2] - obs_z)**2 - p_rsafe**2
+    h_expr = cs.MX.zeros(10)
+    for i in range(10):
+        p1 = p_capsules[i*7 + 0 : i*7 + 3]
+        p2 = p_capsules[i*7 + 3 : i*7 + 6]
+        r  = p_capsules[i*7 + 6]
+        
+        v = p2 - p1
+        w = pos - p1
+        
+        v_dot_v = cs.dot(v, v)
+        v_dot_v_safe = cs.if_else(v_dot_v > 1e-6, v_dot_v, 1e-6)
+        
+        t = cs.dot(w, v) / v_dot_v_safe
+        t = cs.fmax(0.0, cs.fmin(1.0, t))
+        
+        closest_pt = p1 + t * v
+        diff = pos - closest_pt
+        
+        h_expr[i] = cs.dot(diff, diff) - r**2
 
     model = AcadosModel()
     model.name = "sfc_mpcc_model"
@@ -158,7 +170,7 @@ def create_ocp_solver(
     ocp.cost.W = W
     ocp.cost.W_e = W_e
 
-    mu = 10.0
+    mu = 15.0
     v_ref = mu / W_v_theta
 
     yref = np.zeros(ny)
@@ -181,10 +193,25 @@ def create_ocp_solver(
 
     ocp.constraints.x0 = np.zeros(nx)
 
-    ocp.constraints.lh = np.zeros(4)
-    ocp.constraints.uh = 1e6 * np.ones(4)
-    ocp.constraints.lh_e = np.zeros(4)
-    ocp.constraints.uh_e = 1e6 * np.ones(4)
+    ocp.constraints.lh = np.zeros(10)
+    ocp.constraints.uh = 1e6 * np.ones(10)
+    ocp.constraints.lh_e = np.zeros(10)
+    ocp.constraints.uh_e = 1e6 * np.ones(10)
+
+    # Configure slack variables for collision avoidance
+    ocp.constraints.idxsh = np.arange(10)
+    ocp.constraints.idxsh_e = np.arange(10)
+
+    # Slack variable penalties
+    ocp.cost.Zl = 200.0 * np.ones(10)
+    ocp.cost.Zu = 200.0 * np.ones(10)
+    ocp.cost.zl = 2000.0 * np.ones(10)
+    ocp.cost.zu = 2000.0 * np.ones(10)
+
+    ocp.cost.Zl_e = 200.0 * np.ones(10)
+    ocp.cost.Zu_e = 200.0 * np.ones(10)
+    ocp.cost.zl_e = 2000.0 * np.ones(10)
+    ocp.cost.zu_e = 2000.0 * np.ones(10)
 
     ocp.parameter_values = np.zeros(np_dim)
 
@@ -221,13 +248,6 @@ class AttitudeMPC(Controller):
         self.planner = SfcCorridorPlanner(obs, config.env.freq)
         self._update_spline()
 
-        obstacles_config = config.env.track.get("obstacles", [])
-        self._obstacles = np.zeros((4, 3))
-        for i in range(min(4, len(obstacles_config))):
-            self._obstacles[i] = obstacles_config[i]["pos"]
-            
-        self._r_safe = 0.15 # Minimum safe distance squared logic? No, this is radius.
-
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params
@@ -254,8 +274,10 @@ class AttitudeMPC(Controller):
         self._s_total = float(s[-1])
 
     def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
-        if self.planner.update(obs):
+        replanned = self.planner.update(obs)
+        if replanned:
             self._update_spline()
+            self._current_theta = 0.0
 
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
@@ -265,7 +287,20 @@ class AttitudeMPC(Controller):
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
 
-        if self._tick > 0:
+        capsule_params = np.zeros(70)
+        if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
+            capsules = self.planner.capsules
+            if len(capsules) > 0:
+                midpoints = np.array([(cap.p1 + cap.p2) / 2.0 for cap in capsules])
+                dists_to_caps = np.linalg.norm(midpoints - pos, axis=1)
+                closest_idx = np.argsort(dists_to_caps)[:10]
+                for i, idx in enumerate(closest_idx):
+                    cap = capsules[idx]
+                    capsule_params[i*7 : i*7+3] = cap.p1
+                    capsule_params[i*7+3 : i*7+6] = cap.p2
+                    capsule_params[i*7+6] = cap.radius
+
+        if self._tick > 0 and not replanned:
             x_prev = self._acados_ocp_solver.get(1, "x")
             self._current_theta = float(x_prev[12])
             self._current_v_theta = float(x_prev[13])
@@ -300,8 +335,7 @@ class AttitudeMPC(Controller):
             p_j = np.concatenate((
                 [theta_i],
                 c_x, c_y, c_z,
-                self._obstacles.flatten(),
-                [self._r_safe]
+                capsule_params
             ))
             
             self._acados_ocp_solver.set(j, "p", p_j)
