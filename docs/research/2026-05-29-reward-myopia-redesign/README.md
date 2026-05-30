@@ -232,6 +232,31 @@ via the aperture normalisation, but `guidance_x_thresh` (3 m) and the co-equal
 - *(pending)* — Geometric-fix implementation (one term added to the pure-Song
   sum); verification on scripted reverse-out / side-clip trajectories before PPO;
   measured effect on reverse-out / frame-clip and on L3 finish-rate / lap-time.
+- **2026-05-30 — implemented + run; net-neutral result.** Built **Path A** as
+  guiding-path arc-length progress (`exit_{K-1}→entry_K→center_K`, Bézier-smoothed)
+  + the gate-frame barrier, bundled because arc-length progress is **telescoping**
+  (route-independent integral ⇒ progress alone can't clear the just-passed frame;
+  Codex review). Plan + Codex review in `docs/superpowers/{plans,reviews}/`. A
+  scripted-trajectory diagnostic (committed `scripts/diag_path_progress_reward.py`)
+  PASSED before PPO (reverse step penalised −1.0, side-clip lateral 0.0, telescoping
+  19.99=19.99, zero-on-pass 0). Two warm-start runs on the 5090 (200M each):
+  - **L2-first validation** (warm-start spd6, **critic reset**, α=1.2): best ckpt
+    (20M) = 96 % @ 3.45 s ≈ spd6 (neutral, doesn't break L2); SR then **decayed**
+    96→78 % over training with `explained_variance` **0.084** — full critic reset
+    is too aggressive at 200M.
+  - **L3 push** (warm-start round7, **warm critic**, round7 recipe α=0.32/ω=0.01 +
+    fix): trained **stably** — `explained_variance` **0.642**, stable finish-rate.
+    Head-to-head L3 stochastic eval (50 clean seeds): **25/50 vs round7 26/50** —
+    statistically identical (±7 % SE). The fix shifted *which* seeds pass but did
+    **not** move aggregate L3 finish-rate at d=0.4 / gate_frame_weight=0.5 / 200M.
+  - **Findings:** (1) warm critic ≫ reset critic for a reward-geometry change
+    (0.642 vs 0.084 explained-variance). (2) The fix is correct and stable but
+    **net-neutral on L3** at these coefficients — likely too gentle and/or 200M
+    warm-start too short to overcome round7's 2.2B-step optimum, OR reverse-out/clip
+    is not the dominant crash cause on the clean-seed set. **Next:** render crash
+    seeds to confirm the failure mode before retuning (stronger d/weight, longer
+    training, or add wrong-side rejection). round7 remains the L3 baseline (no
+    SOTA gain); checkpoints not promoted.
 
 ## 8. Caveats on citations
 
