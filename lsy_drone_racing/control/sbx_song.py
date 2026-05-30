@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 TOTAL_THRUST_MULTIPLIER: float = 4.0
 
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT: str = "checkpoints/L2_finetune"
+DEFAULT_CHECKPOINT: str = "checkpoints/L2_spd_v2"
 _MISSING: Any = object()
 
 
