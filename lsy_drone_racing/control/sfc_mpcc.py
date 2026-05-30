@@ -170,7 +170,7 @@ def create_ocp_solver(
     ocp.cost.W = W
     ocp.cost.W_e = W_e
 
-    mu = 15.0
+    mu = 20.0
     v_ref = mu / W_v_theta
 
     yref = np.zeros(ny)
@@ -288,6 +288,7 @@ class AttitudeMPC(Controller):
         self._current_theta = float(s_eval[np.argmin(dists)])
 
         capsule_params = np.zeros(70)
+        is_gate_flags = np.zeros(10, dtype=bool)
         if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
             capsules = self.planner.capsules
             if len(capsules) > 0:
@@ -299,6 +300,25 @@ class AttitudeMPC(Controller):
                     capsule_params[i*7 : i*7+3] = cap.p1
                     capsule_params[i*7+3 : i*7+6] = cap.p2
                     capsule_params[i*7+6] = cap.radius
+                    is_gate_flags[i] = getattr(cap, "is_gate", False)
+
+        Zl = 200.0 * np.ones(10)
+        Zu = 200.0 * np.ones(10)
+        zl = 2000.0 * np.ones(10)
+        zu = 2000.0 * np.ones(10)
+
+        for i in range(10):
+            if is_gate_flags[i]:
+                Zl[i] = 10.0
+                Zu[i] = 10.0
+                zl[i] = 100.0
+                zu[i] = 100.0
+
+        for j in range(1, self._N + 1):
+            self._acados_ocp_solver.cost_set(j, "Zl", Zl)
+            self._acados_ocp_solver.cost_set(j, "Zu", Zu)
+            self._acados_ocp_solver.cost_set(j, "zl", zl)
+            self._acados_ocp_solver.cost_set(j, "zu", zu)
 
         if self._tick > 0 and not replanned:
             x_prev = self._acados_ocp_solver.get(1, "x")
@@ -320,10 +340,14 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
+        gates_pos = getattr(self.planner, "gates_pos", None)
+
         for j in range(self._N + 1):
             theta_j = self._current_theta + j * self._dt * self._current_v_theta
             theta_j = np.clip(theta_j, 0, self._s_total)
             
+            p_j_pos = self._des_pos_spline(theta_j)
+
             segment = np.searchsorted(self._des_pos_spline.x, theta_j, side="right") - 1
             segment = np.clip(segment, 0, len(self._des_pos_spline.x) - 2)
             
@@ -339,6 +363,23 @@ class AttitudeMPC(Controller):
             ))
             
             self._acados_ocp_solver.set(j, "p", p_j)
+
+            Q_c_base = 150.0
+            Q_c_dynamic = Q_c_base
+            if gates_pos is not None and len(gates_pos) > 0:
+                dists_to_gates = np.linalg.norm(gates_pos - p_j_pos, axis=1)
+                min_dist = np.min(dists_to_gates)
+                # Increase the contouring error penalty as the predicted position gets closer
+                # to any gate, with a Gaussian-shaped increase
+                # Starts increasing significantly when within ~0.2m of a gate,
+                # and maxes out at 3000 when very close
+                Q_c_dynamic += 3000.0 * np.exp(-(min_dist**2) / (2 * 0.2**2))
+            
+            W = self._acados_ocp_solver.cost_get(j, "W")
+            W[0, 0] = Q_c_dynamic
+            W[1, 1] = Q_c_dynamic
+            W[2, 2] = Q_c_dynamic
+            self._acados_ocp_solver.cost_set(j, "W", W)
 
         status = self._acados_ocp_solver.solve()
         if status != 0:
