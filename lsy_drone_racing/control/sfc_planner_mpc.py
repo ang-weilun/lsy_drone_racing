@@ -188,11 +188,8 @@ class SfcCorridorPlanner:
         # Update current projection on spline
         self._current_t = self._find_closest_t(obs["pos"])
 
-        # 2. Detect movement or gate change
+        # 2. Detect movement
         moved, reason = self._check_objects_moved(obs)
-        if gate_changed:
-            moved = True
-            reason = "gate_passed"
 
         if not moved:
             return False
