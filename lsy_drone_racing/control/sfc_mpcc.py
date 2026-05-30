@@ -6,6 +6,7 @@ state vector with path progress and virtual velocity, and enforces obstacle avoi
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -21,6 +22,8 @@ import casadi as cs
 from crazyflow.sim.visualize import draw_capsule, draw_line, draw_points
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.sfc_planner_mpc import SfcCorridorPlanner
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -339,7 +342,31 @@ class AttitudeMPC(Controller):
         
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
-
+        '''
+        # Warm-start the state trajectory if tick is 0 or we just replanned
+        if self._tick == 0 or replanned:
+            for j in range(self._N + 1):
+                if j == 0:
+                    x_guess = x0
+                else:
+                    theta_guess = self._current_theta + j * self._dt * self._current_v_theta
+                    theta_guess = np.clip(theta_guess, 0, self._s_total)
+                    pos_guess = self._des_pos_spline(theta_guess)
+                    
+                    # Blend initial position and reference
+                    alpha = min(1.0, j / 5.0)
+                    blended_pos = (1 - alpha) * obs["pos"] + alpha * pos_guess
+                    
+                    x_guess = np.concatenate((
+                        blended_pos,
+                        obs["rpy"] * (1 - alpha),  # Blend rpy
+                        obs["vel"] * (1 - alpha),  # Blend vel
+                        obs["drpy"] * (1 - alpha), # Blend drpy
+                        [theta_guess],
+                        [self._current_v_theta]
+                    ))
+                self._acados_ocp_solver.set(j, "x", x_guess)
+        '''
         gates_pos = getattr(self.planner, "gates_pos", None)
 
         for j in range(self._N + 1):
@@ -371,9 +398,9 @@ class AttitudeMPC(Controller):
                 min_dist = np.min(dists_to_gates)
                 # Increase the contouring error penalty as the predicted position gets closer
                 # to any gate, with a Gaussian-shaped increase
-                # Starts increasing significantly when within ~0.2m of a gate,
-                # and maxes out at 3000 when very close
-                Q_c_dynamic += 3000.0 * np.exp(-(min_dist**2) / (2 * 0.2**2))
+                # Starts increasing significantly when within ~0.4m of a gate,
+                # and maxes out at 8000 when very close
+                Q_c_dynamic += 8000.0 * np.exp(-(min_dist**2) / (2 * 0.4**2))
             
             W = self._acados_ocp_solver.cost_get(j, "W")
             W[0, 0] = Q_c_dynamic
@@ -382,8 +409,37 @@ class AttitudeMPC(Controller):
             self._acados_ocp_solver.cost_set(j, "W", W)
 
         status = self._acados_ocp_solver.solve()
-        if status != 0:
-            pass
+        if status not in [0, 2]:
+            logger.warning(f"MPCC solver failed with status {status}. Entering hover mode.")
+            if not hasattr(self, "_hover_pos"):
+                self._hover_pos = obs["pos"].copy()
+            
+            pos_error = self._hover_pos - obs["pos"]
+            vel_error = -obs["vel"]
+            
+            kp = np.array([0.4, 0.4, 1.25])
+            kd = np.array([0.2, 0.2, 0.4])
+            
+            target_thrust = kp * pos_error + kd * vel_error
+            target_thrust[2] += self.drone_params["mass"] * abs(self.drone_params["gravity_vec"][-1])
+            
+            z_axis = R.from_quat(obs["quat"]).as_matrix()[:, 2]
+            thrust_desired = np.dot(target_thrust, z_axis)
+            
+            z_axis_desired = target_thrust / np.linalg.norm(target_thrust)
+            des_yaw = obs["rpy"][2]
+            x_c_des = np.array([np.cos(des_yaw), np.sin(des_yaw), 0.0])
+            y_axis_desired = np.cross(z_axis_desired, x_c_des)
+            y_axis_desired /= np.linalg.norm(y_axis_desired)
+            x_axis_desired = np.cross(y_axis_desired, z_axis_desired)
+            
+            R_desired = np.vstack([x_axis_desired, y_axis_desired, z_axis_desired]).T
+            euler_desired = R.from_matrix(R_desired).as_euler("xyz", degrees=False)
+            
+            return np.concatenate([euler_desired, [thrust_desired]], dtype=np.float32)
+        else:
+            if hasattr(self, "_hover_pos"):
+                del self._hover_pos
             
         u0 = self._acados_ocp_solver.get(0, "u")
         return u0[0:4]
@@ -396,6 +452,8 @@ class AttitudeMPC(Controller):
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        if hasattr(self, "_hover_pos"):
+            del self._hover_pos
         self.planner.episode_reset()
 
     def render_callback(self, sim: object) -> None:
