@@ -287,7 +287,17 @@ class SfcCorridorPlanner:
     def _find_closest_t(self, pos: NDArray) -> float:
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
             return 0.0
-        u_samples = np.linspace(0, 1, 100)
+            
+        if hasattr(self, "_current_t") and getattr(self, "_t_total", 0) > 0:
+            if self._t_to_u is not None:
+                current_u = float(self._t_to_u(min(self._current_t, self._t_total)))
+            else:
+                current_u = self._current_t / self._t_total
+            current_u = float(np.clip(current_u, 0.0, 1.0))
+            u_samples = np.linspace(max(0.0, current_u - 0.1), min(1.0, current_u + 0.3), 100)
+        else:
+            u_samples = np.linspace(0, 1, 100)
+
         pts = self._des_pos_spline(u_samples)
         dists = np.linalg.norm(pts - pos, axis=1)
         u_closest = float(u_samples[np.argmin(dists)])
@@ -400,6 +410,8 @@ class SfcCorridorPlanner:
             logger.warning("TOPP scheduling failed (%s); falling back to uniform schedule.", exc)
             self._t_to_u = None
             self._t_total = float(np.sum(cp_dists) / self.base_speed)
+
+        self._current_t = 0.0
 
     def _compute_time_schedule(self, spline: BSpline, v_start: float) -> tuple[CubicSpline, float]:
         """TOPP-style time parameterization: build a t→u cubic spline.
