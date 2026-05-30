@@ -368,6 +368,7 @@ class AttitudeMPC(Controller):
                 self._acados_ocp_solver.set(j, "x", x_guess)
         '''
         gates_pos = getattr(self.planner, "gates_pos", None)
+        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
 
         for j in range(self._N + 1):
             theta_j = self._current_theta + j * self._dt * self._current_v_theta
@@ -393,14 +394,14 @@ class AttitudeMPC(Controller):
 
             Q_c_base = 150.0
             Q_c_dynamic = Q_c_base
-            if gates_pos is not None and len(gates_pos) > 0:
-                dists_to_gates = np.linalg.norm(gates_pos - p_j_pos, axis=1)
-                min_dist = np.min(dists_to_gates)
+            if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
+                target_gate_pos = gates_pos[target_gate_idx]
+                dist_to_target_gate = np.linalg.norm(target_gate_pos - p_j_pos)
                 # Increase the contouring error penalty as the predicted position gets closer
-                # to any gate, with a Gaussian-shaped increase
-                # Starts increasing significantly when within ~0.4m of a gate,
+                # to the target gate, with a Gaussian-shaped increase
+                # Starts increasing significantly when within ~0.4m of the gate,
                 # and maxes out at 8000 when very close
-                Q_c_dynamic += 8000.0 * np.exp(-(min_dist**2) / (2 * 0.4**2))
+                Q_c_dynamic += 8000.0 * np.exp(-(dist_to_target_gate**2) / (2 * 0.4**2))
             
             W = self._acados_ocp_solver.cost_get(j, "W")
             W[0, 0] = Q_c_dynamic
