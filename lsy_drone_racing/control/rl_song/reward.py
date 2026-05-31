@@ -698,20 +698,10 @@ def step_reward(
     # pole keep-out actually shape the policy — L3 failures are obstacle-collision
     # dominated (see the reward-myopia-l3-findings analysis), and this is the term
     # meant to address them.
-    # r_exit_vel is gated by use_exit_vel_bonus (-> 0 when disabled) and fires only on
-    # the gate-pass step (naturally 0 on crash, no crash-mask needed). Same activation
-    # gap as r_obs: it was computed-but-never-summed. Summing it rewards carrying speed
-    # through gates toward the next one — the time-optimal / racing-line incentive for
-    # cutting lap time (handoff "chase 3.8 s" lever).
-    reward = (
-        r_prog
-        + r_omega
-        + r_smooth
-        + r_crash
-        + r_finish
-        + r_time
-        + r_gate_frame
-        + r_obs
-        + r_exit_vel
-    )
+    # NOTE: r_exit_vel (exit-velocity bonus) was trialled in the summed reward
+    # (2026-05-31 iteration 4, exit_vel_coef=5, warm relB on the relBobs03 recipe) and
+    # DISCARDED: it dropped L3 SR ~81% -> ~73% and did NOT improve lap time (the bonus
+    # rewards instantaneous gate-cross speed, so the policy overshoots / goes wrong-side
+    # at multiple gates and the survivors burn time recovering). Left out of the sum.
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame + r_obs
     return reward, components

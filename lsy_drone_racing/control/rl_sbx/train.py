@@ -36,8 +36,8 @@ from pathlib import Path
 
 import fire
 from stable_baselines3.common.callbacks import BaseCallback
-import wandb
 
+import wandb
 from lsy_drone_racing.control.rl_sbx.callbacks import (
     EntropyAnnealCallback,
     NormalizerUpdateCallback,
@@ -132,8 +132,6 @@ def train(
     time_penalty: float = 0.10,
     guide_coef: float = 0.5,
     gate_pass_bonus: float = 10.0,
-    use_exit_vel_bonus: bool = False,
-    exit_vel_coef: float = 10.0,
     gate_frame_weight: float = 0.0,
     obstacle_weight: float = 0.0,
     use_obstacle_barrier: bool = False,
@@ -254,8 +252,6 @@ def train(
         progress_coef=progress_coef,
         guide_coef=guide_coef,
         gate_pass_bonus=gate_pass_bonus,
-        use_exit_vel_bonus=use_exit_vel_bonus,
-        exit_vel_coef=exit_vel_coef,
         gate_frame_weight=gate_frame_weight,
         obstacle_weight=obstacle_weight,
         use_obstacle_barrier=use_obstacle_barrier,
