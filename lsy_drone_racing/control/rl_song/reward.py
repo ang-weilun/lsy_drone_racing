@@ -281,9 +281,10 @@ def step_reward(
     components : dict[str, Array]
         Per-component rewards. Terms summed into ``reward`` are ``r_prog``,
         ``r_omega``, ``r_smooth``, ``r_crash``, ``r_finish``, ``r_time``
-        (identically 0 when ``time_penalty == 0``), and ``r_gate_frame``
-        (identically 0 unless ``use_gate_frame_barrier`` is set). All other
-        component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``, ``r_obs``,
+        (identically 0 when ``time_penalty == 0``), ``r_gate_frame``
+        (identically 0 unless ``use_gate_frame_barrier`` is set), and ``r_obs``
+        (identically 0 unless ``use_obstacle_barrier`` is set). All other
+        component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``,
         ``r_gate_bonus``, ``r_exit_vel``, ``r_vel``, ``r_caution``,
         ``r_terminal``) are diagnostic only and NOT summed — add them to the
         ``reward = ...`` line to activate.
@@ -689,5 +690,12 @@ def step_reward(
     # is identical to the pure-Song baseline unless the barrier is turned on. Bundled
     # with guiding-path progress because arc-length progress is telescoping and cannot
     # clear the just-passed frame on its own — see the plan Architecture / Codex review.
-    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame
+    # r_obs is likewise gated by use_obstacle_barrier (-> 0 when disabled). It was
+    # computed-but-never-summed until 2026-05-31: the --use-obstacle-barrier CLI flag
+    # (de3364b) only flipped the gate inside the component, so every campaign run that
+    # passed it still trained with a no-op obstacle term. Summing it here makes the XY
+    # pole keep-out actually shape the policy — L3 failures are obstacle-collision
+    # dominated (see the reward-myopia-l3-findings analysis), and this is the term
+    # meant to address them.
+    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame + r_obs
     return reward, components
