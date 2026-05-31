@@ -282,10 +282,11 @@ def step_reward(
         Per-component rewards. Terms summed into ``reward`` are ``r_prog``,
         ``r_omega``, ``r_smooth``, ``r_crash``, ``r_finish``, ``r_time``
         (identically 0 when ``time_penalty == 0``), ``r_gate_frame``
-        (identically 0 unless ``use_gate_frame_barrier`` is set), and ``r_obs``
-        (identically 0 unless ``use_obstacle_barrier`` is set). All other
+        (identically 0 unless ``use_gate_frame_barrier`` is set), ``r_obs``
+        (identically 0 unless ``use_obstacle_barrier`` is set), and ``r_exit_vel``
+        (identically 0 unless ``use_exit_vel_bonus`` is set). All other
         component keys (``r_guid``, ``r_dipole``, ``r_wrong_side``,
-        ``r_gate_bonus``, ``r_exit_vel``, ``r_vel``, ``r_caution``,
+        ``r_gate_bonus``, ``r_vel``, ``r_caution``,
         ``r_terminal``) are diagnostic only and NOT summed — add them to the
         ``reward = ...`` line to activate.
 
@@ -697,5 +698,20 @@ def step_reward(
     # pole keep-out actually shape the policy — L3 failures are obstacle-collision
     # dominated (see the reward-myopia-l3-findings analysis), and this is the term
     # meant to address them.
-    reward = r_prog + r_omega + r_smooth + r_crash + r_finish + r_time + r_gate_frame + r_obs
+    # r_exit_vel is gated by use_exit_vel_bonus (-> 0 when disabled) and fires only on
+    # the gate-pass step (naturally 0 on crash, no crash-mask needed). Same activation
+    # gap as r_obs: it was computed-but-never-summed. Summing it rewards carrying speed
+    # through gates toward the next one — the time-optimal / racing-line incentive for
+    # cutting lap time (handoff "chase 3.8 s" lever).
+    reward = (
+        r_prog
+        + r_omega
+        + r_smooth
+        + r_crash
+        + r_finish
+        + r_time
+        + r_gate_frame
+        + r_obs
+        + r_exit_vel
+    )
     return reward, components
