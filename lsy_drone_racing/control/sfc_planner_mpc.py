@@ -42,6 +42,10 @@ class Capsule(NamedTuple):
 class FlightCorridor:
     """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
 
+    LIMIT_LOW = np.array([-2.5, -1.5, 0.0])
+    LIMIT_HIGH = np.array([2.5, 1.5, 2.0])
+    BUFFER = 0.10
+
     def __init__(self, p1: NDArray, p2: NDArray) -> None:
         """Initialize a flight corridor between two waypoints.
 
@@ -191,12 +195,15 @@ class SfcCorridorPlanner:
         # 2. Detect movement
         moved, reason = self._check_objects_moved(obs)
 
-        if not moved:
+        if not moved and not gate_changed:
             return False
         if self._tick - self._last_replan_tick < self.REPLAN_DEBOUNCE_TICKS:
             return False
         if self.target_gate_idx >= len(self.gates_pos) and not gate_changed:
             return False
+
+        if not moved and gate_changed:
+            reason = "gate_passed"
 
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
         self._last_replan_tick = self._tick
@@ -209,10 +216,10 @@ class SfcCorridorPlanner:
 
     def evaluate_corridor(self, t_offset: float) -> tuple[NDArray, NDArray] | None:
         """Returns the (A, b) matrices for the flight corridor at time t_offset.
-        
+
         Args:
             t_offset: Time in seconds into the future.
-            
+
         Returns:
             Tuple (A, b) representing A*x <= b, or None if no corridor is active.
         """
@@ -240,17 +247,17 @@ class SfcCorridorPlanner:
         n_segments = len(self.corridors)
         seg_idx = int(np.floor(u * n_segments))
         seg_idx = min(seg_idx, n_segments - 1)
-        
+
         A = np.array(self.corridors[seg_idx].A)
         b = np.array(self.corridors[seg_idx].b)
         return A, b
 
     def evaluate_spatial(self, u: float) -> tuple[NDArray, NDArray, NDArray, NDArray]:
         """Evaluate spatial B-spline derivatives w.r.t parameter u.
-        
+
         Args:
             u: Path parameter [0, 1].
-            
+
         Returns:
             pos: (3,) Position
             dpos: (3,) First derivative dr/du
@@ -262,12 +269,12 @@ class SfcCorridorPlanner:
             return cp_last, np.zeros(3), np.zeros(3), np.zeros(3)
 
         u_clamped = float(np.clip(u, 0.0, 1.0))
-        
+
         pos = np.asarray(self._des_pos_spline(u_clamped), dtype=np.float64)
         dpos = np.asarray(self._des_pos_spline.derivative(nu=1)(u_clamped), dtype=np.float64)
         ddpos = np.asarray(self._des_pos_spline.derivative(nu=2)(u_clamped), dtype=np.float64)
         dddpos = np.asarray(self._des_pos_spline.derivative(nu=3)(u_clamped), dtype=np.float64)
-        
+
         return pos, dpos, ddpos, dddpos
 
     def evaluate_corridor_spatial(self, u: float) -> tuple[NDArray, NDArray] | None:
@@ -279,7 +286,7 @@ class SfcCorridorPlanner:
         n_segments = len(self.corridors)
         seg_idx = int(np.floor(u_clamped * n_segments))
         seg_idx = min(seg_idx, n_segments - 1)
-        
+
         A = np.array(self.corridors[seg_idx].A)
         b = np.array(self.corridors[seg_idx].b)
         return A, b
@@ -287,7 +294,7 @@ class SfcCorridorPlanner:
     def _find_closest_t(self, pos: NDArray) -> float:
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
             return 0.0
-            
+
         if hasattr(self, "_current_t") and getattr(self, "_t_total", 0) > 0:
             if self._t_to_u is not None:
                 current_u = float(self._t_to_u(min(self._current_t, self._t_total)))
@@ -611,10 +618,10 @@ class SfcCorridorPlanner:
             corridors.append(corr)
         return corridors
 
-
     def _init_casadi_planner(self) -> None:
         """Initializes the fixed-size parametric CasADi optimizer."""
         import casadi as ca
+
         self.MAX_CTRL = 80
         self.MAX_PLANES = 25
 
@@ -623,47 +630,69 @@ class SfcCorridorPlanner:
 
         self.mask_ca = self.opti.parameter(self.MAX_CTRL)
         self.ref_pts_ca = self.opti.parameter(self.MAX_CTRL, 3)
-        
+
         self.A_corr_ca = self.opti.parameter(self.MAX_CTRL * self.MAX_PLANES, 3)
         self.b_corr_ca = self.opti.parameter(self.MAX_CTRL * self.MAX_PLANES)
-        
+
         self.is_gate_ca = self.opti.parameter(self.MAX_CTRL)
         self.gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
-        
+
         self.tube_mask_ca = self.opti.parameter(self.MAX_CTRL)
         self.tube_gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
         self.tube_normal_ca = self.opti.parameter(self.MAX_CTRL, 3)
         self.tube_sign_ca = self.opti.parameter(self.MAX_CTRL)
         self.tube_facets_ca = self.opti.parameter(self.MAX_CTRL * 8, 3)
-        
+
         self.align_mask_ca = self.opti.parameter(self.MAX_CTRL)
-        
+
         self.P0_ref_ca = self.opti.parameter(3)
         self.P1_ref_ca = self.opti.parameter(3)
         self.P1_weight_ca = self.opti.parameter(1)
-        
+
         self.end_mask_ca = self.opti.parameter(self.MAX_CTRL)
         self.end_pos_ca = self.opti.parameter(3)
 
         cost = 1e-6 * ca.sumsqr(self.P_ca)
 
         for i in range(self.MAX_CTRL - 1):
-            diff = self.P_ca[i+1, :] - self.P_ca[i, :]
-            cost += self.W_VEL * self.mask_ca[i] * self.mask_ca[i+1] * ca.sumsqr(diff)
-            
+            diff = self.P_ca[i + 1, :] - self.P_ca[i, :]
+            cost += self.W_VEL * self.mask_ca[i] * self.mask_ca[i + 1] * ca.sumsqr(diff)
+
         for i in range(self.MAX_CTRL - 2):
-            diff = self.P_ca[i+2, :] - 2*self.P_ca[i+1, :] + self.P_ca[i, :]
-            cost += self.W_ACC * self.mask_ca[i] * self.mask_ca[i+1] * self.mask_ca[i+2] * ca.sumsqr(diff)
+            diff = self.P_ca[i + 2, :] - 2 * self.P_ca[i + 1, :] + self.P_ca[i, :]
+            cost += (
+                self.W_ACC
+                * self.mask_ca[i]
+                * self.mask_ca[i + 1]
+                * self.mask_ca[i + 2]
+                * ca.sumsqr(diff)
+            )
 
         for i in range(self.MAX_CTRL - 3):
-            diff = self.P_ca[i+3, :] - 3*self.P_ca[i+2, :] + 3*self.P_ca[i+1, :] - self.P_ca[i, :]
-            cost += self.W_JERK * self.mask_ca[i] * self.mask_ca[i+1] * self.mask_ca[i+2] * self.mask_ca[i+3] * ca.sumsqr(diff)
+            diff = (
+                self.P_ca[i + 3, :]
+                - 3 * self.P_ca[i + 2, :]
+                + 3 * self.P_ca[i + 1, :]
+                - self.P_ca[i, :]
+            )
+            cost += (
+                self.W_JERK
+                * self.mask_ca[i]
+                * self.mask_ca[i + 1]
+                * self.mask_ca[i + 2]
+                * self.mask_ca[i + 3]
+                * ca.sumsqr(diff)
+            )
 
         for i in range(self.MAX_CTRL):
-            cost += self.W_CENTER * self.mask_ca[i] * ca.sumsqr(self.P_ca[i, :] - self.ref_pts_ca[i, :])
-            cost += 1e5 * self.is_gate_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.gate_pos_ca[i, :].T)
+            cost += (
+                self.W_CENTER * self.mask_ca[i] * ca.sumsqr(self.P_ca[i, :] - self.ref_pts_ca[i, :])
+            )
+            cost += (
+                1e5 * self.is_gate_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.gate_pos_ca[i, :].T)
+            )
             cost += 1e5 * self.end_mask_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.end_pos_ca)
-            
+
         cost += 10.0 * ca.sumsqr(self.P_ca[0, :].T - self.P0_ref_ca)
         cost += self.P1_weight_ca * ca.sumsqr(self.P_ca[1, :].T - self.P1_ref_ca)
 
@@ -676,25 +705,42 @@ class SfcCorridorPlanner:
         self.opti.minimize(cost)
 
         for i in range(self.MAX_CTRL):
-            A_i = self.A_corr_ca[i*self.MAX_PLANES : (i+1)*self.MAX_PLANES, :]
-            b_i = self.b_corr_ca[i*self.MAX_PLANES : (i+1)*self.MAX_PLANES]
-            self.opti.subject_to( ca.mtimes(A_i, self.P_ca[i, :].T) <= b_i )
+            A_i = self.A_corr_ca[i * self.MAX_PLANES : (i + 1) * self.MAX_PLANES, :]
+            b_i = self.b_corr_ca[i * self.MAX_PLANES : (i + 1) * self.MAX_PLANES]
+            self.opti.subject_to(ca.mtimes(A_i, self.P_ca[i, :].T) <= b_i)
 
             dp = self.P_ca[i, :] - self.tube_gate_pos_ca[i, :]
             for f in range(8):
-                facet = self.tube_facets_ca[i*8 + f, :]
+                facet = self.tube_facets_ca[i * 8 + f, :]
                 val = self.tube_mask_ca[i] * ca.dot(dp, facet)
-                bound = self.tube_mask_ca[i] * self.GATE_TUBE_RADIUS + (1 - self.tube_mask_ca[i]) * 1000.0
-                self.opti.subject_to( val <= bound )
-                
-            proj_n = self.tube_mask_ca[i] * self.tube_sign_ca[i] * ca.dot(dp, self.tube_normal_ca[i, :])
-            min_bound = self.tube_mask_ca[i] * self.GATE_TUBE_AXIAL_MIN - (1 - self.tube_mask_ca[i]) * 1000.0
-            max_bound = self.tube_mask_ca[i] * self.GATE_TUBE_HALF_LENGTH + (1 - self.tube_mask_ca[i]) * 1000.0
-            self.opti.subject_to( self.opti.bounded(min_bound, proj_n, max_bound) )
+                bound = (
+                    self.tube_mask_ca[i] * self.GATE_TUBE_RADIUS
+                    + (1 - self.tube_mask_ca[i]) * 1000.0
+                )
+                self.opti.subject_to(val <= bound)
+
+            proj_n = (
+                self.tube_mask_ca[i] * self.tube_sign_ca[i] * ca.dot(dp, self.tube_normal_ca[i, :])
+            )
+            min_bound = (
+                self.tube_mask_ca[i] * self.GATE_TUBE_AXIAL_MIN
+                - (1 - self.tube_mask_ca[i]) * 1000.0
+            )
+            max_bound = (
+                self.tube_mask_ca[i] * self.GATE_TUBE_HALF_LENGTH
+                + (1 - self.tube_mask_ca[i]) * 1000.0
+            )
+            self.opti.subject_to(self.opti.bounded(min_bound, proj_n, max_bound))
 
         p_opts = {"expand": True}
-        s_opts = {"max_iter": 100, "print_level": 0, "tol": 1e-4, "acceptable_tol": 1e-3, "sb": "yes"}
-        self.opti.solver('ipopt', p_opts, s_opts)
+        s_opts = {
+            "max_iter": 100,
+            "print_level": 0,
+            "tol": 1e-4,
+            "acceptable_tol": 1e-3,
+            "sb": "yes",
+        }
+        self.opti.solver("ipopt", p_opts, s_opts)
         self._casadi_initialized = True
         self._last_P = None
 
@@ -753,22 +799,22 @@ class SfcCorridorPlanner:
             A = np.array(corr.A)
             b = np.array(corr.b)
             n_planes = min(len(b), self.MAX_PLANES)
-            
+
             for j in range(n_pts):
                 if idx >= self.MAX_CTRL:
                     break
                 v_mask[idx] = 1.0
                 pt = corr.p1 + (j / n_pts) * (corr.p2 - corr.p1)
                 v_ref[idx] = pt
-                
+
                 v_A[idx * self.MAX_PLANES : idx * self.MAX_PLANES + n_planes] = A[:n_planes]
                 v_b[idx * self.MAX_PLANES : idx * self.MAX_PLANES + n_planes] = b[:n_planes]
                 idx += 1
 
         if idx == 0:
-            return np.array([self._current_pos_for_spline]*4)
-            
-        n_ctrl = idx 
+            return np.array([self._current_pos_for_spline] * 4)
+
+        n_ctrl = idx
 
         cp_idx_map = [0]
         curr_idx = pts_first_seg
@@ -782,7 +828,7 @@ class SfcCorridorPlanner:
                 gate_cp_idx = cp_idx_map[i]
                 if gate_cp_idx >= self.MAX_CTRL:
                     continue
-                    
+
                 gate_pos = skeleton_path[i].pos
                 normal = skeleton_path[i].gate_normal
                 right = skeleton_path[i].gate_right
@@ -803,7 +849,7 @@ class SfcCorridorPlanner:
                     v_tube_gate[gate_cp_idx - 1] = gate_pos
                     v_tube_norm[gate_cp_idx - 1] = normal
                     v_tube_sign[gate_cp_idx - 1] = -1.0
-                    v_tube_facets[(gate_cp_idx - 1)*8 : gate_cp_idx*8] = facet_dirs
+                    v_tube_facets[(gate_cp_idx - 1) * 8 : gate_cp_idx * 8] = facet_dirs
                     v_align_mask[gate_cp_idx - 1] = 1.0
 
                 if gate_cp_idx + 1 < n_ctrl:
@@ -812,7 +858,7 @@ class SfcCorridorPlanner:
                     v_tube_gate[gate_cp_idx + 1] = gate_pos
                     v_tube_norm[gate_cp_idx + 1] = normal
                     v_tube_sign[gate_cp_idx + 1] = 1.0
-                    v_tube_facets[(gate_cp_idx + 1)*8 : (gate_cp_idx + 2)*8] = facet_dirs
+                    v_tube_facets[(gate_cp_idx + 1) * 8 : (gate_cp_idx + 2) * 8] = facet_dirs
                     v_align_mask[gate_cp_idx + 1] = 1.0
 
         v_end_mask[n_ctrl - 1] = 1.0
@@ -858,6 +904,7 @@ class SfcCorridorPlanner:
         except Exception as e:
             logger.warning(f"SFC CasADi QP failed: {e}. Relaxing constraints.")
             return v_ref[:n_ctrl]
+
     def _calculate_anchors(self, current_pos: NDArray) -> list[SkeletonPoint]:
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
@@ -888,7 +935,8 @@ class SfcCorridorPlanner:
                     raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
-            pos = self.gates_pos[i]
+            pos = self.gates_pos[i].copy()
+            pos[2] += 0.10  # Add upward bias to counter altitude drop
             normal = gate_normals[i].copy()
             rot = R.from_quat(self.gates_quat[i])
             right = rot.apply([0, 1, 0])
@@ -898,7 +946,6 @@ class SfcCorridorPlanner:
 
             # ENTRY SWING (U-turn approach logic). Computed against gate centre
             # rather than a pre_pos anchor — same dot-product test, ~0.5 m
-            # offset along normal does not flip the U-turn detection.
             if np.dot(flow_dir, normal) < -0.1:
                 if np.dot(raw_path[-1].pos - pos, right) > 0:
                     swing_pos = pos + right * 0.5
@@ -960,7 +1007,10 @@ class SfcCorridorPlanner:
                     avoid_pt = None
 
                     for C, safe_radius in obs_circles:
-                        t = max(0.0, min(1.0, np.dot(C - prev_pt[:2], AB) / len_sq))
+                        dot_val = np.dot(C - prev_pt[:2], AB)
+                        if dot_val <= 0.0:
+                            continue
+                        t = min(1.0, dot_val / len_sq)
                         projection = prev_pt[:2] + t * AB
                         dist = np.linalg.norm(projection - C)
 
@@ -980,8 +1030,8 @@ class SfcCorridorPlanner:
                             )
 
                             if (
-                                np.linalg.norm(proposed_pos - prev_pt) > 0.3
-                                and np.linalg.norm(proposed_pos - curr_pt) > 0.3
+                                np.linalg.norm(proposed_pos - prev_pt) > 0.15
+                                and np.linalg.norm(proposed_pos - curr_pt) > 0.15
                             ):
                                 avoid_pt = SkeletonPoint(proposed_pos, False, None, None, None)
 
@@ -991,7 +1041,17 @@ class SfcCorridorPlanner:
                 new_path.append(path[i])
             path = new_path
 
-        return path
+        # Clip all path coordinates to be strictly within safety limits (with buffer)
+        low = FlightCorridor.LIMIT_LOW + FlightCorridor.BUFFER
+        high = FlightCorridor.LIMIT_HIGH - FlightCorridor.BUFFER
+        clipped_path = []
+        for pt in path:
+            clipped_pos = np.clip(pt.pos, low, high)
+            clipped_path.append(
+                SkeletonPoint(clipped_pos, pt.is_gate, pt.gate_normal, pt.gate_right, pt.gate_up)
+            )
+
+        return clipped_path
 
     def _check_objects_moved(self, obs: dict[str, NDArray]) -> tuple[bool, str]:
         gate_moved = False
@@ -999,7 +1059,7 @@ class SfcCorridorPlanner:
         new_gates_pos = obs["gates_pos"]
         if (
             len(self.gates_pos) > 0
-            and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.05
+            and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.01
         ):
             self.gates_pos, self.gates_quat = new_gates_pos.copy(), obs["gates_quat"].copy()
             gate_moved = True
@@ -1007,7 +1067,7 @@ class SfcCorridorPlanner:
         new_obs_pos = obs.get("obstacles_pos", np.array([]))
         if len(new_obs_pos) != len(self.obstacles_pos) or (
             len(new_obs_pos) > 0
-            and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.05
+            and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.01
         ):
             self.obstacles_pos = new_obs_pos.copy()
             obs_moved = True
