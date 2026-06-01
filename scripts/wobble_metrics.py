@@ -22,6 +22,14 @@ import numpy as np
 ENV_FREQ_HZ: float = 50.0  # control rate; sets the per-step dt for rate units
 
 
+def _safe(fn, arr: np.ndarray) -> float:
+    """Apply a reduction, returning NaN for empty input (e.g. 1-step traces)."""
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return float("nan")
+    return float(fn(arr))
+
+
 def _sign_changes(signal: np.ndarray) -> int:
     """Count zero-crossings of a 1-D signal (oscillation proxy)."""
     s = np.sign(signal)
@@ -58,6 +66,21 @@ def wobble_metrics(trace: dict[str, np.ndarray]) -> dict[str, float]:
     cmd_delta = np.diff(env_action, axis=0)  # (T-1, 4)
     cmd_jerk = np.linalg.norm(cmd_delta, axis=-1)  # (T-1,)
 
+    # tau_jerk: jerk on the body-frame rotation command ``tau_scaled`` — this is
+    # the actual quantity ``r_smooth`` penalizes (``physical_action[:3]``), so it
+    # is the faithful measure of what the smoothness finetune optimized. The
+    # ``cmd_jerk`` above is on the nonlinearly-converted euler env_action and is
+    # only an approximate proxy.
+    tau = trace.get("tau_scaled")
+    if tau is not None:
+        tau = np.asarray(tau, dtype=np.float64)  # (T, 3)
+        tau_jerk = np.linalg.norm(np.diff(tau, axis=0), axis=-1)  # (T-1,)
+        tau_jerk_mean = _safe(np.mean, tau_jerk)
+        tau_jerk_p95 = _safe(lambda a: np.percentile(a, 95), tau_jerk)
+    else:
+        tau_jerk_mean = float("nan")
+        tau_jerk_p95 = float("nan")
+
     angvel_mag = np.linalg.norm(ang_vel, axis=-1)  # (T,)
     angvel_delta = np.linalg.norm(np.diff(ang_vel, axis=0), axis=-1)  # (T-1,)
 
@@ -65,10 +88,12 @@ def wobble_metrics(trace: dict[str, np.ndarray]) -> dict[str, float]:
     sign_changes_per_s = sign_changes / max(duration_s, 1e-9) / 3.0
 
     return {
-        "cmd_jerk_mean": float(cmd_jerk.mean()),
-        "cmd_jerk_p95": float(np.percentile(cmd_jerk, 95)),
-        "angvel_rms": float(np.sqrt(np.mean(angvel_mag**2))),
-        "angvel_jerk_mean": float(angvel_delta.mean()),
+        "tau_jerk_mean": tau_jerk_mean,
+        "tau_jerk_p95": tau_jerk_p95,
+        "cmd_jerk_mean": _safe(np.mean, cmd_jerk),
+        "cmd_jerk_p95": _safe(lambda a: np.percentile(a, 95), cmd_jerk),
+        "angvel_rms": _safe(lambda a: np.sqrt(np.mean(a**2)), angvel_mag),
+        "angvel_jerk_mean": _safe(np.mean, angvel_delta),
         "angvel_sign_changes_per_s": float(sign_changes_per_s),
         "duration_s": float(duration_s),
         "finished": bool(np.asarray(trace.get("finished", False))),
