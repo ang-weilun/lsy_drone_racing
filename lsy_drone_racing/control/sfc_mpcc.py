@@ -130,7 +130,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     return model
 
 def create_ocp_solver(
-    Tf: float, N: int, parameters: dict, verbose: bool = False
+    time_steps: np.ndarray, parameters: dict, verbose: bool = False
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     ocp = AcadosOcp()
     ocp.model = create_acados_model(parameters)
@@ -141,7 +141,13 @@ def create_ocp_solver(
     ny_e = ocp.model.cost_y_expr_e.rows()
     np_dim = ocp.model.p.rows()
 
+    N = len(time_steps)
     ocp.solver_options.N_horizon = N
+    
+    # Calculate absolute time at each node (starting at 0)
+    shooting_nodes = np.zeros(N + 1)
+    shooting_nodes[1:] = np.cumsum(time_steps)
+    ocp.solver_options.shooting_nodes = shooting_nodes
 
     ocp.cost.cost_type = "NONLINEAR_LS"
     ocp.cost.cost_type_e = "NONLINEAR_LS"
@@ -206,13 +212,13 @@ def create_ocp_solver(
     ocp.constraints.idxsh_e = np.arange(10)
 
     # Slack variable penalties
-    ocp.cost.Zl = 200.0 * np.ones(10)
-    ocp.cost.Zu = 200.0 * np.ones(10)
+    ocp.cost.Zl = 1000.0 * np.ones(10)
+    ocp.cost.Zu = 1000.0 * np.ones(10)
     ocp.cost.zl = 2000.0 * np.ones(10)
     ocp.cost.zu = 2000.0 * np.ones(10)
 
-    ocp.cost.Zl_e = 200.0 * np.ones(10)
-    ocp.cost.Zu_e = 200.0 * np.ones(10)
+    ocp.cost.Zl_e = 1000.0 * np.ones(10)
+    ocp.cost.Zu_e = 1000.0 * np.ones(10)
     ocp.cost.zl_e = 2000.0 * np.ones(10)
     ocp.cost.zu_e = 2000.0 * np.ones(10)
 
@@ -227,7 +233,7 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver_warm_start = 1
     ocp.solver_options.qp_solver_iter_max = 20
     ocp.solver_options.nlp_solver_max_iter = 50
-    ocp.solver_options.tf = Tf
+    ocp.solver_options.tf = float(np.sum(time_steps))
 
     acados_ocp_solver = AcadosOcpSolver(
         ocp,
@@ -244,16 +250,23 @@ class AttitudeMPC(Controller):
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
-        self._N = 25
-        self._dt = 1 / config.env.freq
-        self._T_HORIZON = self._N * self._dt
+        dt_fine = 1 / config.env.freq
+        dt_coarse = 0.05
+        self._time_steps = np.concatenate([
+            np.full(10, dt_fine),
+            np.full(15, dt_coarse)
+        ])
+        self._N = len(self._time_steps)
+        self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
 
         self.planner = SfcCorridorPlanner(obs, config.env.freq)
         self._update_spline()
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self.drone_params["pos_limit_low"] = np.array(config.env.track.safety_limits.get("pos_limit_low", [-2.5, -1.5, 0.0]))
+        self.drone_params["pos_limit_high"] = np.array(config.env.track.safety_limits.get("pos_limit_high", [2.5, 1.5, 2.0]))
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params
+            self._time_steps, self.drone_params
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -295,9 +308,18 @@ class AttitudeMPC(Controller):
         if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
             capsules = self.planner.capsules
             if len(capsules) > 0:
+                # Compute reference trajectory points along the shooting horizon
+                ref_points = np.array([
+                    self._des_pos_spline(np.clip(self._current_theta + t_node * self._current_v_theta, 0, self._s_total))
+                    for t_node in self._shooting_nodes
+                ])
                 midpoints = np.array([(cap.p1 + cap.p2) / 2.0 for cap in capsules])
-                dists_to_caps = np.linalg.norm(midpoints - pos, axis=1)
-                closest_idx = np.argsort(dists_to_caps)[:10]
+                
+                # Pairwise distances between midpoints and reference points
+                diffs = midpoints[:, None, :] - ref_points[None, :, :]
+                dists_to_path = np.linalg.norm(diffs, axis=2)
+                min_dists_to_path = np.min(dists_to_path, axis=1)
+                closest_idx = np.argsort(min_dists_to_path)[:10]
                 for i, idx in enumerate(closest_idx):
                     cap = capsules[idx]
                     capsule_params[i*7 : i*7+3] = cap.p1
@@ -305,17 +327,10 @@ class AttitudeMPC(Controller):
                     capsule_params[i*7+6] = cap.radius
                     is_gate_flags[i] = getattr(cap, "is_gate", False)
 
-        Zl = 200.0 * np.ones(10)
-        Zu = 200.0 * np.ones(10)
+        Zl = 1000.0 * np.ones(10)
+        Zu = 1000.0 * np.ones(10)
         zl = 2000.0 * np.ones(10)
         zu = 2000.0 * np.ones(10)
-
-        for i in range(10):
-            if is_gate_flags[i]:
-                Zl[i] = 10.0
-                Zu[i] = 10.0
-                zl[i] = 100.0
-                zu[i] = 100.0
 
         for j in range(1, self._N + 1):
             self._acados_ocp_solver.cost_set(j, "Zl", Zl)
@@ -326,7 +341,7 @@ class AttitudeMPC(Controller):
         if self._tick > 0 and not replanned:
             x_prev = self._acados_ocp_solver.get(1, "x")
             self._current_theta = float(x_prev[12])
-            self._current_v_theta = float(x_prev[13])
+            self._current_v_theta = max(0.0, float(x_prev[13]))
 
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
         obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
@@ -342,14 +357,14 @@ class AttitudeMPC(Controller):
         
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
-        '''
         # Warm-start the state trajectory if tick is 0 or we just replanned
         if self._tick == 0 or replanned:
+            v_start_guess = max(0.5, self._current_v_theta)
             for j in range(self._N + 1):
                 if j == 0:
                     x_guess = x0
                 else:
-                    theta_guess = self._current_theta + j * self._dt * self._current_v_theta
+                    theta_guess = self._current_theta + self._shooting_nodes[j] * v_start_guess
                     theta_guess = np.clip(theta_guess, 0, self._s_total)
                     pos_guess = self._des_pos_spline(theta_guess)
                     
@@ -363,15 +378,15 @@ class AttitudeMPC(Controller):
                         obs["vel"] * (1 - alpha),  # Blend vel
                         obs["drpy"] * (1 - alpha), # Blend drpy
                         [theta_guess],
-                        [self._current_v_theta]
+                        [v_start_guess]
                     ))
                 self._acados_ocp_solver.set(j, "x", x_guess)
-        '''
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
 
+        v_pred = max(0.5, self._current_v_theta)
         for j in range(self._N + 1):
-            theta_j = self._current_theta + j * self._dt * self._current_v_theta
+            theta_j = self._current_theta + self._shooting_nodes[j] * v_pred
             theta_j = np.clip(theta_j, 0, self._s_total)
             
             p_j_pos = self._des_pos_spline(theta_j)
@@ -397,11 +412,8 @@ class AttitudeMPC(Controller):
             if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
                 target_gate_pos = gates_pos[target_gate_idx]
                 dist_to_target_gate = np.linalg.norm(target_gate_pos - p_j_pos)
-                # Increase the contouring error penalty as the predicted position gets closer
-                # to the target gate, with a Gaussian-shaped increase
-                # Starts increasing significantly when within ~0.4m of the gate,
-                # and maxes out at 8000 when very close
-                Q_c_dynamic += 8000.0 * np.exp(-(dist_to_target_gate**2) / (2 * 0.4**2))
+                dynamic_addition = 300.0 * np.exp(-(dist_to_target_gate**2) / (2 * 0.3**2))
+                Q_c_dynamic += dynamic_addition
             
             W = self._acados_ocp_solver.cost_get(j, "W")
             W[0, 0] = Q_c_dynamic
@@ -409,7 +421,34 @@ class AttitudeMPC(Controller):
             W[2, 2] = Q_c_dynamic
             self._acados_ocp_solver.cost_set(j, "W", W)
 
+        # Logging for debugging
+        min_obs_dist = -1.0
+        if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
+            midpoints = np.array([(cap.p1 + cap.p2) / 2.0 for cap in self.planner.capsules])
+            if len(midpoints) > 0:
+                min_obs_dist = np.min(np.linalg.norm(midpoints - pos, axis=1))
+
+        dist_to_target_gate = -1.0
+        if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
+            dist_to_target_gate = np.linalg.norm(gates_pos[target_gate_idx] - pos)
+
         status = self._acados_ocp_solver.solve()
+        is_hovering = status not in [0, 2] or hasattr(self, "_hover_pos")
+
+        if self._tick % 10 == 0:
+            dist_gate_str = f"{dist_to_target_gate:.2f}m" if dist_to_target_gate >= 0 else "N/A"
+            dist_obs_str = f"{min_obs_dist:.2f}m" if min_obs_dist >= 0 else "N/A"
+            hover_str = "HOVER" if is_hovering else "FLY"
+            print(
+                f"[Tick {self._tick:04d}] Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}] | "
+                f"Progress: {self._current_theta:.2f}/{self._s_total:.2f} | "
+                f"Speed: {self._current_v_theta:.2f} | "
+                f"Gate: {target_gate_idx} ({dist_gate_str}) | "
+                f"Obs Dist: {dist_obs_str} | "
+                f"Status: {status} ({hover_str})",
+                flush=True
+            )
+
         if status not in [0, 2]:
             logger.warning(f"MPCC solver failed with status {status}. Entering hover mode.")
             if not hasattr(self, "_hover_pos"):
@@ -497,9 +536,13 @@ class AttitudeMPC(Controller):
 
         predicted_horizon = []
         for j in range(self._N + 1):
-            theta_j = self._current_theta + j * self._dt * self._current_v_theta
-            theta_j = np.clip(theta_j, 0, self._s_total)
-            predicted_horizon.append(self._des_pos_spline(theta_j))
+            x_j = self._acados_ocp_solver.get(j, "x")
+            predicted_horizon.append(x_j[:3])
+
+        full_spline_path = []
+        if self._s_total > 0:
+            for s in np.linspace(0, self._s_total, 100):
+                full_spline_path.append(self._des_pos_spline(s))
         
         if len(predicted_horizon) > 1:
             draw_line(
@@ -508,6 +551,14 @@ class AttitudeMPC(Controller):
                 rgba=np.array([0.0, 1.0, 0.0, 0.9]),
                 start_size=0.008,
                 end_size=0.008,
+            )
+        if len(full_spline_path) > 1:
+            draw_line(
+                sim,
+                np.array(full_spline_path),
+                rgba=np.array([0.0, 0.5, 1.0, 0.5]),
+                start_size=0.005,
+                end_size=0.005,
             )
 
         if self.planner.gates_pos is not None and len(self.planner.gates_pos) > 0:
