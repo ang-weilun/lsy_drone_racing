@@ -150,6 +150,7 @@ def train(
     zero_progress_on_pass: bool = False,
     use_gate_frame_barrier: bool = False,
     omega_coef: float = 0.01,
+    r_smooth_coef: float = 0.0,
     ortho_init: bool = True,
     log_std_init: float = -0.5,
     n_envs: int | None = None,
@@ -185,6 +186,8 @@ def train(
         Constant PPO entropy bonus for the cold-train recipe.
     learning_rate : float, optional
         Adam learning rate; passed straight to ``sbx.PPO``.
+    r_smooth_coef : float, optional
+        Coefficient for the action-smoothness reward term.
     n_envs : int, optional
         Vectorization width. Defaults to ``TrainConfig.ppo.n_envs``.
     n_steps : int, optional
@@ -270,6 +273,7 @@ def train(
         zero_progress_on_pass=zero_progress_on_pass,
         use_gate_frame_barrier=use_gate_frame_barrier,
         omega_coef=omega_coef,
+        r_smooth_coef=r_smooth_coef,
     )
 
     # The wrapper's __init__ instantiates the inner JAX env via set_stage and
