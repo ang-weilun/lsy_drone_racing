@@ -7,17 +7,19 @@
 # cell's toggle (RL_OBS_ANG_VEL / RL_HIDDEN_SIZE).
 #
 # Usage (on box):
-#   bash box_launch_l2_screen.sh <run_name> <ang_vel 0|1> <hidden_size> [total_steps]
-# Cells:
+#   bash box_launch_l2_screen.sh <run_name> <ang_vel 0|1> <hidden_size> [n_envs] [total_steps]
+# Cells (n_envs=4096 fits a 32GB 5090; total_steps=300M):
 #   ref:    bash box_launch_l2_screen.sh l2scr_ref    0 256
 #   omegaA: bash box_launch_l2_screen.sh l2scr_omega  1 256
 #   capB:   bash box_launch_l2_screen.sh l2scr_cap512 0 512
+#   combo:  bash box_launch_l2_screen.sh l2scr_combo  1 512
 set -euo pipefail
 
 RUN_NAME="${1:?run_name}"
 ANG_VEL="${2:?ang_vel 0|1}"
 HIDDEN="${3:?hidden_size}"
-TOTAL="${4:-300000000}"
+NENVS="${4:-4096}"
+TOTAL="${5:-300000000}"
 
 REPO=/root/lsy_drone_racing
 LOG="$REPO/training_logs/${RUN_NAME}.log"
@@ -39,6 +41,7 @@ tmux new-session -d -s "$RUN_NAME" "
   pixi run -e rl-train python -m lsy_drone_racing.control.rl_sbx.train \
     --run-name=$RUN_NAME \
     --curriculum=default \
+    --n-envs=$NENVS \
     --alpha-max-rad=1.4 \
     --time-penalty=0.40 \
     --omega-coef=0.005 \
@@ -48,4 +51,4 @@ tmux new-session -d -s "$RUN_NAME" "
     --total-timesteps=$TOTAL \
     2>&1 | tee $LOG
 "
-echo "launched $RUN_NAME (ang_vel=$ANG_VEL hidden=$HIDDEN total=$TOTAL) in tmux; log=$LOG"
+echo "launched $RUN_NAME (ang_vel=$ANG_VEL hidden=$HIDDEN n_envs=$NENVS total=$TOTAL) in tmux; log=$LOG"
