@@ -355,13 +355,32 @@ class JitScanPPO(PPO):
                     float((crash_arr & source_mask).sum() / n_done_source),
                 )
 
-        # Phase-2 replay-buffer composition diagnostics. Slot 0 is unused;
-        # slots >= 1 hold successful gate-pass states for ``target_gate == g``.
-        # Tests the calm-pass-bias hypothesis: at low omega_coef the buffer
-        # may be skewed toward survivable-slow gate transitions, biasing the
-        # actor toward calm continuation via replay (see codex review
-        # 2026-05-26). Lower v130-vs-v128 ``agg_ang_vel_norm_mean`` would
-        # support this.
+        # Phase-2 buffer composition diagnostics are heavy (many device→host
+        # syncs over the (n_gates, capacity, state_dim) buffer — ~9s/rollout when
+        # the buffer has fills). Gate to every Nth rollout; default 1 = unchanged.
+        self._diag_rollout_idx = getattr(self, "_diag_rollout_idx", 0) + 1
+        diag_every = max(1, int(getattr(self, "diag_every_n_rollouts", 1)))
+        if self._diag_rollout_idx % diag_every == 0:
+            self._record_phase2_diagnostics(scan_result)
+
+        for name, comp_arr in outputs.reward_components.items():
+            self.logger.record(f"reward/{name}", float(np.asarray(comp_arr).mean()))
+
+        callback.on_rollout_end()
+
+        if profile:
+            t_exit = time.perf_counter()
+            self.logger.record("time/prof_host_s", t_exit - t_scan_done)
+            self._prof_last_exit = t_exit
+        return True
+
+    def _record_phase2_diagnostics(self, scan_result: RLSBXScanResult) -> None:
+        """Log Phase-2 replay-buffer composition (per-gate + aggregate).
+
+        Slot 0 unused; slots >= 1 hold gate-pass states for ``target_gate == g``.
+        Surfaces the calm-pass-bias hypothesis (codex review 2026-05-26): at low
+        omega_coef the buffer may skew toward survivable-slow gate transitions.
+        """
         phase2_buffer = scan_result.phase2_buffer
         phase2_data = phase2_buffer.data
         phase2_fill = phase2_buffer.fill
@@ -441,17 +460,6 @@ class JitScanPPO(PPO):
                 np.asarray(jnp.sum(jnp.where(valid_all, phase2_data[:, :, 13], 0.0)) / denom_all)
             ),
         )
-
-        for name, comp_arr in outputs.reward_components.items():
-            self.logger.record(f"reward/{name}", float(np.asarray(comp_arr).mean()))
-
-        callback.on_rollout_end()
-
-        if profile:
-            t_exit = time.perf_counter()
-            self.logger.record("time/prof_host_s", t_exit - t_scan_done)
-            self._prof_last_exit = t_exit
-        return True
 
     @staticmethod
     @partial(jax.jit, static_argnames=["normalize_advantage", "share_features_extractor"])

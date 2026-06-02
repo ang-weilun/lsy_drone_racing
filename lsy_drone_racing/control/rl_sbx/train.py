@@ -168,6 +168,7 @@ def train(
     wandb_entity: str | None = None,
     no_wandb: bool = False,
     profile_throughput: bool = False,
+    diag_every_n_rollouts: int = 1,
 ) -> None:
     """Run SBX PPO cold-train against the milestone-1 L2 seg-init curriculum.
 
@@ -214,6 +215,10 @@ def train(
         Log per-rollout ``time/prof_scan_s`` / ``prof_host_s`` /
         ``prof_update_plus_log_s`` (adds one ``block_until_ready`` sync).
         Profiling only; default ``False``.
+    diag_every_n_rollouts : int, optional
+        Emit the heavy Phase-2 buffer diagnostics every Nth rollout (default
+        ``1`` = every rollout). Higher values cut the per-rollout host
+        sync-storm on seg-init/phase-2 runs.
 
     Notes:
     -----
@@ -419,6 +424,7 @@ def train(
     )
     # Profiling-only: per-rollout scan/host/update timing into the SB3 logger.
     model.profile_throughput = profile_throughput
+    model.diag_every_n_rollouts = diag_every_n_rollouts
 
     # 2026-05-25: optional warm-start from an existing checkpoint. The
     # checkpoint format mirrors save_step (5 files: actor.params.msgpack,
