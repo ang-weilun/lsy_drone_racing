@@ -96,7 +96,10 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         diff = pos - closest_pt
 
         d2 = cs.dot(diff, diff)
-        y_obs[i] = cs.fmax(0.0, cs.exp(-2.0 * d2 / (r**2 + 1e-6)) - cs.exp(-2.0))
+        # Use a C1-continuous barrier function fmax(0, 1 - d2/r2)^2.
+        # This replaces the Gaussian penalty because fmax(0, exp - exp) has a 
+        # discontinuous gradient at the boundary, which crashes the SQP solver.
+        y_obs[i] = cs.fmax(0.0, 1.0 - d2 / (r**2 + 1e-6))**2
 
     y_expr = cs.vertcat(
         e_c_vec,  # 3
