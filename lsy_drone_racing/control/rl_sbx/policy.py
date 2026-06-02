@@ -36,6 +36,7 @@ Stable Baselines Jax (SBX), https://github.com/araffin/sbx, ``sbx/ppo``.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import flax.linen as nn
@@ -57,16 +58,16 @@ if TYPE_CHECKING:
 
 tfd = tfp.distributions
 
-# Hidden-layer widths for actor and critic MLPs.
-# v132 (2026-05-27): reverted 512 -> 256 to match rl_song.policy.HIDDEN_SIZE.
-# Diagnosis from the rl_song-20M-vs-v131-300M trace diff: v131's deterministic
-# mean |tau|/alpha_max = 0.47 (saturating) vs rl_song's 0.08 (committed)
-# despite same env, obs encoder, and physics. Codex review localized the
-# pathology to the larger 512-wide trunk + single coupled 4D head; the
-# additional capacity drives PPO's actor mean against the tanh boundary
-# under SBX's update geometry. Pairs with the split thrust/tangent head
-# below.
-HIDDEN_SIZE: int = 256
+# Hidden-layer widths for actor and critic MLPs, toggled via RL_HIDDEN_SIZE
+# (default 256). Read at import — before the tyro CLI parses args.
+# History: v131 ran 512 and v132 reverted it after observing a saturating
+# deterministic mean |tau|/alpha_max (0.47 vs rl_song's 0.08). That verdict is
+# now treated as inconclusive: it was confounded by an inert obstacle barrier
+# (fixed 2026-05-31), an unclipped value function (clipped-VF — the likely real
+# fix — postdates v131), the split-head experiment, and an era where no policy
+# finished at all. The L2 screen re-tests 512 on the healthy stack; see
+# docs/superpowers/specs/2026-06-02-l3-obs-completion-capacity-base-design.md.
+HIDDEN_SIZE: int = int(os.environ.get("RL_HIDDEN_SIZE", "256"))
 N_HIDDEN_LAYERS: int = 2
 NET_ARCH: tuple[int, ...] = (HIDDEN_SIZE,) * N_HIDDEN_LAYERS
 
