@@ -77,19 +77,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     e_l = cs.dot(t_vec, e) / t_norm
     e_c_vec = e - e_l * (t_vec / t_norm)
 
-    y_expr = cs.vertcat(
-        e_c_vec,  # 3
-        e_l,  # 1
-        v_theta,  # 1
-        X[3:6],  # 3 (rpy)
-        X[6:9],  # 3 (vel)
-        X[9:12],  # 3 (drpy)
-        U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
-    )
-
-    y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12])
-
-    h_expr = cs.MX.zeros(10)
+    y_obs = cs.MX.zeros(10)
     for i in range(10):
         p1 = p_capsules[i * 7 + 0 : i * 7 + 3]
         p2 = p_capsules[i * 7 + 3 : i * 7 + 6]
@@ -107,7 +95,21 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         closest_pt = p1 + t * v
         diff = pos - closest_pt
 
-        h_expr[i] = cs.dot(diff, diff) - r**2
+        d2 = cs.dot(diff, diff)
+        y_obs[i] = cs.fmax(0.0, cs.exp(-2.0 * d2 / (r**2 + 1e-6)) - cs.exp(-2.0))
+
+    y_expr = cs.vertcat(
+        e_c_vec,  # 3
+        e_l,  # 1
+        v_theta,  # 1
+        X[3:6],  # 3 (rpy)
+        X[6:9],  # 3 (vel)
+        X[9:12],  # 3 (drpy)
+        U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
+        y_obs,    # 10 (obstacle avoidance)
+    )
+
+    y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12], y_obs)
 
     model = AcadosModel()
     model.name = "sfc_mpcc_model"
@@ -118,8 +120,6 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.p = p
     model.cost_y_expr = y_expr
     model.cost_y_expr_e = y_expr_e
-    model.con_h_expr = h_expr
-    model.con_h_expr_e = h_expr
 
     return model
 
@@ -152,41 +152,39 @@ def create_ocp_solver(
     Q_l = 150.0
     W_v_theta = 5.0
 
-    W = np.diag(
-        [
-            Q_c,
-            Q_c,
-            Q_c_z,  # e_c (3)
-            Q_l,  # e_l (1)
-            W_v_theta,  # v_theta (1)
-            1.0,
-            1.0,
-            1.0,  # rpy (3)
-            1.0,
-            1.0,
-            1.0,  # vel (3)
-            5.0,
-            5.0,
-            5.0,  # drpy (3)
-            1.0,
-            1.0,
-            1.0,
-            10.0,  # u (4)
-            0.5,  # delta_v_theta (1)
-        ]
-    )
+    W_diag = [
+        Q_c, Q_c, Q_c_z,  # e_c (3)
+        Q_l,              # e_l (1)
+        W_v_theta,        # v_theta (1)
+        1.0, 1.0, 1.0,    # rpy (3)
+        1.0, 1.0, 1.0,    # vel (3)
+        5.0, 5.0, 5.0,    # drpy (3)
+        1.0, 1.0, 1.0, 10.0,  # u (4)
+        0.5,              # delta_v_theta (1)
+    ] + [100000.0] * 10     # obstacle penalties (10)
 
-    W_e = np.diag([Q_c, Q_c, Q_c_z, Q_l, W_v_theta, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 5.0, 5.0, 5.0])
+    W_e_diag = [
+        Q_c, Q_c, Q_c_z,  # e_c (3)
+        Q_l,              # e_l (1)
+        W_v_theta,        # v_theta (1)
+        1.0, 1.0, 1.0,    # rpy (3)
+        1.0, 1.0, 1.0,    # vel (3)
+        5.0, 5.0, 5.0,    # drpy (3)
+    ] + [100000.0] * 10     # obstacle penalties (10)
+
+    W = np.diag(W_diag)
+    W_e = np.diag(W_e_diag)
 
     ocp.cost.W = W
     ocp.cost.W_e = W_e
 
-    mu = 20.0
+    mu = 10.0
     v_ref = mu / W_v_theta
 
     yref = np.zeros(ny)
     yref[4] = v_ref
     yref[17] = parameters["mass"] * -parameters["gravity_vec"][-1]
+    # The last 10 elements of yref are 0.0, corresponding to minimal obstacle penalty
 
     yref_e = np.zeros(ny_e)
     yref_e[4] = v_ref
@@ -203,26 +201,6 @@ def create_ocp_solver(
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
-
-    ocp.constraints.lh = np.zeros(10)
-    ocp.constraints.uh = 1e6 * np.ones(10)
-    ocp.constraints.lh_e = np.zeros(10)
-    ocp.constraints.uh_e = 1e6 * np.ones(10)
-
-    # Configure slack variables for collision avoidance
-    ocp.constraints.idxsh = np.arange(10)
-    ocp.constraints.idxsh_e = np.arange(10)
-
-    # Slack variable penalties
-    ocp.cost.Zl = 1000.0 * np.ones(10)
-    ocp.cost.Zu = 1000.0 * np.ones(10)
-    ocp.cost.zl = 2000.0 * np.ones(10)
-    ocp.cost.zu = 2000.0 * np.ones(10)
-
-    ocp.cost.Zl_e = 1000.0 * np.ones(10)
-    ocp.cost.Zu_e = 1000.0 * np.ones(10)
-    ocp.cost.zl_e = 2000.0 * np.ones(10)
-    ocp.cost.zu_e = 2000.0 * np.ones(10)
 
     ocp.parameter_values = np.zeros(np_dim)
 
@@ -340,17 +318,6 @@ class AttitudeMPC(Controller):
                     capsule_params[i * 7 + 3 : i * 7 + 6] = cap.p2
                     capsule_params[i * 7 + 6] = cap.radius
                     is_gate_flags[i] = getattr(cap, "is_gate", False)
-
-        Zl = 1000.0 * np.ones(10)
-        Zu = 1000.0 * np.ones(10)
-        zl = 2000.0 * np.ones(10)
-        zu = 2000.0 * np.ones(10)
-
-        for j in range(1, self._N + 1):
-            self._acados_ocp_solver.cost_set(j, "Zl", Zl)
-            self._acados_ocp_solver.cost_set(j, "Zu", Zu)
-            self._acados_ocp_solver.cost_set(j, "zl", zl)
-            self._acados_ocp_solver.cost_set(j, "zu", zu)
 
         if self._tick > 0 and not replanned:
             x_prev = self._acados_ocp_solver.get(1, "x")
