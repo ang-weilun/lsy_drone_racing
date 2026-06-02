@@ -625,15 +625,20 @@ class JitScanPPO(PPO):
         else:
             clip_range_vf_value = float(self.clip_range_vf)
 
-        n_updates = 0
         mean_clip_fraction = 0.0
         mean_kl_div = 0.0
         pg_loss = policy_loss = entropy_loss = value_loss = None
         ratio = None
+        # target_kl=None (our recipe) ⇒ no per-minibatch adaptive LR, so the KL /
+        # clip diagnostics need not sync inside the loop. Collect them as device
+        # scalars and reduce once per rollout; this lets the 768 minibatch updates
+        # pipeline instead of stalling on two .item() syncs each (GPU was at 1%).
+        defer_diag_sync = self.target_kl is None
+        kl_terms: list[jnp.ndarray] = []
+        clip_terms: list[jnp.ndarray] = []
 
         for _ in range(self.n_epochs):
             for rollout_data in self.rollout_buffer.get(self.batch_size):
-                n_updates += 1
                 # Box action space only — JitScanPPO is the only consumer
                 # and its env wrapper exposes ``Box(RAW_ACTION_DIM)``. The
                 # stock SBX ``isinstance(..., spaces.Discrete)`` branch is
@@ -660,23 +665,27 @@ class JitScanPPO(PPO):
                     share_features_extractor=False,
                 )
 
-                # Approximate reverse KL for diagnostics / adaptive LR (see
-                # Schulman http://joschu.net/blog/kl-approx.html). Same
-                # estimator stock SBX uses at sbx/ppo/ppo.py:320-321.
-                approx_kl_div = jnp.mean(
-                    (ratio - 1.0 + APPROX_KL_RATIO_EPS) - jnp.log(ratio + APPROX_KL_RATIO_EPS)
-                ).item()
-                clip_fraction = jnp.mean(jnp.abs(ratio - 1.0) > clip_range).item()
-                mean_clip_fraction += (clip_fraction - mean_clip_fraction) / n_updates
-                mean_kl_div += (approx_kl_div - mean_kl_div) / n_updates
+                # Reverse-KL estimator (Schulman, joschu.net/blog/kl-approx.html;
+                # sbx/ppo/ppo.py:320-321). Kept on-device; reduced after the loop.
+                kl_terms.append(
+                    jnp.mean(
+                        (ratio - 1.0 + APPROX_KL_RATIO_EPS) - jnp.log(ratio + APPROX_KL_RATIO_EPS)
+                    )
+                )
+                clip_terms.append(jnp.mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32)))
 
-                if self.target_kl is not None:
+                if not defer_diag_sync:
+                    approx_kl_div = kl_terms[-1].item()
                     self.adaptive_lr.update(approx_kl_div)
                     self._update_learning_rate(
                         [self.policy.actor_state.opt_state[1], self.policy.vf_state.opt_state[1]],
                         learning_rate=self.adaptive_lr.current_adaptive_lr,
                     )
 
+        # One device→host sync per rollout, not two per minibatch. Equivalent to
+        # the old incremental mean over all n_epochs×minibatches terms.
+        mean_kl_div = float(jnp.mean(jnp.stack(kl_terms)))
+        mean_clip_fraction = float(jnp.mean(jnp.stack(clip_terms)))
         self._n_updates += self.n_epochs
         explained_var = explained_variance(
             self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten()
