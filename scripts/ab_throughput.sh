@@ -15,7 +15,14 @@ export PATH="$HOME/.pixi/bin:$PATH"
 export SCIPY_ARRAY_API=1
 mkdir -p "$REPO/training_logs"
 
-if [ ! -d "$WARM" ]; then echo "WARM checkpoint missing: $WARM" >&2; exit 2; fi
+# Throughput is policy-weight-independent, so warm-start is optional: use it if
+# present (matches the production recipe), else cold-start.
+INIT_FLAG=()
+if [ -d "$WARM" ]; then
+  INIT_FLAG=(--init-from="$WARM")
+else
+  echo "warm checkpoint absent; cold-start (valid for fps measurement)" >&2
+fi
 
 if [ "$ARM" = "on" ]; then
   SEG_FLAGS=(--segment-init-prob=0.5 --segment-init-vel-mps=2.5)
@@ -28,7 +35,7 @@ fi
 cd "$REPO"
 pixi run -e rl-train python -m lsy_drone_racing.control.rl_sbx.train \
   --run-name="ab_seg${ARM}" \
-  --init-from="$WARM" \
+  "${INIT_FLAG[@]}" \
   "${SEG_FLAGS[@]}" \
   --alpha-max-rad=1.4 --time-penalty=0.60 --omega-coef=0.005 --progress-coef=15 \
   --use-obstacle-barrier --obstacle-weight=0.3 \
