@@ -13,6 +13,7 @@ See ``docs/plans/2026-05-13-rl-song-prototype-design.md`` §8–§10.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 # v38: policy is sampled in raw 4-vec space: 1 thrust scalar + 3 axis-angle
@@ -57,14 +58,24 @@ ACTOR_OBS_DRONE_DIM: int = 12  # full 9D rotation matrix + body-frame velocity
 # both directly. See ``obs.build_actor_obs`` lines for the v124 commentary.
 ACTOR_OBS_GATE_DIM: int = 24
 ACTOR_OBS_PREV_ACTION_DIM: int = 0
+# Body-frame angular-velocity channel, toggled on for the L2 ω screen via the
+# RL_OBS_ANG_VEL env var. Read at import — before the tyro CLI parses args —
+# matching the controller_ablate ABLATE_MODE pattern. Default off preserves the
+# 52-d reference obs. See docs/superpowers/specs/
+# 2026-06-02-l3-obs-completion-capacity-base-design.md.
+ACTOR_OBS_ANG_VEL_DIM: int = 3 if os.environ.get("RL_OBS_ANG_VEL", "0") == "1" else 0
 # Per-slot obstacle: 2 body-frame xy + 1 body-frame velocity projected onto
 # unit-to-obstacle + N_OBSTACLES one-hot identity + 1 visited flag.
 _PER_OBSTACLE_SLOT_DIM: int = 2 + 1 + N_OBSTACLES + 1
 ACTOR_OBS_OBSTACLE_DIM: int = N_NEAREST_OBSTACLES * _PER_OBSTACLE_SLOT_DIM
 ACTOR_OBS_DIM: int = (
-    ACTOR_OBS_DRONE_DIM + ACTOR_OBS_GATE_DIM + ACTOR_OBS_PREV_ACTION_DIM + ACTOR_OBS_OBSTACLE_DIM
+    ACTOR_OBS_DRONE_DIM
+    + ACTOR_OBS_ANG_VEL_DIM
+    + ACTOR_OBS_GATE_DIM
+    + ACTOR_OBS_PREV_ACTION_DIM
+    + ACTOR_OBS_OBSTACLE_DIM
 )
-assert ACTOR_OBS_DIM == 52, "Actor obs layout drift"
+assert ACTOR_OBS_DIM == 52 + ACTOR_OBS_ANG_VEL_DIM, "Actor obs layout drift"
 
 
 @dataclass(frozen=True)

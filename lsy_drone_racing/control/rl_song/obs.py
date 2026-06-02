@@ -8,7 +8,9 @@ Layout
 ------
 The actor observation is ``[drone | gates | obstacles]``:
 
-* drone (12): full 9D rotation matrix and body-frame linear velocity (3).
+* drone (12, or 15 with RL_OBS_ANG_VEL=1): full 9D rotation matrix and
+  body-frame linear velocity (3), optionally followed by body-frame angular
+  velocity (3).
 * gates (24): target gate corners in body frame (12), then the next-gate
   minus target-gate corner deltas in body frame (12).
 * obstacles (16): the ``N_NEAREST_OBSTACLES = 2`` nearest obstacles in
@@ -32,7 +34,12 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, N_NEAREST_OBSTACLES, N_OBSTACLES
+from lsy_drone_racing.control.rl_song.config import (
+    ACTOR_OBS_ANG_VEL_DIM,
+    ACTOR_OBS_DIM,
+    N_NEAREST_OBSTACLES,
+    N_OBSTACLES,
+)
 
 # Number of future gates encoded in the actor observation (target + 1).
 N_FUTURE_GATES: int = 2
@@ -233,7 +240,13 @@ def build_actor_obs(
     rot_9d = rot_wb.reshape(9)
     rot_bw = rot_wb.T
     vel_body = rot_bw @ vel
-    drone_chan = jnp.concatenate([rot_9d, vel_body])
+    drone_parts = [rot_9d, vel_body]
+    if ACTOR_OBS_ANG_VEL_DIM:
+        # Body-frame body rates, appended raw (already body frame, unlike vel).
+        # The flag is a static module constant, so this branch resolves before
+        # jit tracing — the graph shape stays static per run.
+        drone_parts.append(env_obs["ang_vel"])
+    drone_chan = jnp.concatenate(drone_parts)
 
     # Song's recursive gate channel keeps both 12-float blocks in body
     # frame so the target and inter-gate geometry share one rotation basis.
