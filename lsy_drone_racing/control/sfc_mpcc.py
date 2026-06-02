@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+
 def create_acados_model(parameters: dict) -> AcadosModel:
     X_dot, X, U, _ = symbolic_dynamics_euler(
         mass=parameters["mass"],
@@ -55,18 +56,18 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     p_c_y = cs.MX.sym("c_y", 4)
     p_c_z = cs.MX.sym("c_z", 4)
     p_capsules = cs.MX.sym("capsules", 10 * 7)
-    
+
     p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules)
 
     t_val = theta - p_theta_i
-    p_d_x = p_c_x[0]*t_val**3 + p_c_x[1]*t_val**2 + p_c_x[2]*t_val + p_c_x[3]
-    p_d_y = p_c_y[0]*t_val**3 + p_c_y[1]*t_val**2 + p_c_y[2]*t_val + p_c_y[3]
-    p_d_z = p_c_z[0]*t_val**3 + p_c_z[1]*t_val**2 + p_c_z[2]*t_val + p_c_z[3]
+    p_d_x = p_c_x[0] * t_val**3 + p_c_x[1] * t_val**2 + p_c_x[2] * t_val + p_c_x[3]
+    p_d_y = p_c_y[0] * t_val**3 + p_c_y[1] * t_val**2 + p_c_y[2] * t_val + p_c_y[3]
+    p_d_z = p_c_z[0] * t_val**3 + p_c_z[1] * t_val**2 + p_c_z[2] * t_val + p_c_z[3]
     p_d = cs.vertcat(p_d_x, p_d_y, p_d_z)
 
-    t_x = 3*p_c_x[0]*t_val**2 + 2*p_c_x[1]*t_val + p_c_x[2]
-    t_y = 3*p_c_y[0]*t_val**2 + 2*p_c_y[1]*t_val + p_c_y[2]
-    t_z = 3*p_c_z[0]*t_val**2 + 2*p_c_z[1]*t_val + p_c_z[2]
+    t_x = 3 * p_c_x[0] * t_val**2 + 2 * p_c_x[1] * t_val + p_c_x[2]
+    t_y = 3 * p_c_y[0] * t_val**2 + 2 * p_c_y[1] * t_val + p_c_y[2]
+    t_z = 3 * p_c_z[0] * t_val**2 + 2 * p_c_z[1] * t_val + p_c_z[2]
     t_vec = cs.vertcat(t_x, t_y, t_z)
 
     pos = X[0:3]
@@ -77,42 +78,35 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     e_c_vec = e - e_l * (t_vec / t_norm)
 
     y_expr = cs.vertcat(
-        e_c_vec,      # 3
-        e_l,          # 1
-        v_theta,      # 1
-        X[3:6],       # 3 (rpy)
-        X[6:9],       # 3 (vel)
-        X[9:12],      # 3 (drpy)
-        U_aug         # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
+        e_c_vec,  # 3
+        e_l,  # 1
+        v_theta,  # 1
+        X[3:6],  # 3 (rpy)
+        X[6:9],  # 3 (vel)
+        X[9:12],  # 3 (drpy)
+        U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
     )
 
-    y_expr_e = cs.vertcat(
-        e_c_vec,
-        e_l,
-        v_theta,
-        X[3:6],
-        X[6:9],
-        X[9:12]
-    )
+    y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12])
 
     h_expr = cs.MX.zeros(10)
     for i in range(10):
-        p1 = p_capsules[i*7 + 0 : i*7 + 3]
-        p2 = p_capsules[i*7 + 3 : i*7 + 6]
-        r  = p_capsules[i*7 + 6]
-        
+        p1 = p_capsules[i * 7 + 0 : i * 7 + 3]
+        p2 = p_capsules[i * 7 + 3 : i * 7 + 6]
+        r = p_capsules[i * 7 + 6]
+
         v = p2 - p1
         w = pos - p1
-        
+
         v_dot_v = cs.dot(v, v)
         v_dot_v_safe = cs.if_else(v_dot_v > 1e-6, v_dot_v, 1e-6)
-        
+
         t = cs.dot(w, v) / v_dot_v_safe
         t = cs.fmax(0.0, cs.fmin(1.0, t))
-        
+
         closest_pt = p1 + t * v
         diff = pos - closest_pt
-        
+
         h_expr[i] = cs.dot(diff, diff) - r**2
 
     model = AcadosModel()
@@ -129,6 +123,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 
     return model
 
+
 def create_ocp_solver(
     time_steps: np.ndarray, parameters: dict, verbose: bool = False
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
@@ -143,7 +138,7 @@ def create_ocp_solver(
 
     N = len(time_steps)
     ocp.solver_options.N_horizon = N
-    
+
     # Calculate absolute time at each node (starting at 0)
     shooting_nodes = np.zeros(N + 1)
     shooting_nodes[1:] = np.cumsum(time_steps)
@@ -153,28 +148,35 @@ def create_ocp_solver(
     ocp.cost.cost_type_e = "NONLINEAR_LS"
 
     Q_c = 150.0
+    Q_c_z = 400.0
     Q_l = 150.0
     W_v_theta = 5.0
-    
-    W = np.diag([
-        Q_c, Q_c, Q_c, # e_c (3)
-        Q_l,           # e_l (1)
-        W_v_theta,     # v_theta (1)
-        1.0, 1.0, 1.0, # rpy (3)
-        1.0, 1.0, 1.0, # vel (3)
-        5.0, 5.0, 5.0, # drpy (3)
-        1.0, 1.0, 1.0, 50.0, # u (4)
-        0.5            # delta_v_theta (1)
-    ])
 
-    W_e = np.diag([
-        Q_c, Q_c, Q_c,
-        Q_l,
-        W_v_theta,
-        1.0, 1.0, 1.0,
-        1.0, 1.0, 1.0,
-        5.0, 5.0, 5.0
-    ])
+    W = np.diag(
+        [
+            Q_c,
+            Q_c,
+            Q_c_z,  # e_c (3)
+            Q_l,  # e_l (1)
+            W_v_theta,  # v_theta (1)
+            1.0,
+            1.0,
+            1.0,  # rpy (3)
+            1.0,
+            1.0,
+            1.0,  # vel (3)
+            5.0,
+            5.0,
+            5.0,  # drpy (3)
+            1.0,
+            1.0,
+            1.0,
+            10.0,  # u (4)
+            0.5,  # delta_v_theta (1)
+        ]
+    )
+
+    W_e = np.diag([Q_c, Q_c, Q_c_z, Q_l, W_v_theta, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 5.0, 5.0, 5.0])
 
     ocp.cost.W = W
     ocp.cost.W_e = W_e
@@ -245,6 +247,7 @@ def create_ocp_solver(
 
     return acados_ocp_solver, ocp
 
+
 class AttitudeMPC(Controller):
     """Example of a MPCC using the collective thrust and attitude interface."""
 
@@ -252,10 +255,7 @@ class AttitudeMPC(Controller):
         super().__init__(obs, info, config)
         dt_fine = 1 / config.env.freq
         dt_coarse = 0.05
-        self._time_steps = np.concatenate([
-            np.full(10, dt_fine),
-            np.full(15, dt_coarse)
-        ])
+        self._time_steps = np.concatenate([np.full(10, dt_fine), np.full(15, dt_coarse)])
         self._N = len(self._time_steps)
         self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
 
@@ -263,11 +263,13 @@ class AttitudeMPC(Controller):
         self._update_spline()
 
         self.drone_params = load_params("so_rpy", config.sim.drone_model)
-        self.drone_params["pos_limit_low"] = np.array(config.env.track.safety_limits.get("pos_limit_low", [-2.5, -1.5, 0.0]))
-        self.drone_params["pos_limit_high"] = np.array(config.env.track.safety_limits.get("pos_limit_high", [2.5, 1.5, 2.0]))
-        self._acados_ocp_solver, self._ocp = create_ocp_solver(
-            self._time_steps, self.drone_params
+        self.drone_params["pos_limit_low"] = np.array(
+            config.env.track.safety_limits.get("pos_limit_low", [-2.5, -1.5, 0.0])
         )
+        self.drone_params["pos_limit_high"] = np.array(
+            config.env.track.safety_limits.get("pos_limit_high", [2.5, 1.5, 2.0])
+        )
+        self._acados_ocp_solver, self._ocp = create_ocp_solver(self._time_steps, self.drone_params)
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
 
@@ -281,15 +283,17 @@ class AttitudeMPC(Controller):
     def _update_spline(self):
         u_samples = np.linspace(0, 1, 100)
         pts = self.planner._des_pos_spline(u_samples)
-        
+
         diffs = np.diff(pts, axis=0)
         chords = np.linalg.norm(diffs, axis=1)
         s = np.concatenate(([0], np.cumsum(chords)))
-        
+
         self._des_pos_spline = CubicSpline(s, pts)
         self._s_total = float(s[-1])
 
-    def compute_control(self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
+    def compute_control(
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+    ) -> NDArray[np.floating]:
         replanned = self.planner.update(obs)
         if replanned:
             self._update_spline()
@@ -298,7 +302,9 @@ class AttitudeMPC(Controller):
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
 
-        s_eval = np.linspace(max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 0.5), 20)
+        s_eval = np.linspace(
+            max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 0.5), 20
+        )
         pos = obs["pos"]
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
@@ -309,12 +315,20 @@ class AttitudeMPC(Controller):
             capsules = self.planner.capsules
             if len(capsules) > 0:
                 # Compute reference trajectory points along the shooting horizon
-                ref_points = np.array([
-                    self._des_pos_spline(np.clip(self._current_theta + t_node * self._current_v_theta, 0, self._s_total))
-                    for t_node in self._shooting_nodes
-                ])
+                ref_points = np.array(
+                    [
+                        self._des_pos_spline(
+                            np.clip(
+                                self._current_theta + t_node * self._current_v_theta,
+                                0,
+                                self._s_total,
+                            )
+                        )
+                        for t_node in self._shooting_nodes
+                    ]
+                )
                 midpoints = np.array([(cap.p1 + cap.p2) / 2.0 for cap in capsules])
-                
+
                 # Pairwise distances between midpoints and reference points
                 diffs = midpoints[:, None, :] - ref_points[None, :, :]
                 dists_to_path = np.linalg.norm(diffs, axis=2)
@@ -322,9 +336,9 @@ class AttitudeMPC(Controller):
                 closest_idx = np.argsort(min_dists_to_path)[:10]
                 for i, idx in enumerate(closest_idx):
                     cap = capsules[idx]
-                    capsule_params[i*7 : i*7+3] = cap.p1
-                    capsule_params[i*7+3 : i*7+6] = cap.p2
-                    capsule_params[i*7+6] = cap.radius
+                    capsule_params[i * 7 : i * 7 + 3] = cap.p1
+                    capsule_params[i * 7 + 3 : i * 7 + 6] = cap.p2
+                    capsule_params[i * 7 + 6] = cap.radius
                     is_gate_flags[i] = getattr(cap, "is_gate", False)
 
         Zl = 1000.0 * np.ones(10)
@@ -345,16 +359,18 @@ class AttitudeMPC(Controller):
 
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
         obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        
-        x0 = np.concatenate((
-            obs["pos"], 
-            obs["rpy"], 
-            obs["vel"], 
-            obs["drpy"], 
-            [self._current_theta], 
-            [self._current_v_theta]
-        ))
-        
+
+        x0 = np.concatenate(
+            (
+                obs["pos"],
+                obs["rpy"],
+                obs["vel"],
+                obs["drpy"],
+                [self._current_theta],
+                [self._current_v_theta],
+            )
+        )
+
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
         # Warm-start the state trajectory if tick is 0 or we just replanned
@@ -367,19 +383,21 @@ class AttitudeMPC(Controller):
                     theta_guess = self._current_theta + self._shooting_nodes[j] * v_start_guess
                     theta_guess = np.clip(theta_guess, 0, self._s_total)
                     pos_guess = self._des_pos_spline(theta_guess)
-                    
+
                     # Blend initial position and reference
                     alpha = min(1.0, j / 5.0)
                     blended_pos = (1 - alpha) * obs["pos"] + alpha * pos_guess
-                    
-                    x_guess = np.concatenate((
-                        blended_pos,
-                        obs["rpy"] * (1 - alpha),  # Blend rpy
-                        obs["vel"] * (1 - alpha),  # Blend vel
-                        obs["drpy"] * (1 - alpha), # Blend drpy
-                        [theta_guess],
-                        [v_start_guess]
-                    ))
+
+                    x_guess = np.concatenate(
+                        (
+                            blended_pos,
+                            obs["rpy"] * (1 - alpha),  # Blend rpy
+                            obs["vel"] * (1 - alpha),  # Blend vel
+                            obs["drpy"] * (1 - alpha),  # Blend drpy
+                            [theta_guess],
+                            [v_start_guess],
+                        )
+                    )
                 self._acados_ocp_solver.set(j, "x", x_guess)
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
@@ -388,23 +406,19 @@ class AttitudeMPC(Controller):
         for j in range(self._N + 1):
             theta_j = self._current_theta + self._shooting_nodes[j] * v_pred
             theta_j = np.clip(theta_j, 0, self._s_total)
-            
+
             p_j_pos = self._des_pos_spline(theta_j)
 
             segment = np.searchsorted(self._des_pos_spline.x, theta_j, side="right") - 1
             segment = np.clip(segment, 0, len(self._des_pos_spline.x) - 2)
-            
+
             theta_i = self._des_pos_spline.x[segment]
             c_x = self._des_pos_spline.c[:, segment, 0]
             c_y = self._des_pos_spline.c[:, segment, 1]
             c_z = self._des_pos_spline.c[:, segment, 2]
-            
-            p_j = np.concatenate((
-                [theta_i],
-                c_x, c_y, c_z,
-                capsule_params
-            ))
-            
+
+            p_j = np.concatenate(([theta_i], c_x, c_y, c_z, capsule_params))
+
             self._acados_ocp_solver.set(j, "p", p_j)
 
             Q_c_base = 150.0
@@ -414,11 +428,11 @@ class AttitudeMPC(Controller):
                 dist_to_target_gate = np.linalg.norm(target_gate_pos - p_j_pos)
                 dynamic_addition = 300.0 * np.exp(-(dist_to_target_gate**2) / (2 * 0.3**2))
                 Q_c_dynamic += dynamic_addition
-            
+
             W = self._acados_ocp_solver.cost_get(j, "W")
             W[0, 0] = Q_c_dynamic
             W[1, 1] = Q_c_dynamic
-            W[2, 2] = Q_c_dynamic
+            W[2, 2] = max(Q_c_dynamic, 400.0)
             self._acados_ocp_solver.cost_set(j, "W", W)
 
         # Logging for debugging
@@ -446,45 +460,55 @@ class AttitudeMPC(Controller):
                 f"Gate: {target_gate_idx} ({dist_gate_str}) | "
                 f"Obs Dist: {dist_obs_str} | "
                 f"Status: {status} ({hover_str})",
-                flush=True
+                flush=True,
             )
 
         if status not in [0, 2]:
             logger.warning(f"MPCC solver failed with status {status}. Entering hover mode.")
             if not hasattr(self, "_hover_pos"):
                 self._hover_pos = obs["pos"].copy()
-            
+
             pos_error = self._hover_pos - obs["pos"]
             vel_error = -obs["vel"]
-            
+
             kp = np.array([0.4, 0.4, 1.25])
             kd = np.array([0.2, 0.2, 0.4])
-            
+
             target_thrust = kp * pos_error + kd * vel_error
-            target_thrust[2] += self.drone_params["mass"] * abs(self.drone_params["gravity_vec"][-1])
-            
+            target_thrust[2] += self.drone_params["mass"] * abs(
+                self.drone_params["gravity_vec"][-1]
+            )
+
             z_axis = R.from_quat(obs["quat"]).as_matrix()[:, 2]
             thrust_desired = np.dot(target_thrust, z_axis)
-            
+
             z_axis_desired = target_thrust / np.linalg.norm(target_thrust)
             des_yaw = obs["rpy"][2]
             x_c_des = np.array([np.cos(des_yaw), np.sin(des_yaw), 0.0])
             y_axis_desired = np.cross(z_axis_desired, x_c_des)
             y_axis_desired /= np.linalg.norm(y_axis_desired)
             x_axis_desired = np.cross(y_axis_desired, z_axis_desired)
-            
+
             R_desired = np.vstack([x_axis_desired, y_axis_desired, z_axis_desired]).T
             euler_desired = R.from_matrix(R_desired).as_euler("xyz", degrees=False)
-            
+
             return np.concatenate([euler_desired, [thrust_desired]], dtype=np.float32)
         else:
             if hasattr(self, "_hover_pos"):
                 del self._hover_pos
-            
+
         u0 = self._acados_ocp_solver.get(0, "u")
         return u0[0:4]
 
-    def step_callback(self, action: NDArray[np.floating], obs: dict[str, NDArray[np.floating]], reward: float, terminated: bool, truncated: bool, info: dict) -> bool:
+    def step_callback(
+        self,
+        action: NDArray[np.floating],
+        obs: dict[str, NDArray[np.floating]],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict,
+    ) -> bool:
         self._tick += 1
         return self._finished
 
@@ -543,7 +567,7 @@ class AttitudeMPC(Controller):
         if self._s_total > 0:
             for s in np.linspace(0, self._s_total, 100):
                 full_spline_path.append(self._des_pos_spline(s))
-        
+
         if len(predicted_horizon) > 1:
             draw_line(
                 sim,
