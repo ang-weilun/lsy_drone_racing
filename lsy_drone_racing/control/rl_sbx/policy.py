@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 tfd = tfp.distributions
 
 # Hidden-layer widths for actor and critic MLPs, toggled via RL_HIDDEN_SIZE
-# (default 256). Read at import — before the tyro CLI parses args.
+# (default 256). Read at import — before the CLI parses args.
 # History: v131 ran 512 and v132 reverted it after observing a saturating
 # deterministic mean |tau|/alpha_max (0.47 vs rl_song's 0.08). That verdict is
 # now treated as inconclusive: it was confounded by an inert obstacle barrier

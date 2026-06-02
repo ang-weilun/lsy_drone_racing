@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -11,11 +12,7 @@ import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation
 
-from lsy_drone_racing.control.rl_song.config import (
-    ACTOR_OBS_DIM,
-    ENV_ACTION_DIM,
-    RAW_ACTION_DIM,
-)
+from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_DIM, ENV_ACTION_DIM, RAW_ACTION_DIM
 
 
 def _read_net_arch() -> tuple[int, ...]:
@@ -45,7 +42,33 @@ def _eval_constant_expr(node: ast.AST, constants: Mapping[str, Any]) -> Any:
         left = _eval_constant_expr(node.left, constants)
         right = _eval_constant_expr(node.right, constants)
         return left * right
+    if isinstance(node, ast.Call):
+        return _eval_call_expr(node, constants)
     return ast.literal_eval(node)
+
+
+def _eval_call_expr(node: ast.Call, constants: Mapping[str, Any]) -> Any:
+    """Evaluate the ``int(os.environ.get("RL_HIDDEN_SIZE", "256"))`` width read.
+
+    ``rl_sbx.policy`` resolves ``HIDDEN_SIZE`` from the ``RL_HIDDEN_SIZE`` env
+    var at import; the numpy deploy must read the SAME env var so its actor
+    width matches the trained checkpoint.
+    """
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "int":
+        return int(_eval_constant_expr(node.args[0], constants))
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "get"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "environ"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "os"
+    ):
+        key = _eval_constant_expr(node.args[0], constants)
+        default = _eval_constant_expr(node.args[1], constants) if len(node.args) > 1 else None
+        return os.environ.get(key, default)
+    raise ValueError(f"unsupported call expression in rl_sbx.policy: {ast.dump(node)}")
 
 
 # Raw action layout: one thrust scalar followed by a 3-d tangent vector.
@@ -101,9 +124,7 @@ def actor_mean(
 
 def _leaky_relu(x: npt.NDArray[np.floating]) -> npt.NDArray[np.float32]:
     """Leaky-ReLU with the flax default negative slope."""
-    return np.where(x >= 0.0, x, _LEAKY_RELU_NEGATIVE_SLOPE * x).astype(
-        np.float32, copy=False
-    )
+    return np.where(x >= 0.0, x, _LEAKY_RELU_NEGATIVE_SLOPE * x).astype(np.float32, copy=False)
 
 
 def raw_to_env_action(
@@ -204,11 +225,7 @@ def _dense_params(
     return layer
 
 
-def _validate_last_dim(
-    array: npt.NDArray[np.floating], expected_dim: int, name: str
-) -> None:
+def _validate_last_dim(array: npt.NDArray[np.floating], expected_dim: int, name: str) -> None:
     """Raise if an array's trailing dimension violates a static contract."""
     if array.shape[-1] != expected_dim:
-        raise ValueError(
-            f"{name} trailing dimension must be {expected_dim}; got {array.shape[-1]}"
-        )
+        raise ValueError(f"{name} trailing dimension must be {expected_dim}; got {array.shape[-1]}")

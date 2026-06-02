@@ -59,7 +59,7 @@ ACTOR_OBS_DRONE_DIM: int = 12  # full 9D rotation matrix + body-frame velocity
 ACTOR_OBS_GATE_DIM: int = 24
 ACTOR_OBS_PREV_ACTION_DIM: int = 0
 # Body-frame angular-velocity channel, toggled on for the L2 ω screen via the
-# RL_OBS_ANG_VEL env var. Read at import — before the tyro CLI parses args —
+# RL_OBS_ANG_VEL env var. Read at import — before the CLI parses args —
 # matching the controller_ablate ABLATE_MODE pattern. Default off preserves the
 # 52-d reference obs. See docs/superpowers/specs/
 # 2026-06-02-l3-obs-completion-capacity-base-design.md.

@@ -9,7 +9,7 @@ training-time clip range.
 
 Usage
 -----
-::
+Requires ``SCIPY_ARRAY_API=1`` in the environment (crazyflow). Then::
 
     RL_OBS_ANG_VEL=0 pixi run -e rl-train python scripts/check_obs_encoder_parity.py
     RL_OBS_ANG_VEL=1 pixi run -e rl-train python scripts/check_obs_encoder_parity.py
