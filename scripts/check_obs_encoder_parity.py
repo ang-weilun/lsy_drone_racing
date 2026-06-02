@@ -17,6 +17,7 @@ Requires ``SCIPY_ARRAY_API=1`` in the environment (crazyflow). Then::
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -60,6 +61,8 @@ def main() -> None:
     """Encode the fake obs with both encoders and assert they agree."""
     env_obs = _fake_env_obs()
     prev_action = np.zeros(4, dtype=np.float32)
+    # The JAX encoder uses jnp ops (e.g. ``.at[].set()``); feed it JAX arrays.
+    jax_env_obs = {key: jnp.asarray(value) for key, value in env_obs.items()}
 
     jax_norm = jax_obs.init_normalizer(ACTOR_OBS_DIM)
     np_norm = NormalizerState(
@@ -68,7 +71,9 @@ def main() -> None:
         count=np.asarray(NORM_VAR_EPS, dtype=np.float32),
     )
 
-    jax_out = np.asarray(jax_obs.build_actor_obs(env_obs, prev_action, jax_norm), dtype=np.float32)
+    jax_out = np.asarray(
+        jax_obs.build_actor_obs(jax_env_obs, jnp.asarray(prev_action), jax_norm), dtype=np.float32
+    )
     np_out = np_obs.build_actor_obs(env_obs, prev_action, np_norm)
 
     if jax_out.shape != (ACTOR_OBS_DIM,):
