@@ -3,8 +3,11 @@
 # Cold-trains one cell of the omega / 512 screen on the single-stage L2
 # curriculum. No --init-from (cold); --curriculum=default is the single L2
 # stage (rl_song.config.default_curriculum / stage1_level2_phase12). The reward
-# recipe is held at the SOTA spdobs03 flags so the only varying factor is the
-# cell's toggle (RL_OBS_ANG_VEL / RL_HIDDEN_SIZE).
+# is the minimal Song recipe (r_prog + r_omega + r_crash + r_finish; NO obstacle
+# / gate-frame barriers, NO time penalty) with alpha_max=0.36 -- the gentle
+# cold-start substrate, NOT the L3 SOTA speed recipe (alpha=1.4 + barriers +
+# time penalty, which thrashes a from-scratch policy). The only varying factor
+# is the cell's toggle (RL_OBS_ANG_VEL / RL_HIDDEN_SIZE).
 #
 # Usage (on box):
 #   bash box_launch_l2_screen.sh <run_name> <ang_vel 0|1> <hidden_size> [n_envs] [total_steps]
@@ -42,12 +45,10 @@ tmux new-session -d -s "$RUN_NAME" "
     --run-name=$RUN_NAME \
     --curriculum=default \
     --n-envs=$NENVS \
-    --alpha-max-rad=1.4 \
-    --time-penalty=0.40 \
+    --alpha-max-rad=0.36 \
+    --time-penalty=0.0 \
     --omega-coef=0.005 \
     --progress-coef=15 \
-    --use-obstacle-barrier --obstacle-weight=0.3 \
-    --use-gate-frame-barrier --gate-frame-weight=0.5 \
     --total-timesteps=$TOTAL \
     2>&1 | tee $LOG
 "

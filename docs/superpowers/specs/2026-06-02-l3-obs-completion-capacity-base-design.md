@@ -93,8 +93,13 @@ head and active clipped-VF stay. Log `|τ|/α_max` as the diagnostic.
 
 9D rotation; `prev_action` off; single coupled head; clipped-VF; `curriculum=default`
 (single L2 stage); cold start (`init_from` omitted); and **one fixed reward recipe
-across all cells** (the SOTA `box_launch_speed.sh` flags) so the only varying factor
-per cell is the toggle under test.
+across all cells** so the only varying factor per cell is the toggle under test. The
+recipe is the **minimal Song reward** — `r_prog + r_omega + r_crash + r_finish` only
+(NO obstacle / gate-frame barriers, NO time penalty) — with `alpha_max=0.36`. This is
+the gentle cold-start substrate, **not** the L3 SOTA speed recipe (`alpha=1.4` +
+barriers + `time_penalty=0.40`), which over-drives a from-scratch policy. (The first
+run, 2026-06-02, mistakenly used the SOTA recipe and produced 0% true-start across all
+cells — a recipe artifact, not a factor verdict; corrected here.)
 
 ## 4. Evaluation protocol
 
