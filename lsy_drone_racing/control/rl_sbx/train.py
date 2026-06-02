@@ -167,6 +167,7 @@ def train(
     wandb_project: str = WANDB_PROJECT,
     wandb_entity: str | None = None,
     no_wandb: bool = False,
+    profile_throughput: bool = False,
 ) -> None:
     """Run SBX PPO cold-train against the milestone-1 L2 seg-init curriculum.
 
@@ -209,6 +210,10 @@ def train(
         Skip wandb init entirely (stdout-only diagnostics). Default
         ``False`` — milestone-1 needs the wandb plots for the comparison
         write-up.
+    profile_throughput : bool, optional
+        Log per-rollout ``time/prof_scan_s`` / ``prof_host_s`` /
+        ``prof_update_plus_log_s`` (adds one ``block_until_ready`` sync).
+        Profiling only; default ``False``.
 
     Notes:
     -----
@@ -412,6 +417,8 @@ def train(
         verbose=1,
         # No ``tensorboard_log``: scalars go via ``WandbScalarCallback``.
     )
+    # Profiling-only: per-rollout scan/host/update timing into the SB3 logger.
+    model.profile_throughput = profile_throughput
 
     # 2026-05-25: optional warm-start from an existing checkpoint. The
     # checkpoint format mirrors save_step (5 files: actor.params.msgpack,

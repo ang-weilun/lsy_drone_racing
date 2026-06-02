@@ -57,6 +57,7 @@ Song, Y. et al. (2023). Reaching the limit in autonomous racing.
 
 from __future__ import annotations
 
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -156,6 +157,13 @@ class JitScanPPO(PPO):
                 "JitScanPPO.collect_rollouts called before _last_episode_starts initialized."
             )
 
+        profile = getattr(self, "profile_throughput", False)
+        if profile:
+            t_entry = time.perf_counter()
+            prev_exit = getattr(self, "_prof_last_exit", None)
+            if prev_exit is not None:
+                self.logger.record("time/prof_update_plus_log_s", t_entry - prev_exit)
+
         rollout_buffer.reset()
         callback.on_rollout_start()
 
@@ -213,6 +221,8 @@ class JitScanPPO(PPO):
         rng_key = self._next_rollout_rng_key()
         reset_rng_key = self._next_reset_rng_key()
 
+        if profile:
+            t_scan_start = time.perf_counter()
         scan_result: RLSBXScanResult = scan_rollout(
             env.jax_env.data,
             self.policy.actor_state.params,
@@ -230,6 +240,10 @@ class JitScanPPO(PPO):
             env.jax_env._reset,
             static_cfg,
         )
+        if profile:
+            jax.block_until_ready(scan_result)
+            t_scan_done = time.perf_counter()
+            self.logger.record("time/prof_scan_s", t_scan_done - t_scan_start)
 
         # Round-trip env state. The wrapper's ``_prev_env_obs`` is only
         # consumed by ``step_wait``; refreshing it here keeps the wrapper
@@ -432,6 +446,11 @@ class JitScanPPO(PPO):
             self.logger.record(f"reward/{name}", float(np.asarray(comp_arr).mean()))
 
         callback.on_rollout_end()
+
+        if profile:
+            t_exit = time.perf_counter()
+            self.logger.record("time/prof_host_s", t_exit - t_scan_done)
+            self._prof_last_exit = t_exit
         return True
 
     @staticmethod
