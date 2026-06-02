@@ -27,6 +27,7 @@ class SkeletonPoint(NamedTuple):
     gate_normal: NDArray | None
     gate_right: NDArray | None
     gate_up: NDArray | None
+    gate_idx: int | None = None
 
 
 class Capsule(NamedTuple):
@@ -42,8 +43,8 @@ class Capsule(NamedTuple):
 class FlightCorridor:
     """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
 
-    LIMIT_LOW = np.array([-2.5, -1.5, 0.0])
-    LIMIT_HIGH = np.array([2.5, 1.5, 2.0])
+    LIMIT_LOW = np.array([-3.5, -3.5, 0.0])
+    LIMIT_HIGH = np.array([3.5, 3.5, 3.0])
     BUFFER = 0.10
 
     def __init__(self, p1: NDArray, p2: NDArray) -> None:
@@ -583,23 +584,25 @@ class SfcCorridorPlanner:
                 # radius - otherwise it's just going around the gate, and
                 # the corridor must keep the frame as a real obstacle.
                 if cap.is_gate and cap.gate_idx is not None:
-                    g_pos = self.gates_pos[cap.gate_idx]
-                    g_normal = gate_normals[cap.gate_idx]
-                    d1 = float(np.dot(pt1.pos - g_pos, g_normal))
-                    d2 = float(np.dot(pt2.pos - g_pos, g_normal))
-                    # Frame outer radius is 0.36m; allow a small slack so the
-                    # pre/post anchors (which sit on the normal axis) still
-                    # qualify as a through-segment.
-                    near_radius = self.gate_outer / 2.0 + 0.10
-                    if d1 * d2 < 0.0:
-                        t = -d1 / (d2 - d1)
-                        crossing = pt1.pos + t * (pt2.pos - pt1.pos)
-                        if np.linalg.norm(crossing - g_pos) < near_radius:
+                    # ONLY skip if the segment is connecting to/from this gate
+                    if getattr(pt1, 'gate_idx', None) == cap.gate_idx or getattr(pt2, 'gate_idx', None) == cap.gate_idx:
+                        g_pos = self.gates_pos[cap.gate_idx]
+                        g_normal = gate_normals[cap.gate_idx]
+                        d1 = float(np.dot(pt1.pos - g_pos, g_normal))
+                        d2 = float(np.dot(pt2.pos - g_pos, g_normal))
+                        # Frame outer radius is 0.36m; allow a small slack so the
+                        # pre/post anchors (which sit on the normal axis) still
+                        # qualify as a through-segment.
+                        near_radius = self.gate_outer / 2.0 + 0.10
+                        if d1 * d2 < 0.0:
+                            t = -d1 / (d2 - d1)
+                            crossing = pt1.pos + t * (pt2.pos - pt1.pos)
+                            if np.linalg.norm(crossing - g_pos) < near_radius:
+                                continue
+                        elif d1 == 0.0 and np.linalg.norm(pt1.pos - g_pos) < near_radius:
                             continue
-                    elif d1 == 0.0 and np.linalg.norm(pt1.pos - g_pos) < near_radius:
-                        continue
-                    elif d2 == 0.0 and np.linalg.norm(pt2.pos - g_pos) < near_radius:
-                        continue
+                        elif d2 == 0.0 and np.linalg.norm(pt2.pos - g_pos) < near_radius:
+                            continue
 
                 c1, c2 = closest_points_segments(pt1.pos, pt2.pos, cap.p1, cap.p2)
                 vec = c1 - c2  # Points from obstacle towards the segment
@@ -937,7 +940,7 @@ class SfcCorridorPlanner:
                 exit_vector = next_pos - (prev_pos + prev_normal * self.anchor_gap)
                 if float(np.dot(exit_vector, prev_normal)) < -0.2:
                     clearance_pos = prev_pos + prev_normal * (self.anchor_gap + 1.0)
-                    raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
+                    raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None, gate_idx=prev_gate_idx))
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
@@ -956,9 +959,9 @@ class SfcCorridorPlanner:
                     swing_pos = pos + right * 0.5
                 else:
                     swing_pos = pos - right * 0.5
-                raw_path.append(SkeletonPoint(swing_pos, False, None, None, None))
+                raw_path.append(SkeletonPoint(swing_pos, False, None, None, None, gate_idx=i))
 
-            raw_path.append(SkeletonPoint(pos, True, normal, right, up))
+            raw_path.append(SkeletonPoint(pos, True, normal, right, up, gate_idx=i))
 
             # EXIT SWING (Hairpin / Reversal Logic)
             if i + 1 < len(self.gates_pos):
@@ -969,14 +972,14 @@ class SfcCorridorPlanner:
 
                 if np.dot(exit_vector, normal) < -0.2:
                     clearance_pos = pos + normal * (self.anchor_gap + 1.0)
-                    raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None))
+                    raw_path.append(SkeletonPoint(clearance_pos, False, None, None, None, gate_idx=i))
 
                     if np.dot(exit_vector, right) > 0:
                         exit_swing = clearance_pos + right * 1.0 - normal * 0.7
                     else:
                         exit_swing = clearance_pos - right * 1.0 - normal * 0.7
 
-                    raw_path.append(SkeletonPoint(exit_swing, False, None, None, None))
+                    raw_path.append(SkeletonPoint(exit_swing, False, None, None, None, gate_idx=i))
 
         # Add an additional waypoint after the final gate to maintain speed through the finish line
         if len(self.gates_pos) > 0 and self.target_gate_idx <= len(self.gates_pos):
@@ -984,7 +987,7 @@ class SfcCorridorPlanner:
             last_pos = self.gates_pos[last_gate_idx]
             last_normal = gate_normals[last_gate_idx]
             finish_pos = last_pos + last_normal * 0.75
-            raw_path.append(SkeletonPoint(finish_pos, False, None, None, None))
+            raw_path.append(SkeletonPoint(finish_pos, False, None, None, None, gate_idx=last_gate_idx))
 
         obs_circles = []
         for p in self.obstacles_pos:
@@ -1053,7 +1056,7 @@ class SfcCorridorPlanner:
         for pt in path:
             clipped_pos = np.clip(pt.pos, low, high)
             clipped_path.append(
-                SkeletonPoint(clipped_pos, pt.is_gate, pt.gate_normal, pt.gate_right, pt.gate_up)
+                SkeletonPoint(clipped_pos, pt.is_gate, pt.gate_normal, pt.gate_right, pt.gate_up, gate_idx=getattr(pt, 'gate_idx', None))
             )
 
         return clipped_path
