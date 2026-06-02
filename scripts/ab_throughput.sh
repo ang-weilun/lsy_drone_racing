@@ -41,6 +41,7 @@ pixi run -e rl-train python -m lsy_drone_racing.control.rl_sbx.train \
   --use-obstacle-barrier --obstacle-weight=0.3 \
   --use-gate-frame-barrier --gate-frame-weight=0.5 \
   --curriculum=full --stage-idx=5 --seed=0 \
+  --diag-every-n-rollouts="${DIAG_EVERY:-1}" \
   --total-timesteps="$TOTAL" --no-wandb --profile-throughput \
   2>&1 | tee "$LOG"
 echo "arm=$ARM done; log=$LOG"
