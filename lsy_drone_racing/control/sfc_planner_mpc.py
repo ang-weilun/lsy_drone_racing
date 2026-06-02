@@ -205,6 +205,11 @@ class SfcCorridorPlanner:
         if not moved and gate_changed:
             reason = "gate_passed"
 
+        if moved:
+            self.gates_pos = obs["gates_pos"].copy()
+            self.gates_quat = obs["gates_quat"].copy()
+            self.obstacles_pos = obs.get("obstacles_pos", np.array([])).copy()
+
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
         self._last_replan_tick = self._tick
         self._record_replan_event(reason=reason)
@@ -1061,7 +1066,6 @@ class SfcCorridorPlanner:
             len(self.gates_pos) > 0
             and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.01
         ):
-            self.gates_pos, self.gates_quat = new_gates_pos.copy(), obs["gates_quat"].copy()
             gate_moved = True
 
         new_obs_pos = obs.get("obstacles_pos", np.array([]))
@@ -1069,7 +1073,6 @@ class SfcCorridorPlanner:
             len(new_obs_pos) > 0
             and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.01
         ):
-            self.obstacles_pos = new_obs_pos.copy()
             obs_moved = True
 
         if gate_moved and obs_moved:
