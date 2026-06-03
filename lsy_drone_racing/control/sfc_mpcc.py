@@ -219,9 +219,9 @@ def create_ocp_solver(
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
 
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5])
-    ocp.constraints.idxbx = np.array([3, 4, 5])
+    ocp.constraints.lbx = np.array([-np.pi/2, -np.pi/2, -np.pi, 0.5])
+    ocp.constraints.ubx = np.array([np.pi/2, np.pi/2, np.pi, 20.0])
+    ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
     ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -5.0])
     ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 5.0])
