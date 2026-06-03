@@ -8,7 +8,7 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Horizon Parameters ---
-    N_fine: int = 10
+    N_fine: int = 20
     """Number of fine time steps at the beginning of the horizon."""
 
     N_coarse: int = 15
@@ -34,7 +34,7 @@ class MPCCConfig:
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
-    mu: float = 10.0
+    mu: float = 15.0
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
 
     # --- Dynamic Tuning ---
