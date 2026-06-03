@@ -20,3 +20,12 @@ c_generated_code/
 !.pixi/config.toml
 ros_ws/
 acados/
+
+# render artifacts and large binaries (not checkpoints)
+renders/
+*.mp4
+*.pdf
+*.tar.gz
+deploy_bundle.tar.gz
+gate_colour_code.txt
+responses*.txt
