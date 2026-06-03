@@ -11,8 +11,11 @@ The actor observation is ``[drone | gates | obstacles]``:
 * drone (12, or 15 with RL_OBS_ANG_VEL=1): full 9D rotation matrix and
   body-frame linear velocity (3), optionally followed by body-frame angular
   velocity (3).
-* gates (24): target gate corners in body frame (12), then the next-gate
-  minus target-gate corner deltas in body frame (12).
+* gates (50): target gate corners in body frame (12), the next-gate minus
+  target-gate corner deltas in body frame (12), then the two non-window gates
+  (target+2, target+3 = just-passed) as absolute body-frame corners (12) plus a
+  visited flag (1) each — the collision-avoidance channel for frames the aiming
+  window does not cover.
 * obstacles (16): the ``N_NEAREST_OBSTACLES = 2`` nearest obstacles in
   body-frame XY distance, packed into permutation-stable slots. Per slot:
   body-frame XY relative position (2), body-frame velocity projected onto
@@ -43,6 +46,13 @@ from lsy_drone_racing.control.rl_song.config import (
 
 # Number of future gates encoded in the actor observation (target + 1).
 N_FUTURE_GATES: int = 2
+# Number of non-window gates encoded purely for collision avoidance: the gates
+# outside the {target, target+1} aiming window. For a 4-gate track these are
+# target+2 and target+3 (= the just-passed gate). Encoded as absolute body-frame
+# aperture corners + a visited flag, NOT as aiming deltas — for avoidance the
+# useful quantity is "where is this frame relative to me." Cyclic offset makes
+# the slots permutation-stable (no rank-flip), so no identity one-hot is needed.
+N_EXTRA_GATE_SLOTS: int = 2
 # Half extents of the gate opening in the gate's local (y, z) plane. The
 # track configs specify a 0.4 m x 0.4 m opening; see e.g. ``config/level1.toml``
 # header comment "Gates are square. Gates are 0.72m wide ... with a 0.4m wide
@@ -261,8 +271,23 @@ def build_actor_obs(
     g_next_corners_w = _gate_corners_world(g_next_pos, g_next_quat)
     inter_gate_delta_body = (g_next_corners_w - g_target_corners_w) @ rot_bw.T
 
+    # Blind-gate collision channel: gates outside the {target, target+1} window
+    # (target+2, target+3 = just-passed). Absolute body-frame corners + visited.
+    gates_visited = env_obs["gates_visited"]
+    extra_indices = (
+        target_idx + jnp.arange(N_FUTURE_GATES, N_FUTURE_GATES + N_EXTRA_GATE_SLOTS)
+    ) % n_gates
+
+    def _abs_body_corners(idx: Array) -> Array:
+        corners_w = _gate_corners_world(gates_pos[idx], gates_quat[idx])
+        return ((corners_w - pos) @ rot_bw.T).reshape(-1)
+
+    extra_corners = jax.vmap(_abs_body_corners)(extra_indices)  # (N_EXTRA, 12)
+    extra_visited = gates_visited[extra_indices].astype(jnp.float32)[:, None]  # (N_EXTRA, 1)
+    extra_chan = jnp.concatenate([extra_corners, extra_visited], axis=-1).reshape(-1)
+
     gate_chan = jnp.concatenate(
-        [target_corners_body.reshape(-1), inter_gate_delta_body.reshape(-1)]
+        [target_corners_body.reshape(-1), inter_gate_delta_body.reshape(-1), extra_chan]
     )
 
     _ = prev_action

@@ -16,6 +16,10 @@ from lsy_drone_racing.control.rl_song.config import ACTOR_OBS_ANG_VEL_DIM, ACTOR
 # Number of future gates encoded in actor observations.
 N_FUTURE_GATES: int = int(read_rl_song_obs_constant("N_FUTURE_GATES"))
 
+# Number of non-window gates encoded for collision avoidance (mirror of
+# rl_song.obs.N_EXTRA_GATE_SLOTS).
+N_EXTRA_GATE_SLOTS: int = int(read_rl_song_obs_constant("N_EXTRA_GATE_SLOTS"))
+
 # Number of obstacles encoded in actor observations.
 N_OBSTACLES: int = int(read_rl_song_obs_constant("N_OBSTACLES"))
 
@@ -105,7 +109,24 @@ def build_actor_obs(
     g_next_quat = gates_quat[gate_indices[1]]
     g_next_corners_w = _gate_corners_world(g_next_pos, g_next_quat, corners_local)
     inter_gate_delta_body = (g_next_corners_w - g_target_corners_w) @ rot_bw.T
-    gate_chan = np.concatenate([target_corners_body.reshape(-1), inter_gate_delta_body.reshape(-1)])
+
+    # Blind-gate collision channel (mirror of rl_song.obs): gates outside the
+    # {target, target+1} window, as absolute body-frame corners + visited.
+    gates_visited = np.asarray(env_obs["gates_visited"])
+    extra_indices = (
+        target_idx + np.arange(N_FUTURE_GATES, N_FUTURE_GATES + N_EXTRA_GATE_SLOTS, dtype=np.int64)
+    ) % n_gates
+    extra_parts = []
+    for idx in extra_indices:
+        corners_w = _gate_corners_world(gates_pos[idx], gates_quat[idx], corners_local)
+        corners_body = (corners_w - pos) @ rot_bw.T
+        extra_parts.append(
+            np.concatenate([corners_body.reshape(-1), [np.float32(gates_visited[idx])]])
+        )
+    extra_chan = np.concatenate(extra_parts).astype(np.float32)
+    gate_chan = np.concatenate(
+        [target_corners_body.reshape(-1), inter_gate_delta_body.reshape(-1), extra_chan]
+    )
 
     _ = prev_action
 

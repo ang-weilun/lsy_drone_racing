@@ -56,7 +56,11 @@ ACTOR_OBS_DRONE_DIM: int = 12  # full 9D rotation matrix + body-frame velocity
 # forced the network to learn world->body rotation and gate-orientation
 # extraction implicitly; the recursive body/target-frame layout exposes
 # both directly. See ``obs.build_actor_obs`` lines for the v124 commentary.
-ACTOR_OBS_GATE_DIM: int = 24
+# 12 (target abs corners) + 12 (next-gate delta corners) + 2 blind-gate slots
+# of (12 abs corners + 1 visited) = 50. The blind slots (target+2, target+3 =
+# just-passed) encode non-window gate frames for collision avoidance; see
+# docs/superpowers/specs/2026-06-02-nontarget-gate-frame-obs-design.md.
+ACTOR_OBS_GATE_DIM: int = 50
 ACTOR_OBS_PREV_ACTION_DIM: int = 0
 # Body-frame angular-velocity channel, toggled on for the L2 ω screen via the
 # RL_OBS_ANG_VEL env var. Read at import — before the CLI parses args —
@@ -75,7 +79,7 @@ ACTOR_OBS_DIM: int = (
     + ACTOR_OBS_PREV_ACTION_DIM
     + ACTOR_OBS_OBSTACLE_DIM
 )
-assert ACTOR_OBS_DIM == 52 + ACTOR_OBS_ANG_VEL_DIM, "Actor obs layout drift"
+assert ACTOR_OBS_DIM == 78 + ACTOR_OBS_ANG_VEL_DIM, "Actor obs layout drift"
 
 
 @dataclass(frozen=True)
