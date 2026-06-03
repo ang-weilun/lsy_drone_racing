@@ -20,14 +20,16 @@ The update is **host-bound, not compute-bound** (GPU ~1% during it). The scan ro
 
 I had assumed the path to ~500K was "port rl_song's fused update." **It isn't — rl_song has no fused update.** Its update is the *same* host-side double-loop we have (`rl_song/train.py:869-885`, per-minibatch jitted `_train_minibatch` at `train.py:902`). Only the **rollout** is scanned (`scan_rollout`, `rollout.py:412`). rl_song reaches ~700k SPS purely by **rollout scale**: `n_envs=16384 × n_steps=250 = 4.1M transitions/rollout` (`config.py:112,130`), so the fixed host-loop overhead is amortized over a giant batch — and its net is only 256-wide (`policy.py:36`). So there are two distinct levers, not one.
 
-## Lever A (cheap, proven) — bigger rollouts
+## Lever A (cheap, ALREADY PROVEN on our codebase) — bigger rollouts
 
-Scale `n_envs`/`n_steps` so the fixed ~10 s host overhead is amortized over more samples. This is *literally what rl_song does* — no rewrite, just config. Near-linear SPS until limited by:
-- **GPU memory:** our config is **512-wide + 78-d obs** (vs rl_song's 256-wide); 16384 envs may not fit 32 GB — must measure. A 4096→8192 step is the safe first move.
-- **Compute-bound crossover:** at 512-wide the per-sample backward is ~4× rl_song's, so gains go sub-linear sooner than rl_song sees.
-- **PPO batch dynamics:** more envs = fewer updates per env-step + different gradient noise; the relB recipe was tuned at 4096, so a bigger batch needs a quick convergence sanity-check before the numbers are trusted.
+Scale `n_envs`/`n_steps` so the fixed host overhead is amortized over more samples. This is *literally what rl_song does* — no rewrite, just config — **and our own stack already validated it**: per memory `rl-sbx-throughput-bottleneck`, commit `c0b410f` (defer per-minibatch `.item()` syncs) at **16384 envs + 256-wide** took the update 45.2 s→3.9 s and **fps ~70k→~524k** (2026-06-02). So "524k" is real and on our branch; **our current 91k is purely the config — 4096 envs + 512-wide.**
 
-**Verdict:** the right first lever. Low risk, no code, partial gain (~+30–100%).
+The catch is a **width↔envs↔memory tradeoff**:
+- **512-wide caps the env count.** Our 4096 envs already use 24.7/32.6 GB. 16384 envs (what hit 524k) needs ~4× the rollout/activation memory — it **will not fit 32 GB at 512-wide** (the 524k run was 256-wide, smaller activations). 8192-wide-512 is the realistic ceiling to *test* (may still OOM).
+- **Compute-bound crossover:** at 512-wide the backward is ~4× the 256-wide cost, so even where memory allows more envs, gains go sub-linear and the update may shift from host-bound to **compute-bound** — in which case bigger batches help less and the fuse helps not at all. *Open question: is our 512-wide update still GPU-~1% (host-bound) or now GPU-busy (compute-bound)? One `nvidia-smi` sample during the update settles it.*
+- **PPO batch dynamics:** more envs = fewer updates/env-step + different gradient noise; relB was tuned at 4096 → needs a convergence sanity-check.
+
+**Verdict:** the right first lever **if we can relax width to 256** (→ proven 524k at 16384). At **512-wide** (our capacity choice) we're memory-capped to ~4096–8192 envs → ~91–180k, and the real question becomes whether 512 is worth keeping (the L2 ω/512 screen is exactly testing that).
 
 ## Lever B (net-new, biggest ceiling) — fuse the update on-device
 
@@ -62,8 +64,11 @@ Pin a fixed numpy+JAX seed; clone initial `actor_state.params`, `vf_state.params
 
 ## Recommendation
 
-1. **Now / cheap:** pull Lever A (bump `n_envs` 4096→8192, keep minibatch *count* fixed) and measure SPS + a short convergence sanity-check. Likely ~+50–100% for free, modulo 512-wide memory.
-2. **Separate workstream:** Lever B (fuse) only if A doesn't get us far enough. It's ~1–2 focused days (in-JAX GAE + permute + scan + parity harness), net-new (no rl_song reference), with real divergence risk — but it's the only path to the ~500K ceiling and would 5–10× *every* future campaign run. Gate it behind the parity harness above.
-3. **Not worth it for the current diagnostic run** (we're at 91k → L2 ~55 min, L3 stage-5 faster). This is campaign infrastructure, not blocking.
+The decision is really **width**, not the fuse:
 
-**Open unknowns:** exact `(n_steps, n_envs, batch_size, n_epochs)` and `N % batch_size` for the production recipe (verify divisibility); whether 16384 envs fit 32 GB at 512-wide; SBX runtime version vs the `/tmp/sbx-src` source the sweep read.
+1. **If 256-wide is acceptable** (the L2 ω/512 screen is testing exactly whether 512 earns its keep): just run **16384 envs at 256-wide** → **~524k, already proven, zero code**. The fuse is then *not worth it* (memory note: at 16384 envs the update is already ~3.9 s, ~1.5× headroom for a big refactor).
+2. **If 512-wide is required** (capacity): we're memory-capped to ~4096–8192 envs → ~91–180k. **First** measure GPU util during the update — if it's still host-bound (~1%), the fuse (B) is the lever that gives high SPS *without* needing 16384 envs; if it's now compute-bound, neither the fuse nor bigger batches help and the only lever is narrower net / fewer epochs.
+3. **Lever B (fuse) is a separate, parity-gated workstream** — ~1–2 focused days (in-JAX GAE + permute + scan + the parity harness above), net-new (no rl_song reference), real divergence risk. Justified only in the 512-wide-and-host-bound case, where it would 5–10× every future 512-wide run.
+4. **Nothing here blocks the current diagnostic run** (91k → L2 ~55 min, L3 stage-5 faster).
+
+**Open unknowns:** GPU util during the 512-wide update (host- vs compute-bound — the pivotal measurement); whether 8192 envs fit 32 GB at 512-wide; exact `(n_steps, n_envs, batch_size, n_epochs)` + `N % batch_size` divisibility; SBX runtime version vs the `/tmp/sbx-src` source the sweep read.
