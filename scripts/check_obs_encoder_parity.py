@@ -50,6 +50,7 @@ def _fake_env_obs() -> dict[str, np.ndarray]:
             np.linspace([0.6, -0.6, 0.8], [3.2, 0.6, 1.0], _N_GATES), 0.08
         ).astype(np.float32),
         "gates_quat": gates_quat.astype(np.float32),
+        "gates_visited": rng.choice([False, True], size=_N_GATES).astype(bool),
         "obstacles_pos": rng.normal(
             np.linspace([0.5, 0.7, 1.0], [2.8, -0.7, 1.0], _N_OBSTACLES), 0.1
         ).astype(np.float32),
