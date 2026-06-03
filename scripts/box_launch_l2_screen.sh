@@ -49,6 +49,7 @@ tmux new-session -d -s "$RUN_NAME" "
     --time-penalty=0.0 \
     --omega-coef=0.005 \
     --progress-coef=15 \
+    --diag-every-n-rollouts=20 \
     --total-timesteps=$TOTAL \
     2>&1 | tee $LOG
 "
