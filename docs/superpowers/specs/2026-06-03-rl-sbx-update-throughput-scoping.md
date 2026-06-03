@@ -24,12 +24,21 @@ I had assumed the path to ~500K was "port rl_song's fused update." **It isn't �
 
 Scale `n_envs`/`n_steps` so the fixed host overhead is amortized over more samples. This is *literally what rl_song does* — no rewrite, just config — **and our own stack already validated it**: per memory `rl-sbx-throughput-bottleneck`, commit `c0b410f` (defer per-minibatch `.item()` syncs) at **16384 envs + 256-wide** took the update 45.2 s→3.9 s and **fps ~70k→~524k** (2026-06-02). So "524k" is real and on our branch; **our current 91k is purely the config — 4096 envs + 512-wide.**
 
-The catch is a **width↔envs↔memory tradeoff**:
-- **512-wide caps the env count.** Our 4096 envs already use 24.7/32.6 GB. 16384 envs (what hit 524k) needs ~4× the rollout/activation memory — it **will not fit 32 GB at 512-wide** (the 524k run was 256-wide, smaller activations). 8192-wide-512 is the realistic ceiling to *test* (may still OOM).
-- **Compute-bound crossover:** at 512-wide the backward is ~4× the 256-wide cost, so even where memory allows more envs, gains go sub-linear and the update may shift from host-bound to **compute-bound** — in which case bigger batches help less and the fuse helps not at all. *Open question: is our 512-wide update still GPU-~1% (host-bound) or now GPU-busy (compute-bound)? One `nvidia-smi` sample during the update settles it.*
-- **PPO batch dynamics:** more envs = fewer updates/env-step + different gradient noise; relB was tuned at 4096 → needs a convergence sanity-check.
+**MEASURED 2026-06-03 (5090, 512-wide, mem_frac 0.95) — bigger batches do NOT help at 512-wide:**
 
-**Verdict:** the right first lever **if we can relax width to 256** (→ proven 524k at 16384). At **512-wide** (our capacity choice) we're memory-capped to ~4096–8192 envs → ~91–180k, and the real question becomes whether 512 is worth keeping (the L2 ω/512 screen is exactly testing that).
+| n_envs | fits 32 GB? | steady SPS | update/rollout |
+|---|---|---|---|
+| 4096 | yes | ~91k | 9.7 s |
+| 8192 | yes | ~65k | 20.5 s |
+| 16384 | **yes** | ~81k | 42 s |
+
+Two corrections to my earlier assumptions:
+- **16384 envs DOES fit at 512-wide.** The 24.7 GB I'd cited was JAX's default 75% preallocation, not a real limit — memory is **not** the constraint.
+- **More envs gives no amortization.** The update scales ~linearly with `n_envs` (9.7→20.5→42 s) because the host/dispatch cost is **per-minibatch** and growing `n_envs` at fixed minibatch *size* grows the minibatch *count* proportionally. So SPS stays ~flat (~65–91k). The "big-batch amortizes" intuition only works if you grow minibatch *size* (fewer, bigger minibatches) — **untested**, and it changes PPO gradient noise.
+
+**So the lever is width, not batch.** 256-wide + 16384 envs = ~524k (proven, memory note); 512-wide ≈ 90k regardless of env count — **~6× slower, and you cannot batch your way out of it.** The 512-vs-256 decision (the L2 ω/512 screen) is therefore *also* a ~6× throughput decision.
+
+**Remaining cheap lever (untested):** larger minibatch *size* at fixed `n_envs` (fewer dispatches → less per-minibatch host overhead), accepting a PPO gradient-noise retune.
 
 ## Lever B (net-new, biggest ceiling) — fuse the update on-device
 
