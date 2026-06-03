@@ -460,6 +460,8 @@ class SfcCorridorPlanner:
     def _generate_flight_corridors(
         self, skeleton_path: list[SkeletonPoint], capsules: list[Capsule]
     ) -> list[FlightCorridor]:
+        """Constructs a convex polyhedron for each segment via separating planes."""
+        # Precompute per-gate normal in world frame; used to scope the gate-skip rule.
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         corridors = []
 
@@ -468,8 +470,15 @@ class SfcCorridorPlanner:
             pt2 = skeleton_path[i + 1]
             corr = FlightCorridor(pt1.pos, pt2.pos)
 
+            # Add separating half-spaces for all capsules
             for cap in capsules:
+                # Skip a gate's frame capsules only for segments that pass
+                # through the gate's opening. The segment must (a) cross the
+                # gate's normal plane and (b) cross it within the frame's
+                # radius - otherwise it's just going around the gate, and
+                # the corridor must keep the frame as a real obstacle.
                 if cap.is_gate and cap.gate_idx is not None:
+                    # ONLY skip if the segment is connecting to/from this gate
                     if (
                         getattr(pt1, "gate_idx", None) == cap.gate_idx
                         or getattr(pt2, "gate_idx", None) == cap.gate_idx
@@ -478,6 +487,9 @@ class SfcCorridorPlanner:
                         g_normal = gate_normals[cap.gate_idx]
                         d1 = float(np.dot(pt1.pos - g_pos, g_normal))
                         d2 = float(np.dot(pt2.pos - g_pos, g_normal))
+                        # Frame outer radius is 0.36m; allow a small slack so the
+                        # pre/post anchors (which sit on the normal axis) still
+                        # qualify as a through-segment.
                         near_radius = self.config.gate_outer / 2.0 + 0.10
                         if d1 * d2 < 0.0:
                             t = -d1 / (d2 - d1)
@@ -490,7 +502,7 @@ class SfcCorridorPlanner:
                             continue
 
                 c1, c2 = closest_points_segments(pt1.pos, pt2.pos, cap.p1, cap.p2)
-                vec = c1 - c2
+                vec = c1 - c2  # Points from obstacle towards the segment
                 dist = np.linalg.norm(vec)
 
                 if dist > 1e-5:
@@ -852,6 +864,17 @@ class SfcCorridorPlanner:
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
+        # Preserve the just-passed gate's clearance anchor when a replan fires
+        # mid-exit. Without this, the new skeleton goes straight from the
+        # drone (still inside the previous gate's exit zone) to the next
+        # gate's pre_pos, ignoring the forward-along-normal commitment the
+        # drone is currently flying out on. The drone ends up flying with
+        # momentum along the old route while the spline pulls it onto a path
+        # that demands an instantaneous direction change. Re-emitting only
+        # the clearance anchor (along the prev gate's normal) keeps the
+        # tangent aligned with the drone's current heading without forcing
+        # the perpendicular exit_swing detour, which over-commits when the
+        # drone has already started its turn.
         prev_gate_idx = self.target_gate_idx - 1
         if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(self.gates_pos):
             prev_pos = self.gates_pos[prev_gate_idx]
@@ -859,6 +882,8 @@ class SfcCorridorPlanner:
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
             if 0.0 < d_post < 1.0:
                 next_pos = self.gates_pos[self.target_gate_idx]
+                # Test against prev_pos + prev_normal * anchor_gap, the canonical
+                # post-gate exit point (no post_pos anchor in skeleton anymore).
                 exit_vector = next_pos - (prev_pos + prev_normal * self.config.anchor_gap)
                 if float(np.dot(exit_vector, prev_normal)) < -0.2:
                     clearance_pos = prev_pos + prev_normal * (self.config.anchor_gap + 1.0)
@@ -870,13 +895,16 @@ class SfcCorridorPlanner:
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
-            pos[2] += 0.10
+            #pos[2] += 0.00  # Add upward bias to counter altitude drop
             normal = gate_normals[i].copy()
             rot = R.from_quat(self.gates_quat[i])
             right = rot.apply([0, 1, 0])
             up = rot.apply([0, 0, 1])
 
             flow_dir = pos - raw_path[-1].pos
+
+            # ENTRY SWING (U-turn approach logic). Computed against gate centre
+            # rather than a pre_pos anchor — same dot-product test, ~0.5 m
             if np.dot(flow_dir, normal) < -0.1:
                 if np.dot(raw_path[-1].pos - pos, right) > 0:
                     swing_pos = pos + right * 0.5
@@ -886,8 +914,11 @@ class SfcCorridorPlanner:
 
             raw_path.append(SkeletonPoint(pos, True, normal, right, up, gate_idx=i))
 
+            # EXIT SWING (Hairpin / Reversal Logic)
             if i + 1 < len(self.gates_pos):
                 next_pos = self.gates_pos[i + 1]
+                # Test against pos + normal * anchor_gap, the canonical post-gate
+                # exit point, even though no post_pos anchor is in the skeleton.
                 exit_vector = next_pos - (pos + normal * self.config.anchor_gap)
                 if np.dot(exit_vector, normal) < -0.2:
                     clearance_pos = pos + normal * (self.config.anchor_gap + 1.0)
@@ -900,6 +931,7 @@ class SfcCorridorPlanner:
                         exit_swing = clearance_pos - right * 1.0 - normal * 0.7
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None, gate_idx=i))
 
+        # Add an additional waypoint after the final gate to maintain speed through the finish line
         if len(self.gates_pos) > 0 and self.target_gate_idx <= len(self.gates_pos):
             last_gate_idx = len(self.gates_pos) - 1
             last_pos = self.gates_pos[last_gate_idx]
