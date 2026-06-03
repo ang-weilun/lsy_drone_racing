@@ -7,6 +7,16 @@ import numpy as np
 class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
+    # --- Horizon Parameters ---
+    N_fine: int = 10
+    """Number of fine time steps at the beginning of the horizon."""
+
+    N_coarse: int = 15
+    """Number of coarse time steps at the end of the horizon."""
+
+    dt_coarse: float = 0.05
+    """Time step duration for the coarse horizon steps (s)."""
+
     # --- Cost Weights ---
     Q_c: float = 150.0
     """Contouring error penalty (lateral/longitudinal). Higher values force the drone to stay strictly on path."""

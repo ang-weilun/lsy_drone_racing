@@ -261,8 +261,13 @@ class AttitudeMPC(Controller):
         self.planner_config = PlannerConfig()
 
         dt_fine = 1 / config.env.freq
-        dt_coarse = 0.05
-        self._time_steps = np.concatenate([np.full(10, dt_fine), np.full(15, dt_coarse)])
+        dt_coarse = self.mpcc_config.dt_coarse
+        self._time_steps = np.concatenate(
+            [
+                np.full(self.mpcc_config.N_fine, dt_fine),
+                np.full(self.mpcc_config.N_coarse, dt_coarse),
+            ]
+        )
         self._N = len(self._time_steps)
         self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
 
