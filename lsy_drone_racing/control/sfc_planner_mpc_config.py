@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 class PlannerConfig:
     """Configuration for the SFC B-Spline Path Planner."""
 
-
     # --- Optimizer Weights ---
     W_VEL: float = 2.0
     """Penalty on velocity (first derivative of control points)."""
@@ -158,12 +157,12 @@ class PlannerConfig:
     OBSTACLE_AVOIDANCE_PUSH_EXTRA: float = 0.20
     """Push offset distance (m) beyond obstacle radius to place the generated avoidance waypoint."""
 
-    OBSTACLE_AVOIDANCE_MIN_DIST: float = 0.15
+    OBSTACLE_AVOIDANCE_MIN_DIST: float = 0.3
     """Minimum displacement (m) from previous and current path
     points to accept a new avoidance waypoint.
     """
 
-    JITTER_THRESHOLD: float = 0.01
+    JITTER_THRESHOLD: float = 0.001
     """Distance shift (m) above which moving obstacles or gates trigger a path replan."""
 
     # --- Gate Frame Details ---
@@ -177,4 +176,3 @@ class PlannerConfig:
 
     gate_bar_radius: float = 0.08
     """Radius (m) of the gate border bars."""
-

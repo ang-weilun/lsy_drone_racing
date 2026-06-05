@@ -141,7 +141,6 @@ class SfcCorridorPlanner:
         self.replan_events: list[dict] = []
         self.last_replan_event: dict | None = None
         self._traj_history = []
-        self._max_history_len = 200
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
         self._record_replan_event(reason="init")
@@ -429,7 +428,7 @@ class SfcCorridorPlanner:
         self.MAX_CTRL = self.config.MAX_CTRL
         self.MAX_PLANES = self.config.MAX_PLANES
 
-        self.opti = ca.Opti()
+        self.opti = ca.Opti("conic")
         self.P_ca = self.opti.variable(self.MAX_CTRL, 3)
 
         self.mask_ca = self.opti.parameter(self.MAX_CTRL)
@@ -544,15 +543,7 @@ class SfcCorridorPlanner:
             )
             self.opti.subject_to(self.opti.bounded(min_bound, proj_n, max_bound))
 
-        p_opts = {"expand": True}
-        s_opts = {
-            "max_iter": self.config.IPOPT_MAX_ITER,
-            "print_level": 0,
-            "tol": self.config.IPOPT_TOL,
-            "acceptable_tol": self.config.IPOPT_ACCEPTABLE_TOL,
-            "sb": "yes",
-        }
-        self.opti.solver("ipopt", p_opts, s_opts)
+        self.opti.solver("qpoases", {"printLevel": "none"})
         self._casadi_initialized = True
         self._last_P = None
 
@@ -882,9 +873,7 @@ class SfcCorridorPlanner:
 
                     for C, safe_radius in obs_circles:
                         dot_val = np.dot(C - prev_pt[:2], AB)
-                        if dot_val <= 0.0:
-                            continue
-                        t = min(1.0, dot_val / len_sq)
+                        t = np.clip(dot_val / len_sq, 0.0, 1.0)
                         projection = prev_pt[:2] + t * AB
                         dist = np.linalg.norm(projection - C)
 
@@ -997,8 +986,6 @@ class SfcCorridorPlanner:
         Args:
             pos: 3D position vector [x, y, z] to record.
         """
-        if len(self._traj_history) >= self._max_history_len:
-            self._traj_history.pop(0)
         self._traj_history.append(pos.copy())
 
     def get_trajectory_history(self) -> NDArray:
