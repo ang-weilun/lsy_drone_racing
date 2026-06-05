@@ -1,3 +1,5 @@
+"""Configuration settings for the Model Predictive Contouring Controller (MPCC)."""
+
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -19,13 +21,17 @@ class MPCCConfig:
 
     # --- Cost Weights ---
     Q_c: float = 150.0
-    """Contouring error penalty (lateral/longitudinal). Higher values force the drone to stay strictly on path."""
+    """Contouring error penalty (lateral/longitudinal).
+    Higher values force the drone to stay strictly on path.
+    """
 
     Q_c_z: float = 400.0
     """Vertical contouring error penalty. Often higher than Q_c to prevent altitude drops."""
 
     Q_l: float = 150.0
-    """Lag error penalty. Penalizes falling behind or rushing ahead of the virtual reference point."""
+    """Lag error penalty.
+    Penalizes falling behind or rushing ahead of the virtual reference point.
+    """
 
     W_v_theta: float = 5.0
     """Penalty on virtual velocity. Higher values penalize high virtual velocities."""
@@ -50,3 +56,33 @@ class MPCCConfig:
 
     hover_kd: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2, 0.4]))
     """Derivative gains for the hover fallback controller [x, y, z]."""
+
+    # --- MPC State & Input Constraint Boundaries ---
+    MAX_ROLL_PITCH: float = 1.2
+    """Maximum roll and pitch attitude angle (rad) allowed inside MPC horizon."""
+
+    MAX_YAW: float = np.pi
+    """Maximum yaw attitude angle (rad) allowed inside MPC horizon."""
+
+    MIN_V_THETA: float = 0.5
+    """Minimum virtual speed (m/s) allowed along the spline path."""
+
+    MAX_V_THETA: float = 20.0
+    """Maximum virtual speed (m/s) allowed along the spline path."""
+
+    MAX_RPY_RATES: float = 0.5
+    """Maximum desired roll, pitch, and yaw rates (rad/s)."""
+
+    MAX_DELTA_V_THETA: float = 5.0
+    """Maximum rate of change of the virtual progress speed (m/s^2) / acceleration input."""
+
+    # --- Acados OCP Solver Settings ---
+    SOLVER_TOL: float = 1e-6
+    """Tolerance for convergence in the ACADOS OCP solver."""
+
+    QP_SOLVER_ITER_MAX: int = 20
+    """Maximum iterations allowed for the condensed QP solver in ACADOS."""
+
+    NLP_SOLVER_MAX_ITER: int = 50
+    """Maximum iterations allowed for the nonlinear SQP solver in ACADOS."""
+

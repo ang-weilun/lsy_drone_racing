@@ -8,16 +8,18 @@ builder, and B-spline optimization. Consumed by both `sfc_controller.py`
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-from numpy.typing import NDArray
 from scipy.interpolate import BSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 class SkeletonPoint(NamedTuple):
@@ -44,16 +46,14 @@ class Capsule(NamedTuple):
 class FlightCorridor:
     """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
 
-    LIMIT_LOW = np.array([-3.5, -3.5, 0.0])
-    LIMIT_HIGH = np.array([3.5, 3.5, 3.0])
-    BUFFER = 0.10
-
-    def __init__(self, p1: NDArray, p2: NDArray) -> None:
+    def __init__(self, p1: NDArray, p2: NDArray, limit_low: NDArray, limit_high: NDArray) -> None:
         """Initialize a flight corridor between two waypoints.
 
         Args:
             p1: Start point of the corridor.
             p2: End point of the corridor.
+            limit_low: Bounding box lower limits.
+            limit_high: Bounding box upper limits.
         """
         self.A = []
         self.b = []
@@ -61,12 +61,12 @@ class FlightCorridor:
         self.p2 = p2
 
         # Bounding box (Room limits)
-        self.add_halfspace(np.array([0, 0, 1]), np.array([0, 0, 3.0]))
-        self.add_halfspace(np.array([0, 0, -1]), np.array([0, 0, -0.2]))
-        self.add_halfspace(np.array([1, 0, 0]), np.array([15.0, 0, 0]))
-        self.add_halfspace(np.array([-1, 0, 0]), np.array([-15.0, 0, 0]))
-        self.add_halfspace(np.array([0, 1, 0]), np.array([0, 15.0, 0]))
-        self.add_halfspace(np.array([0, -1, 0]), np.array([0, -15.0, 0]))
+        self.add_halfspace(np.array([0, 0, 1]), np.array([0, 0, limit_high[2]]))
+        self.add_halfspace(np.array([0, 0, -1]), np.array([0, 0, limit_low[2]]))
+        self.add_halfspace(np.array([1, 0, 0]), np.array([limit_high[0], 0, 0]))
+        self.add_halfspace(np.array([-1, 0, 0]), np.array([limit_low[0], 0, 0]))
+        self.add_halfspace(np.array([0, 1, 0]), np.array([0, limit_high[1], 0]))
+        self.add_halfspace(np.array([0, -1, 0]), np.array([0, limit_low[1], 0]))
 
     def add_halfspace(self, n: NDArray, p: NDArray):
         """Adds a constraint (x - p) * n <= 0, where n is the OUTWARD normal."""
@@ -121,6 +121,13 @@ class SfcCorridorPlanner:
     def __init__(
         self, obs: dict[str, NDArray], freq: int, config: PlannerConfig | None = None
     ) -> None:
+        """Initialize the SfcCorridorPlanner.
+
+        Args:
+            obs: Initial observation dict containing gate and obstacle positions.
+            freq: Controller operating frequency (Hz).
+            config: Path planner configuration dataclass.
+        """
         self._freq = freq
         self.config = config or PlannerConfig()
 
@@ -177,6 +184,18 @@ class SfcCorridorPlanner:
         return True
 
     def evaluate_spatial(self, u: float) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+        """Evaluate the path B-spline and its derivatives at normalized arc-length parameter u.
+
+        Args:
+            u: Normalized arc-length parameter in [0, 1].
+
+        Returns:
+            A tuple containing:
+                - Position vector [x, y, z] (m).
+                - First derivative (velocity vector).
+                - Second derivative (acceleration vector).
+                - Third derivative (jerk vector).
+        """
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
             cp_last = np.asarray(self._control_points[-1], dtype=np.float64)
             return cp_last, np.zeros(3), np.zeros(3), np.zeros(3)
@@ -191,6 +210,14 @@ class SfcCorridorPlanner:
         return pos, dpos, ddpos, dddpos
 
     def evaluate_corridor_spatial(self, u: float) -> tuple[NDArray, NDArray] | None:
+        """Get the flight corridor half-space constraints (A, b) at normalized parameter u.
+
+        Args:
+            u: Normalized arc-length parameter in [0, 1].
+
+        Returns:
+            A tuple (A, b) defining the half-spaces A * x <= b, or None if no corridors exist.
+        """
         if not hasattr(self, "corridors") or self.corridors is None or len(self.corridors) == 0:
             return None
 
@@ -205,13 +232,16 @@ class SfcCorridorPlanner:
 
     @property
     def des_pos_spline(self) -> BSpline:
+        """Get the optimized B-spline representing the drone's target path."""
         return self._des_pos_spline
 
     @property
     def control_points(self) -> NDArray:
+        """Get the optimized B-spline control points."""
         return self._control_points
 
     def episode_reset(self) -> None:
+        """Reset the planner state for a new episode."""
         self.target_gate_idx = 0
         self._tick = 0
         self._last_replan_tick = -self.config.REPLAN_DEBOUNCE_TICKS
@@ -273,19 +303,20 @@ class SfcCorridorPlanner:
                     Capsule(
                         pos - up * (self.config.gate_outer / 2.0),
                         pos - up * (self.config.gate_outer / 2.0 + stand_h),
-                        0.05 + margin,
+                        self.config.gate_stand_radius + margin,
                         True,
                         gate_i,
                     )
                 )
 
-            bar_dist = 0.28
-            bar_radius = 0.08 + margin
+            bar_dist = self.config.gate_bar_dist
+            bar_radius = self.config.gate_bar_radius + margin
+            half_outer = self.config.gate_outer / 2.0
 
             capsules.append(
                 Capsule(
-                    pos + up * bar_dist - right * 0.36,
-                    pos + up * bar_dist + right * 0.36,
+                    pos + up * bar_dist - right * half_outer,
+                    pos + up * bar_dist + right * half_outer,
                     bar_radius,
                     True,
                     gate_i,
@@ -293,8 +324,8 @@ class SfcCorridorPlanner:
             )
             capsules.append(
                 Capsule(
-                    pos - up * bar_dist - right * 0.36,
-                    pos - up * bar_dist + right * 0.36,
+                    pos - up * bar_dist - right * half_outer,
+                    pos - up * bar_dist + right * half_outer,
                     bar_radius,
                     True,
                     gate_i,
@@ -302,8 +333,8 @@ class SfcCorridorPlanner:
             )
             capsules.append(
                 Capsule(
-                    pos - right * bar_dist + up * 0.36,
-                    pos - right * bar_dist - up * 0.36,
+                    pos - right * bar_dist + up * half_outer,
+                    pos - right * bar_dist - up * half_outer,
                     bar_radius,
                     True,
                     gate_i,
@@ -311,8 +342,8 @@ class SfcCorridorPlanner:
             )
             capsules.append(
                 Capsule(
-                    pos + right * bar_dist + up * 0.36,
-                    pos + right * bar_dist - up * 0.36,
+                    pos + right * bar_dist + up * half_outer,
+                    pos + right * bar_dist - up * half_outer,
                     bar_radius,
                     True,
                     gate_i,
@@ -332,7 +363,12 @@ class SfcCorridorPlanner:
         for i in range(len(skeleton_path) - 1):
             pt1 = skeleton_path[i]
             pt2 = skeleton_path[i + 1]
-            corr = FlightCorridor(pt1.pos, pt2.pos)
+            corr = FlightCorridor(
+                pt1.pos,
+                pt2.pos,
+                limit_low=np.array(self.config.ROOM_LIMIT_LOW),
+                limit_high=np.array(self.config.ROOM_LIMIT_HIGH),
+            )
 
             # Add separating half-spaces for all capsules
             for cap in capsules:
@@ -390,8 +426,8 @@ class SfcCorridorPlanner:
     def _init_casadi_planner(self) -> None:
         import casadi as ca
 
-        self.MAX_CTRL = 80
-        self.MAX_PLANES = 25
+        self.MAX_CTRL = self.config.MAX_CTRL
+        self.MAX_PLANES = self.config.MAX_PLANES
 
         self.opti = ca.Opti()
         self.P_ca = self.opti.variable(self.MAX_CTRL, 3)
@@ -459,11 +495,17 @@ class SfcCorridorPlanner:
                 * ca.sumsqr(self.P_ca[i, :] - self.ref_pts_ca[i, :])
             )
             cost += (
-                1e5 * self.is_gate_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.gate_pos_ca[i, :].T)
+                self.config.W_GATE_HARD
+                * self.is_gate_ca[i]
+                * ca.sumsqr(self.P_ca[i, :].T - self.gate_pos_ca[i, :].T)
             )
-            cost += 1e5 * self.end_mask_ca[i] * ca.sumsqr(self.P_ca[i, :].T - self.end_pos_ca)
+            cost += (
+                self.config.W_GATE_HARD
+                * self.end_mask_ca[i]
+                * ca.sumsqr(self.P_ca[i, :].T - self.end_pos_ca)
+            )
 
-        cost += 10.0 * ca.sumsqr(self.P_ca[0, :].T - self.P0_ref_ca)
+        cost += self.config.W_P0_REF * ca.sumsqr(self.P_ca[0, :].T - self.P0_ref_ca)
         cost += self.P1_weight_ca * ca.sumsqr(self.P_ca[1, :].T - self.P1_ref_ca)
 
         for i in range(self.MAX_CTRL):
@@ -504,10 +546,10 @@ class SfcCorridorPlanner:
 
         p_opts = {"expand": True}
         s_opts = {
-            "max_iter": 100,
+            "max_iter": self.config.IPOPT_MAX_ITER,
             "print_level": 0,
-            "tol": 1e-4,
-            "acceptable_tol": 1e-3,
+            "tol": self.config.IPOPT_TOL,
+            "acceptable_tol": self.config.IPOPT_ACCEPTABLE_TOL,
             "sb": "yes",
         }
         self.opti.solver("ipopt", p_opts, s_opts)
@@ -687,10 +729,10 @@ class SfcCorridorPlanner:
         speed = np.linalg.norm(current_vel)
         if speed > 0.1:
             v_P1_ref = v_P0_ref + current_vel * 0.05
-            v_P1_weight = 50.0
+            v_P1_weight = self.config.W_P1_REF_HIGH
         else:
             v_P1_ref = v_P0_ref
-            v_P1_weight = 10.0
+            v_P1_weight = self.config.W_P1_REF_LOW
 
         self.opti.set_value(self.mask_ca, corridor_params["mask"])
         self.opti.set_value(self.ref_pts_ca, v_ref)
@@ -744,13 +786,14 @@ class SfcCorridorPlanner:
             prev_pos = self.gates_pos[prev_gate_idx]
             prev_normal = gate_normals[prev_gate_idx]
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
-            if 0.0 < d_post < 1.0:
+            if 0.0 < d_post < self.config.PREV_GATE_EXIT_THRESHOLD:
                 next_pos = self.gates_pos[self.target_gate_idx]
                 # Test against prev_pos + prev_normal * anchor_gap, the canonical
                 # post-gate exit point (no post_pos anchor in skeleton anymore).
                 exit_vector = next_pos - (prev_pos + prev_normal * self.config.anchor_gap)
-                if float(np.dot(exit_vector, prev_normal)) < -0.2:
-                    clearance_pos = prev_pos + prev_normal * (self.config.anchor_gap + 1.0)
+                if float(np.dot(exit_vector, prev_normal)) < self.config.EXIT_SWING_THRESHOLD:
+                    clearance_dist = self.config.anchor_gap + self.config.EXIT_SWING_CLEARANCE
+                    clearance_pos = prev_pos + prev_normal * clearance_dist
                     raw_path.append(
                         SkeletonPoint(
                             clearance_pos, False, None, None, None, gate_idx=prev_gate_idx
@@ -769,11 +812,11 @@ class SfcCorridorPlanner:
 
             # ENTRY SWING (U-turn approach logic). Computed against gate centre
             # rather than a pre_pos anchor — same dot-product test, ~0.5 m
-            if np.dot(flow_dir, normal) < -0.1:
+            if np.dot(flow_dir, normal) < self.config.ENTRY_SWING_THRESHOLD:
                 if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * 0.5
+                    swing_pos = pos + right * self.config.ENTRY_SWING_OFFSET
                 else:
-                    swing_pos = pos - right * 0.5
+                    swing_pos = pos - right * self.config.ENTRY_SWING_OFFSET
                 raw_path.append(SkeletonPoint(swing_pos, False, None, None, None, gate_idx=i))
 
             raw_path.append(SkeletonPoint(pos, True, normal, right, up, gate_idx=i))
@@ -784,15 +827,18 @@ class SfcCorridorPlanner:
                 # Test against pos + normal * anchor_gap, the canonical post-gate
                 # exit point, even though no post_pos anchor is in the skeleton.
                 exit_vector = next_pos - (pos + normal * self.config.anchor_gap)
-                if np.dot(exit_vector, normal) < -0.2:
-                    clearance_pos = pos + normal * (self.config.anchor_gap + 1.0)
+                if np.dot(exit_vector, normal) < self.config.EXIT_SWING_THRESHOLD:
+                    clearance_dist = self.config.anchor_gap + self.config.EXIT_SWING_CLEARANCE
+                    clearance_pos = pos + normal * clearance_dist
                     raw_path.append(
                         SkeletonPoint(clearance_pos, False, None, None, None, gate_idx=i)
                     )
+                    side_offset = self.config.EXIT_SWING_SIDE_OFFSET
+                    back_offset = self.config.EXIT_SWING_BACK_OFFSET
                     if np.dot(exit_vector, right) > 0:
-                        exit_swing = clearance_pos + right * 1.0 - normal * 0.7
+                        exit_swing = clearance_pos + right * side_offset - normal * back_offset
                     else:
-                        exit_swing = clearance_pos - right * 1.0 - normal * 0.7
+                        exit_swing = clearance_pos - right * side_offset - normal * back_offset
                     raw_path.append(SkeletonPoint(exit_swing, False, None, None, None, gate_idx=i))
 
         # Add an additional waypoint after the final gate to maintain speed through the finish line
@@ -800,7 +846,7 @@ class SfcCorridorPlanner:
             last_gate_idx = len(self.gates_pos) - 1
             last_pos = self.gates_pos[last_gate_idx]
             last_normal = gate_normals[last_gate_idx]
-            finish_pos = last_pos + last_normal * 0.75
+            finish_pos = last_pos + last_normal * self.config.FINISH_LINE_EXT_DIST
             raw_path.append(
                 SkeletonPoint(finish_pos, False, None, None, None, gate_idx=last_gate_idx)
             )
@@ -809,13 +855,14 @@ class SfcCorridorPlanner:
 
     def _apply_obstacle_avoidance(self, raw_path: list[SkeletonPoint]) -> list[SkeletonPoint]:
         obs_circles = []
+        margin = self.config.OBSTACLE_AVOIDANCE_MARGIN
         for p in self.obstacles_pos:
-            obs_circles.append((p[:2], self.config.pole_radius + 0.15))
+            obs_circles.append((p[:2], self.config.pole_radius + margin))
         for j, (p, q) in enumerate(zip(self.gates_pos, self.gates_quat)):
             rot = R.from_quat(q)
             right = rot.apply([0, 1, 0])
-            bar_dist = 0.28
-            obs_radius = 0.08 + 0.10
+            bar_dist = self.config.gate_bar_dist
+            obs_radius = self.config.gate_bar_radius + self.config.OBSTACLE_AVOIDANCE_MARGIN
             obs_circles.append(((p - right * bar_dist)[:2], obs_radius))
             obs_circles.append(((p + right * bar_dist)[:2], obs_radius))
 
@@ -849,16 +896,18 @@ class SfcCorridorPlanner:
                                 else np.array([-AB[1], AB[0]]) / np.linalg.norm(AB)
                             )
 
-                            avoidance_pt_2d = C + push_dir * (safe_radius + 0.20)
+                            push_extra = self.config.OBSTACLE_AVOIDANCE_PUSH_EXTRA
+                            avoidance_pt_2d = C + push_dir * (safe_radius + push_extra)
                             avoidance_z = prev_pt[2] + t * (curr_pt[2] - prev_pt[2])
 
                             proposed_pos = np.array(
                                 [avoidance_pt_2d[0], avoidance_pt_2d[1], avoidance_z]
                             )
 
+                            min_dist = self.config.OBSTACLE_AVOIDANCE_MIN_DIST
                             if (
-                                np.linalg.norm(proposed_pos - prev_pt) > 0.15
-                                and np.linalg.norm(proposed_pos - curr_pt) > 0.15
+                                np.linalg.norm(proposed_pos - prev_pt) > min_dist
+                                and np.linalg.norm(proposed_pos - curr_pt) > min_dist
                             ):
                                 avoid_pt = SkeletonPoint(proposed_pos, False, None, None, None)
 
@@ -873,8 +922,8 @@ class SfcCorridorPlanner:
         raw_path = self._build_raw_skeleton(current_pos)
         path = self._apply_obstacle_avoidance(raw_path)
 
-        low = FlightCorridor.LIMIT_LOW + FlightCorridor.BUFFER
-        high = FlightCorridor.LIMIT_HIGH - FlightCorridor.BUFFER
+        low = np.array(self.config.CORRIDOR_LIMIT_LOW) + self.config.CORRIDOR_BUFFER
+        high = np.array(self.config.CORRIDOR_LIMIT_HIGH) - self.config.CORRIDOR_BUFFER
         clipped_path = []
         for pt in path:
             clipped_pos = np.clip(pt.pos, low, high)
@@ -895,16 +944,17 @@ class SfcCorridorPlanner:
         gate_moved = False
         obs_moved = False
         new_gates_pos = obs["gates_pos"]
+        jitter_th = self.config.JITTER_THRESHOLD
         if (
             len(self.gates_pos) > 0
-            and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > 0.01
+            and np.max(np.linalg.norm(new_gates_pos - self.gates_pos, axis=1)) > jitter_th
         ):
             gate_moved = True
 
         new_obs_pos = obs.get("obstacles_pos", np.array([]))
         if len(new_obs_pos) != len(self.obstacles_pos) or (
             len(new_obs_pos) > 0
-            and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > 0.01
+            and np.max(np.linalg.norm(new_obs_pos - self.obstacles_pos, axis=1)) > jitter_th
         ):
             obs_moved = True
 
@@ -919,6 +969,12 @@ class SfcCorridorPlanner:
         return gate_moved or obs_moved, reason
 
     def current_spline_snapshot(self) -> dict:
+        """Capture a snapshot of the current optimized B-spline state.
+
+        Returns:
+            A dictionary containing the spline's knots, control points,
+            degree k, and target gate index.
+        """
         return {
             "knots": np.asarray(self._des_pos_spline.t, dtype=np.float64).copy(),
             "control_points": np.asarray(self._control_points, dtype=np.float64).copy(),
@@ -936,11 +992,21 @@ class SfcCorridorPlanner:
         self.last_replan_event = evt
 
     def add_trajectory_point(self, pos: NDArray) -> None:
+        """Add a position point to the flown trajectory history buffer.
+
+        Args:
+            pos: 3D position vector [x, y, z] to record.
+        """
         if len(self._traj_history) >= self._max_history_len:
             self._traj_history.pop(0)
         self._traj_history.append(pos.copy())
 
     def get_trajectory_history(self) -> NDArray:
+        """Retrieve the recorded flown trajectory history.
+
+        Returns:
+            An Nx3 array of historical position coordinates.
+        """
         if len(self._traj_history) == 0:
             return np.empty((0, 3))
         return np.array(self._traj_history)

@@ -219,12 +219,34 @@ def create_ocp_solver(
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
 
-    ocp.constraints.lbx = np.array([-1.2, -1.2, -np.pi, 0.5])
-    ocp.constraints.ubx = np.array([1.2, 1.2, np.pi, 20.0])
+    ocp.constraints.lbx = np.array([
+        -config.MAX_ROLL_PITCH,
+        -config.MAX_ROLL_PITCH,
+        -config.MAX_YAW,
+        config.MIN_V_THETA,
+    ])
+    ocp.constraints.ubx = np.array([
+        config.MAX_ROLL_PITCH,
+        config.MAX_ROLL_PITCH,
+        config.MAX_YAW,
+        config.MAX_V_THETA,
+    ])
     ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, parameters["thrust_min"] * 4, -5.0])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, parameters["thrust_max"] * 4, 5.0])
+    ocp.constraints.lbu = np.array([
+        -config.MAX_RPY_RATES,
+        -config.MAX_RPY_RATES,
+        -config.MAX_RPY_RATES,
+        parameters["thrust_min"] * 4,
+        -config.MAX_DELTA_V_THETA,
+    ])
+    ocp.constraints.ubu = np.array([
+        config.MAX_RPY_RATES,
+        config.MAX_RPY_RATES,
+        config.MAX_RPY_RATES,
+        parameters["thrust_max"] * 4,
+        config.MAX_DELTA_V_THETA,
+    ])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
@@ -234,11 +256,11 @@ def create_ocp_solver(
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
     ocp.solver_options.nlp_solver_type = "SQP"
-    ocp.solver_options.tol = 1e-6
+    ocp.solver_options.tol = config.SOLVER_TOL
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
-    ocp.solver_options.qp_solver_iter_max = 20
-    ocp.solver_options.nlp_solver_max_iter = 50
+    ocp.solver_options.qp_solver_iter_max = config.QP_SOLVER_ITER_MAX
+    ocp.solver_options.nlp_solver_max_iter = config.NLP_SOLVER_MAX_ITER
     ocp.solver_options.tf = float(np.sum(time_steps))
 
     acados_ocp_solver = AcadosOcpSolver(
@@ -256,6 +278,13 @@ class AttitudeMPC(Controller):
     """Example of a MPCC using the collective thrust and attitude interface."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        """Initialize the AttitudeMPC controller.
+
+        Args:
+            obs: Initial observation dict containing drone state and target gate.
+            info: Environment information dictionary.
+            config: General controller configuration dictionary.
+        """
         super().__init__(obs, info, config)
         self.mpcc_config = MPCCConfig()
         self.planner_config = PlannerConfig()
@@ -441,6 +470,16 @@ class AttitudeMPC(Controller):
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
+        """Compute the control input (desired attitude and thrust) for the current tick.
+
+        Args:
+            obs: The current observation dict from the environment.
+            info: Optional environment info dict.
+
+        Returns:
+            The control command [desired_roll, desired_pitch, desired_yaw, thrust]
+            as a float32 array.
+        """
         replanned = self.planner.update(obs)
         if replanned:
             self._update_spline()
@@ -498,12 +537,13 @@ class AttitudeMPC(Controller):
             dist_obs_str = f"{min_obs_dist:.2f}m" if min_obs_dist >= 0 else "N/A"
             hover_str = "HOVER" if is_hovering else "FLY"
             logger.info(
-            f"[Tick {self._tick:04d}] Pos: [{obs['pos'][0]:.2f}, {obs['pos'][1]:.2f}, {obs['pos'][2]:.2f}] | "
-            f"Progress: {self._current_theta:.2f}/{self._s_total:.2f} | "
-            f"Speed: {self._current_v_theta:.2f} | "
-            f"Gate: {target_gate_idx} ({dist_gate_str}) | "
-            f"Obs Dist: {dist_obs_str} | "
-            f"Status: {status} ({hover_str})"
+                f"[Tick {self._tick:04d}] Pos: ["
+                f"{obs['pos'][0]:.2f}, {obs['pos'][1]:.2f}, {obs['pos'][2]:.2f}] | "
+                f"Progress: {self._current_theta:.2f}/{self._s_total:.2f} | "
+                f"Speed: {self._current_v_theta:.2f} | "
+                f"Gate: {target_gate_idx} ({dist_gate_str}) | "
+                f"Obs Dist: {dist_obs_str} | "
+                f"Status: {status} ({hover_str})"
             )
 
         # Record flown trajectory
@@ -528,10 +568,24 @@ class AttitudeMPC(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
+        """Callback executed at each simulation step to increment ticks.
+
+        Args:
+            action: The action executed in the step.
+            obs: The observation resulting from the step.
+            reward: The reward received.
+            terminated: Whether the episode terminated.
+            truncated: Whether the episode was truncated.
+            info: Extra info dictionary.
+
+        Returns:
+            bool: True if the drone has completed the track/finished the episode.
+        """
         self._tick += 1
         return self._finished
 
     def episode_callback(self) -> None:
+        """Reset the controller state and variables at the start of a new episode."""
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
@@ -540,6 +594,11 @@ class AttitudeMPC(Controller):
         self.planner.episode_reset()
 
     def render_callback(self, sim: object) -> None:
+        """Render debug visualizations in the PyBullet simulator.
+
+        Args:
+            sim: The simulator environment instance.
+        """
         if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
             safety_margin = getattr(self.planner.config, "safety_margin", 0.0)
             for cap in self.planner.capsules:
