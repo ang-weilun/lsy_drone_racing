@@ -38,28 +38,9 @@ class PlannerConfig:
     REPLAN_DEBOUNCE_TICKS: int = 5
     """Minimum number of ticks to wait before allowing another replan."""
 
-    # --- TOPP (Variable Speed Schedule) Tunables ---
-    V_MAX_GLOBAL: float = 1.5
-    """Speed ceiling (m/s) on straight segments."""
-
-    TILT_LIMIT_PLANNER: float = 0.5
-    """Max tilt angle (rad) mirroring controller limits. Drives lateral acceleration max."""
-
-    A_LONG_MAX_FACTOR: float = 0.53
-    """Factor determining max longitudinal acceleration from max lateral acceleration."""
-
-    V_FLOOR: float = 0.2
-    """Floor on scheduled speed (m/s) to avoid division by zero in pathological curvature."""
-
-    N_TOPP_SAMPLES: int = 200
-    """Number of points to sample when building the TOPP velocity schedule."""
-
     # --- Geometry / Spline Builder ---
     anchor_gap: float = 0.5
     """Distance (m) from gate to place entry/exit anchors along the normal."""
-
-    base_speed: float = 1.0
-    """Fallback constant speed (m/s) if TOPP fails."""
 
     points_per_segment: int = 4
     """Number of B-spline control points per inter-gate segment."""

@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.interpolate import BSpline, CubicSpline
+from scipy.interpolate import BSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
@@ -131,12 +131,10 @@ class SfcCorridorPlanner:
         self._tick = 0
         self._last_replan_tick = -self.config.REPLAN_DEBOUNCE_TICKS
 
-        self._t_to_u: CubicSpline | None = None
         self.replan_events: list[dict] = []
         self.last_replan_event: dict | None = None
         self._traj_history = []
         self._max_history_len = 200
-        self._current_t = 0.0
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
         self._record_replan_event(reason="init")
@@ -156,7 +154,6 @@ class SfcCorridorPlanner:
                 gate_changed = True
             self.target_gate_idx = env_target
 
-        self._current_t = self._find_closest_t(obs["pos"])
         moved, reason = self._check_objects_moved(obs)
 
         if not moved and not gate_changed:
@@ -178,33 +175,6 @@ class SfcCorridorPlanner:
         self._last_replan_tick = self._tick
         self._record_replan_event(reason=reason)
         return True
-
-    def evaluate(self, t_offset: float) -> tuple[NDArray, NDArray, NDArray]:
-        t_eval = self._current_t + t_offset
-        return self._evaluate_absolute(t_eval)
-
-    def evaluate_corridor(self, t_offset: float) -> tuple[NDArray, NDArray] | None:
-        if not hasattr(self, "corridors") or self.corridors is None or len(self.corridors) == 0:
-            return None
-
-        t_eval = self._current_t + t_offset
-        if self._t_total <= 0:
-            u = 1.0
-        else:
-            t_clamped = float(np.clip(t_eval, 0.0, self._t_total))
-            if self._t_to_u is not None:
-                u = float(self._t_to_u(t_clamped))
-            else:
-                u = t_clamped / self._t_total
-        u = float(np.clip(u, 0.0, 1.0))
-
-        n_segments = len(self.corridors)
-        seg_idx = int(np.floor(u * n_segments))
-        seg_idx = min(seg_idx, n_segments - 1)
-
-        A = np.array(self.corridors[seg_idx].A)
-        b = np.array(self.corridors[seg_idx].b)
-        return A, b
 
     def evaluate_spatial(self, u: float) -> tuple[NDArray, NDArray, NDArray, NDArray]:
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
@@ -233,61 +203,6 @@ class SfcCorridorPlanner:
         b = np.array(self.corridors[seg_idx].b)
         return A, b
 
-    def _find_closest_t(self, pos: NDArray) -> float:
-        if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
-            return 0.0
-
-        if hasattr(self, "_current_t") and getattr(self, "_t_total", 0) > 0:
-            if self._t_to_u is not None:
-                current_u = float(self._t_to_u(min(self._current_t, self._t_total)))
-            else:
-                current_u = self._current_t / self._t_total
-            current_u = float(np.clip(current_u, 0.0, 1.0))
-            u_samples = np.linspace(max(0.0, current_u - 0.1), min(1.0, current_u + 0.3), 100)
-        else:
-            u_samples = np.linspace(0, 1, 100)
-
-        pts = self._des_pos_spline(u_samples)
-        dists = np.linalg.norm(pts - pos, axis=1)
-        u_closest = float(u_samples[np.argmin(dists)])
-
-        if self._t_to_u is not None:
-            roots = self._t_to_u.solve(y=u_closest, extrapolate=False)
-            if len(roots) > 0:
-                return float(roots[0])
-            return 0.0
-        else:
-            return u_closest * self._t_total
-
-    def _evaluate_absolute(self, t: float) -> tuple[NDArray, NDArray, NDArray]:
-        if self._t_total <= 0:
-            cp_last = np.asarray(self._control_points[-1], dtype=np.float64)
-            return cp_last, np.zeros(3), np.zeros(3)
-
-        t_clamped = float(np.clip(t, 0.0, self._t_total))
-
-        if self._t_to_u is not None:
-            u = float(self._t_to_u(t_clamped))
-            du_dt = float(self._t_to_u(t_clamped, 1))
-            d2u_dt2 = float(self._t_to_u(t_clamped, 2))
-        else:
-            u = t_clamped / self._t_total
-            du_dt = 1.0 / self._t_total
-            d2u_dt2 = 0.0
-
-        u = float(np.clip(u, 0.0, 1.0))
-
-        r1 = np.asarray(self._des_pos_spline.derivative(nu=1)(u), dtype=np.float64)
-        r2 = np.asarray(self._des_pos_spline.derivative(nu=2)(u), dtype=np.float64)
-        pos = np.asarray(self._des_pos_spline(u), dtype=np.float64)
-        vel = r1 * du_dt
-        acc = r2 * (du_dt**2) + r1 * d2u_dt2
-        return pos, vel, acc
-
-    @property
-    def t_total(self) -> float:
-        return getattr(self, "_t_total", 0.0)
-
     @property
     def des_pos_spline(self) -> BSpline:
         return self._des_pos_spline
@@ -302,7 +217,6 @@ class SfcCorridorPlanner:
         self._last_replan_tick = -self.config.REPLAN_DEBOUNCE_TICKS
         self.replan_events = []
         self.last_replan_event = None
-        self._current_t = 0.0
         self._traj_history = []
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
@@ -333,56 +247,6 @@ class SfcCorridorPlanner:
             knots[i + k] = np.mean(u_params[i : i + k])
 
         self._des_pos_spline = BSpline(knots, control_points, k)
-
-        v_start = float(np.linalg.norm(current_vel))
-        try:
-            self._t_to_u, self._t_total = self._compute_time_schedule(self._des_pos_spline, v_start)
-        except Exception as exc:
-            logger.warning("TOPP scheduling failed (%s); falling back to uniform schedule.", exc)
-            self._t_to_u = None
-            self._t_total = float(np.sum(cp_dists) / self.config.base_speed)
-
-        self._current_t = 0.0
-
-    def _compute_time_schedule(self, spline: BSpline, v_start: float) -> tuple[CubicSpline, float]:
-        g = 9.81
-        a_lat_max = g * np.tan(self.config.TILT_LIMIT_PLANNER)
-        a_long_max = self.config.A_LONG_MAX_FACTOR * a_lat_max
-        eps = 1e-6
-
-        N = self.config.N_TOPP_SAMPLES
-        u_k = np.linspace(0.0, 1.0, N)
-
-        d1 = spline.derivative(nu=1)(u_k)
-        d2 = spline.derivative(nu=2)(u_k)
-        ds_du = np.linalg.norm(d1, axis=1)
-        cross = np.cross(d1, d2)
-        kappa = np.linalg.norm(cross, axis=1) / np.maximum(ds_du**3, eps)
-
-        v_curve = np.sqrt(a_lat_max / np.maximum(kappa, eps))
-        v = np.minimum(v_curve, self.config.V_MAX_GLOBAL)
-
-        v[0] = min(v[0], v_start)
-        for k in range(1, N):
-            ds = 0.5 * (ds_du[k] + ds_du[k - 1]) * (u_k[k] - u_k[k - 1])
-            v_max_fwd = np.sqrt(v[k - 1] ** 2 + 2.0 * a_long_max * ds)
-            v[k] = min(v[k], v_max_fwd)
-
-        for k in range(N - 2, -1, -1):
-            ds = 0.5 * (ds_du[k + 1] + ds_du[k]) * (u_k[k + 1] - u_k[k])
-            v_max_bwd = np.sqrt(v[k + 1] ** 2 + 2.0 * a_long_max * ds)
-            v[k] = min(v[k], v_max_bwd)
-
-        v = np.maximum(v, self.config.V_FLOOR)
-
-        t = np.zeros(N)
-        for k in range(1, N):
-            ds = 0.5 * (ds_du[k] + ds_du[k - 1]) * (u_k[k] - u_k[k - 1])
-            v_avg = 0.5 * (v[k] + v[k - 1])
-            t[k] = t[k - 1] + ds / max(v_avg, self.config.V_FLOOR)
-
-        t_to_u = CubicSpline(t, u_k)
-        return t_to_u, float(t[-1])
 
     def _get_all_obstacle_capsules(self) -> list[Capsule]:
         capsules = []
@@ -895,7 +759,7 @@ class SfcCorridorPlanner:
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
-            #pos[2] += 0.00  # Add upward bias to counter altitude drop
+            # pos[2] += 0.00  # Add upward bias to counter altitude drop
             normal = gate_normals[i].copy()
             rot = R.from_quat(self.gates_quat[i])
             right = rot.apply([0, 1, 0])
@@ -1056,7 +920,6 @@ class SfcCorridorPlanner:
 
     def current_spline_snapshot(self) -> dict:
         return {
-            "t_total": float(getattr(self, "_t_total", 0.0)),
             "knots": np.asarray(self._des_pos_spline.t, dtype=np.float64).copy(),
             "control_points": np.asarray(self._control_points, dtype=np.float64).copy(),
             "k": int(self._des_pos_spline.k),
@@ -1071,32 +934,6 @@ class SfcCorridorPlanner:
         }
         self.replan_events.append(evt)
         self.last_replan_event = evt
-
-    @property
-    def current_pos_ref(self) -> NDArray:
-        if hasattr(self, "_t_total") and self._t_total > 0:
-            pos_ref, _, _ = self.evaluate(0.0)
-            return pos_ref
-        return np.array([0.0, 0.0, 0.0])
-
-    @property
-    def current_vel_ref(self) -> NDArray:
-        if hasattr(self, "_t_total") and self._t_total > 0:
-            _, vel_ref, _ = self.evaluate(0.0)
-            return vel_ref
-        return np.array([0.0, 0.0, 0.0])
-
-    def get_mpc_horizon_trajectory(self, N: int, dt: float) -> NDArray:
-        if not hasattr(self, "_t_total") or self._t_total <= 0:
-            return np.zeros((N + 1, 3))
-
-        traj = []
-        for k in range(N + 1):
-            t_k = k * dt
-            pos_ref, _, _ = self.evaluate(t_k)
-            traj.append(pos_ref)
-
-        return np.array(traj)
 
     def add_trajectory_point(self, pos: NDArray) -> None:
         if len(self._traj_history) >= self._max_history_len:
