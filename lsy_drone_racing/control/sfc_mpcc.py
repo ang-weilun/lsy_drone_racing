@@ -64,7 +64,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     p_c_x = cs.MX.sym("c_x", 4)
     p_c_y = cs.MX.sym("c_y", 4)
     p_c_z = cs.MX.sym("c_z", 4)
-    p_capsules = cs.MX.sym("capsules", 10 * 7)
+    p_capsules = cs.MX.sym("capsules", 24 * 7)
 
     p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules)
 
@@ -96,7 +96,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         X[6:9],  # 3 (vel)
         X[9:12],  # 3 (drpy)
         U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
-        y_obs,  # 10 (obstacle avoidance)
+        y_obs,  # 24 (obstacle avoidance)
     )
 
     y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12], y_obs)
@@ -116,8 +116,8 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 
 def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
     """Build the C1-continuous barrier function for obstacle avoidance."""
-    y_obs = cs.MX.zeros(10)
-    for i in range(10):
+    y_obs = cs.MX.zeros(24)
+    for i in range(24):
         p1 = p_capsules[i * 7 + 0 : i * 7 + 3]
         p2 = p_capsules[i * 7 + 3 : i * 7 + 6]
         r = p_capsules[i * 7 + 6]
@@ -161,7 +161,7 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         1.0,
         10.0,  # u (4)
         0.5,  # delta_v_theta (1)
-    ] + [config.obstacle_penalty] * 10
+    ] + [config.obstacle_penalty] * 24
 
     W_e_diag = [
         config.Q_c,
@@ -178,7 +178,7 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         5.0,
         5.0,
         5.0,  # drpy (3)
-    ] + [config.obstacle_penalty] * 10
+    ] + [config.obstacle_penalty] * 24
 
     return np.diag(W_diag), np.diag(W_e_diag)
 
@@ -348,8 +348,10 @@ class AttitudeMPC(Controller):
         self, ref_points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """Extract the closest obstacle capsules and gate flags for the MPC horizon."""
-        capsule_params = np.zeros(70)
-        is_gate_flags = np.zeros(10, dtype=bool)
+        capsule_params = np.zeros(168)
+        for i in range(24):
+            capsule_params[i * 7 : i * 7 + 6] = 1000.0
+        is_gate_flags = np.zeros(24, dtype=bool)
         min_obs_dist = -1.0
 
         if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
@@ -361,7 +363,7 @@ class AttitudeMPC(Controller):
                 diffs = midpoints[:, None, :] - ref_points[None, :, :]
                 dists_to_path = np.linalg.norm(diffs, axis=2)
                 min_dists_to_path = np.min(dists_to_path, axis=1)
-                closest_idx = np.argsort(min_dists_to_path)[:10]
+                closest_idx = np.argsort(min_dists_to_path)[:24]
 
                 for i, idx in enumerate(closest_idx):
                     cap = capsules[idx]
@@ -406,10 +408,9 @@ class AttitudeMPC(Controller):
         """Set the reference parameters and cost weights along the MPC horizon."""
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
-        v_pred = max(0.5, self._current_v_theta)
-
         for j in range(self._N + 1):
-            theta_j = self._current_theta + self._shooting_nodes[j] * v_pred
+            x_j = self._acados_ocp_solver.get(j, "x")
+            theta_j = float(x_j[12])
             theta_j = np.clip(theta_j, 0, self._s_total)
             p_j_pos = self._des_pos_spline(theta_j)
 
