@@ -77,11 +77,11 @@ class MPCCConfig:
     """Maximum rate of change of the virtual progress speed (m/s^2) / acceleration input."""
 
     # --- Acados OCP Solver Settings ---
-    SOLVER_TOL: float = 1e-6
+    SOLVER_TOL: float = 1e-3
     """Tolerance for convergence in the ACADOS OCP solver."""
 
-    QP_SOLVER_ITER_MAX: int = 20
+    QP_SOLVER_ITER_MAX: int = 10
     """Maximum iterations allowed for the condensed QP solver in ACADOS."""
 
-    NLP_SOLVER_MAX_ITER: int = 50
+    NLP_SOLVER_MAX_ITER: int = 20
     """Maximum iterations allowed for the nonlinear SQP solver in ACADOS."""

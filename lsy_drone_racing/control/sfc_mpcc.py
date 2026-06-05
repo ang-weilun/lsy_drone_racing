@@ -219,34 +219,32 @@ def create_ocp_solver(
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
 
-    ocp.constraints.lbx = np.array([
-        -config.MAX_ROLL_PITCH,
-        -config.MAX_ROLL_PITCH,
-        -config.MAX_YAW,
-        config.MIN_V_THETA,
-    ])
-    ocp.constraints.ubx = np.array([
-        config.MAX_ROLL_PITCH,
-        config.MAX_ROLL_PITCH,
-        config.MAX_YAW,
-        config.MAX_V_THETA,
-    ])
+    ocp.constraints.lbx = np.array(
+        [-config.MAX_ROLL_PITCH, -config.MAX_ROLL_PITCH, -config.MAX_YAW, config.MIN_V_THETA]
+    )
+    ocp.constraints.ubx = np.array(
+        [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, config.MAX_V_THETA]
+    )
     ocp.constraints.idxbx = np.array([3, 4, 5, 13])
 
-    ocp.constraints.lbu = np.array([
-        -config.MAX_RPY_RATES,
-        -config.MAX_RPY_RATES,
-        -config.MAX_RPY_RATES,
-        parameters["thrust_min"] * 4,
-        -config.MAX_DELTA_V_THETA,
-    ])
-    ocp.constraints.ubu = np.array([
-        config.MAX_RPY_RATES,
-        config.MAX_RPY_RATES,
-        config.MAX_RPY_RATES,
-        parameters["thrust_max"] * 4,
-        config.MAX_DELTA_V_THETA,
-    ])
+    ocp.constraints.lbu = np.array(
+        [
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+            parameters["thrust_min"] * 4,
+            -config.MAX_DELTA_V_THETA,
+        ]
+    )
+    ocp.constraints.ubu = np.array(
+        [
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+            parameters["thrust_max"] * 4,
+            config.MAX_DELTA_V_THETA,
+        ]
+    )
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
@@ -255,7 +253,7 @@ def create_ocp_solver(
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP"
+    ocp.solver_options.nlp_solver_type = "SQP_RTI"
     ocp.solver_options.tol = config.SOLVER_TOL
     ocp.solver_options.qp_solver_cond_N = N
     ocp.solver_options.qp_solver_warm_start = 1
