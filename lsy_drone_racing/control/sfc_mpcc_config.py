@@ -13,7 +13,7 @@ class MPCCConfig:
     N_fine: int = 20
     """Number of fine time steps at the beginning of the horizon."""
 
-    N_coarse: int = 15
+    N_coarse: int = 20
     """Number of coarse time steps at the end of the horizon."""
 
     dt_coarse: float = 0.05
@@ -67,7 +67,7 @@ class MPCCConfig:
     MIN_V_THETA: float = 0.5
     """Minimum virtual speed (m/s) allowed along the spline path."""
 
-    MAX_V_THETA: float = 20.0
+    MAX_V_THETA: float = 3.0
     """Maximum virtual speed (m/s) allowed along the spline path."""
 
     MAX_RPY_RATES: float = 0.5
@@ -85,4 +85,3 @@ class MPCCConfig:
 
     NLP_SOLVER_MAX_ITER: int = 50
     """Maximum iterations allowed for the nonlinear SQP solver in ACADOS."""
-
