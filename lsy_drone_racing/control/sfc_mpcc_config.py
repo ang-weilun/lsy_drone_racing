@@ -36,7 +36,7 @@ class MPCCConfig:
     W_v_theta: float = 5.0
     """Penalty on virtual velocity. Higher values penalize high virtual velocities."""
 
-    obstacle_penalty: float = 100000.0
+    obstacle_penalty: float = 5000.0
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
@@ -47,10 +47,10 @@ class MPCCConfig:
     Q_rpy: float = 1.0
     """Penalty on roll, pitch, yaw attitude."""
 
-    Q_drpy: float = 5.0
+    Q_drpy: float = 20.0
     """Penalty on roll, pitch, yaw rates (angular velocity). Increase for smoother flight."""
 
-    R_cmd_rpy: float = 1.0
+    R_cmd_rpy: float = 10.0
     """Penalty on desired roll, pitch, yaw commands. Increase to limit aggressive control inputs."""
 
     R_cmd_thrust: float = 10.0
@@ -96,8 +96,8 @@ class MPCCConfig:
     SOLVER_TOL: float = 1e-3
     """Tolerance for convergence in the ACADOS OCP solver."""
 
-    QP_SOLVER_ITER_MAX: int = 20
+    QP_SOLVER_ITER_MAX: int = 10
     """Maximum iterations allowed for the condensed QP solver in ACADOS."""
 
-    NLP_SOLVER_MAX_ITER: int = 25
+    NLP_SOLVER_MAX_ITER: int = 5
     """Maximum iterations allowed for the nonlinear SQP solver in ACADOS."""
