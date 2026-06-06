@@ -147,19 +147,19 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         config.Q_c_z,  # e_c (3)
         config.Q_l,  # e_l (1)
         config.W_v_theta,  # v_theta (1)
-        1.0,
-        1.0,
-        1.0,  # rpy (3)
-        1.0,
-        1.0,
-        1.0,  # vel (3)
-        5.0,
-        5.0,
-        5.0,  # drpy (3)
-        1.0,
-        1.0,
-        1.0,
-        10.0,  # u (4)
+        config.Q_rpy,
+        config.Q_rpy,
+        config.Q_rpy,  # rpy (3)
+        config.Q_vel,
+        config.Q_vel,
+        config.Q_vel,  # vel (3)
+        config.Q_drpy,
+        config.Q_drpy,
+        config.Q_drpy,  # drpy (3)
+        config.R_cmd_rpy,
+        config.R_cmd_rpy,
+        config.R_cmd_rpy,
+        config.R_cmd_thrust,  # u (4)
         0.5,  # delta_v_theta (1)
     ] + [config.obstacle_penalty] * 24
 
@@ -169,15 +169,15 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         config.Q_c_z,  # e_c (3)
         config.Q_l,  # e_l (1)
         config.W_v_theta,  # v_theta (1)
-        1.0,
-        1.0,
-        1.0,  # rpy (3)
-        1.0,
-        1.0,
-        1.0,  # vel (3)
-        5.0,
-        5.0,
-        5.0,  # drpy (3)
+        config.Q_rpy,
+        config.Q_rpy,
+        config.Q_rpy,  # rpy (3)
+        config.Q_vel,
+        config.Q_vel,
+        config.Q_vel,  # vel (3)
+        config.Q_drpy,
+        config.Q_drpy,
+        config.Q_drpy,  # drpy (3)
     ] + [config.obstacle_penalty] * 24
 
     return np.diag(W_diag), np.diag(W_e_diag)
