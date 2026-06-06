@@ -519,6 +519,12 @@ class AttitudeMPC(Controller):
             )
         )
 
+        if not hasattr(self, "_prev_capsule_params"):
+            self._prev_capsule_params = capsule_params
+
+        param_diff = np.linalg.norm(capsule_params - self._prev_capsule_params)
+        self._prev_capsule_params = capsule_params.copy()
+
         self._warm_start_solver(x0, replanned, obs)
         self._set_mpc_horizon_parameters(capsule_params)
 
@@ -528,7 +534,17 @@ class AttitudeMPC(Controller):
         if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
             dist_to_target_gate = np.linalg.norm(gates_pos[target_gate_idx] - obs["pos"])
 
-        status = self._acados_ocp_solver.solve()
+        num_iters = 1
+        if replanned or param_diff > 0.5:
+            num_iters = self.mpcc_config.NLP_SOLVER_MAX_ITER
+
+        for _ in range(num_iters):
+            self._acados_ocp_solver.options_set("rti_phase", 1)
+            self._acados_ocp_solver.solve()
+
+            self._acados_ocp_solver.options_set("rti_phase", 2)
+            status = self._acados_ocp_solver.solve()
+
         is_hovering = status not in [0, 2] or hasattr(self, "_hover_pos")
 
         if self._tick % 10 == 0:
@@ -675,7 +691,7 @@ class AttitudeMPC(Controller):
                 end_size=0.005,
             )
 
-        traj_history = self.planner.get_trajectory_history()
+        traj_history = self.planner.get_trajectory_history()[-100:]
         if len(traj_history) > 1:
             draw_line(
                 sim,
