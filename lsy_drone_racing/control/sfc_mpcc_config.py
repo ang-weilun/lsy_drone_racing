@@ -10,17 +10,20 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Horizon Parameters ---
-    N_fine: int = 15
+    N_fine: int = 40
     """Number of fine time steps at the beginning of the horizon."""
 
-    N_coarse: int = 20
+    N_coarse: int = 0
     """Number of coarse time steps at the end of the horizon."""
 
-    dt_coarse: float = 0.03
+    dt_fine: float = 0.05
+    """Time step duration for the fine horizon steps (s)."""
+
+    dt_coarse: float = 0.02
     """Time step duration for the coarse horizon steps (s)."""
 
     # --- Cost Weights ---
-    Q_c: float = 50.0
+    Q_c: float = 150.0
     """Contouring error penalty (lateral/longitudinal).
     Higher values force the drone to stay strictly on path.
     """
@@ -44,16 +47,16 @@ class MPCCConfig:
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
-    Q_rpy: float = 1.0
+    Q_rpy: float = 50.0
     """Penalty on roll, pitch, yaw attitude."""
 
     Q_drpy: float = 20.0
     """Penalty on roll, pitch, yaw rates (angular velocity). Increase for smoother flight."""
 
-    R_cmd_rpy: float = 10.0
+    R_cmd_rpy: float = 50.0
     """Penalty on desired roll, pitch, yaw commands. Increase to limit aggressive control inputs."""
 
-    R_cmd_thrust: float = 10.0
+    R_cmd_thrust: float = 100.0
     """Penalty on desired thrust command."""
 
     Q_vel: float = 1.0
@@ -99,5 +102,5 @@ class MPCCConfig:
     QP_SOLVER_ITER_MAX: int = 10
     """Maximum iterations allowed for the condensed QP solver in ACADOS."""
 
-    NLP_SOLVER_MAX_ITER: int = 5
+    NLP_SOLVER_MAX_ITER: int = 1
     """Maximum iterations allowed for the nonlinear SQP solver in ACADOS."""
