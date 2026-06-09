@@ -287,7 +287,7 @@ class AttitudeMPC(Controller):
         self.mpcc_config = MPCCConfig()
         self.planner_config = PlannerConfig()
 
-        dt_fine = 1 / config.env.freq
+        dt_fine = self.mpcc_config.dt_fine
         dt_coarse = self.mpcc_config.dt_coarse
         self._time_steps = np.concatenate(
             [
@@ -401,6 +401,12 @@ class AttitudeMPC(Controller):
                         )
                     )
                 self._acados_ocp_solver.set(j, "x", x_guess)
+        else:
+            for j in range(self._N):
+                self._acados_ocp_solver.set(j, "x", self._acados_ocp_solver.get(j + 1, "x"))
+            for j in range(self._N - 1):
+                self._acados_ocp_solver.set(j, "u", self._acados_ocp_solver.get(j + 1, "u"))
+            self._acados_ocp_solver.set(0, "x", x0)
 
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
         """Set the reference parameters and cost weights along the MPC horizon."""
@@ -483,11 +489,14 @@ class AttitudeMPC(Controller):
         if replanned:
             self._update_spline()
             self._current_theta = 0.0
+            self._update_current_theta(obs["pos"])
+        elif self._tick > 0:
+            x_prev = self._acados_ocp_solver.get(1, "x")
+            self._current_theta = float(x_prev[12])
+            self._current_v_theta = max(0.0, float(x_prev[13]))
 
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
-
-        self._update_current_theta(obs["pos"])
 
         ref_points = np.array(
             [
@@ -499,11 +508,6 @@ class AttitudeMPC(Controller):
         )
 
         capsule_params, _, min_obs_dist = self._extract_closest_obstacles(ref_points)
-
-        if self._tick > 0 and not replanned:
-            x_prev = self._acados_ocp_solver.get(1, "x")
-            self._current_theta = float(x_prev[12])
-            self._current_v_theta = max(0.0, float(x_prev[13]))
 
         obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
         obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
