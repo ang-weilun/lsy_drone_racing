@@ -157,7 +157,7 @@ class PlannerConfig:
     OBSTACLE_AVOIDANCE_PUSH_EXTRA: float = 0.20
     """Push offset distance (m) beyond obstacle radius to place the generated avoidance waypoint."""
 
-    OBSTACLE_AVOIDANCE_MIN_DIST: float = 0.3
+    OBSTACLE_AVOIDANCE_MIN_DIST: float = 0.2
     """Minimum displacement (m) from previous and current path
     points to accept a new avoidance waypoint.
     """
