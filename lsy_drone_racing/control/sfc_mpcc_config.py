@@ -10,17 +10,14 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Horizon Parameters ---
-    N_fine: int = 40
-    """Number of fine time steps at the beginning of the horizon."""
+    N: int = 40
+    """Number of time steps in the horizon."""
 
-    N_coarse: int = 0
-    """Number of coarse time steps at the end of the horizon."""
+    dt_min: float = 0.02
+    """Time step duration for the first horizon step (s)."""
 
-    dt_fine: float = 0.05
-    """Time step duration for the fine horizon steps (s)."""
-
-    dt_coarse: float = 0.02
-    """Time step duration for the coarse horizon steps (s)."""
+    dt_max: float = 0.08
+    """Time step duration for the last horizon step (s)."""
 
     # --- Cost Weights ---
     Q_c: float = 150.0
@@ -88,6 +85,12 @@ class MPCCConfig:
 
     MAX_V_THETA: float = 3.0
     """Maximum virtual speed (m/s) allowed along the spline path."""
+
+    unobserved_gate_velocity_cap: float = 0.7
+    """Velocity cap when approaching an unobserved gate."""
+
+    unobserved_gate_dist_threshold: float = 0.5
+    """Distance threshold to start capping velocity for an unobserved gate."""
 
     MAX_RPY_RATES: float = 0.5
     """Maximum desired roll, pitch, and yaw rates (rad/s)."""

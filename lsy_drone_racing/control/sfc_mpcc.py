@@ -210,11 +210,11 @@ def create_ocp_solver(
     v_ref = config.mu / config.W_v_theta
 
     yref = np.zeros(ny)
-    yref[4] = v_ref
-    yref[17] = parameters["mass"] * -parameters["gravity_vec"][-1]
+    yref[_YREF_V_THETA] = v_ref
+    yref[_YREF_THRUST] = parameters["mass"] * -parameters["gravity_vec"][-1]
 
     yref_e = np.zeros(ny_e)
-    yref_e[4] = v_ref
+    yref_e[_YREF_V_THETA] = v_ref
 
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
@@ -225,7 +225,7 @@ def create_ocp_solver(
     ocp.constraints.ubx = np.array(
         [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, 1000.0, config.MAX_V_THETA]
     )
-    ocp.constraints.idxbx = np.array([3, 4, 5, 12, 13])
+    ocp.constraints.idxbx = np.array([_X_RPY.start, _X_RPY.start + 1, _X_RPY.start + 2, _X_THETA, _X_V_THETA])
 
     ocp.constraints.lbu = np.array(
         [
@@ -272,6 +272,37 @@ def create_ocp_solver(
     return acados_ocp_solver, ocp
 
 
+# ---------------------------------------------------------------------------
+# Index constants for the augmented state, input, and cost vectors.
+#
+# Augmented state x (14):  [pos(3), rpy(3), vel(3), drpy(3), theta, v_theta]
+# Augmented input u (5):   [cmd_roll, cmd_pitch, cmd_yaw, thrust, delta_v_theta]
+# ---------------------------------------------------------------------------
+
+# -- State indices --
+_X_POS = slice(0, 3)
+_X_RPY = slice(3, 6)
+_X_VEL = slice(6, 9)
+_X_DRPY = slice(9, 12)
+_X_THETA = 12
+_X_V_THETA = 13
+
+# -- Input indices --
+_U_CMD = slice(0, 4)  # [roll_des, pitch_des, yaw_des, thrust_des]
+
+# -- Cost reference (yref) indices --
+_YREF_V_THETA = 4     # virtual velocity reference
+_YREF_THRUST = 17     # hover thrust reference (stage cost only)
+
+# -- Bounded-state (ubx) index mapping --
+# idxbx = [3, 4, 5, 12, 13] => ubx positions 0..4
+_UBX_ROLL = 0
+_UBX_PITCH = 1
+_UBX_YAW = 2
+_UBX_THETA = 3
+_UBX_V_THETA = 4
+
+
 class AttitudeMPC(Controller):
     """Example of a MPCC using the collective thrust and attitude interface."""
 
@@ -287,13 +318,8 @@ class AttitudeMPC(Controller):
         self.mpcc_config = MPCCConfig()
         self.planner_config = PlannerConfig()
 
-        dt_fine = self.mpcc_config.dt_fine
-        dt_coarse = self.mpcc_config.dt_coarse
-        self._time_steps = np.concatenate(
-            [
-                np.full(self.mpcc_config.N_fine, dt_fine),
-                np.full(self.mpcc_config.N_coarse, dt_coarse),
-            ]
+        self._time_steps = np.linspace(
+            self.mpcc_config.dt_min, self.mpcc_config.dt_max, self.mpcc_config.N
         )
         self._N = len(self._time_steps)
         self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
@@ -443,7 +469,7 @@ class AttitudeMPC(Controller):
 
             for j in range(self._N + 1):
                 x_j = self._acados_ocp_solver.get(j, "x")
-                pos_j = x_j[:3]
+                pos_j = x_j[_X_POS]
                 if (
                     np.dot(pos_j - target_gate_pos, gate_normal) > -0.1
                     and np.linalg.norm(pos_j - target_gate_pos) < 0.5
@@ -459,10 +485,16 @@ class AttitudeMPC(Controller):
             x_j = self._acados_ocp_solver.get(j, "x")
             ubx_j = self._acados_ocp_solver.constraints_get(j, "ubx")
             ubx_theta = 1000.0 if horizon_passes_gate else theta_target_gate
-            ubx_j[3] = max(ubx_theta, float(x_j[12]))
+            
+            ubx_j[_UBX_THETA] = ubx_theta
             self._acados_ocp_solver.constraints_set(j, "ubx", ubx_j)
+            
+            if float(x_j[_X_THETA]) > ubx_theta:
+                x_j[_X_THETA] = ubx_theta
+                x_j[_X_V_THETA] = 0.0
+                self._acados_ocp_solver.set(j, "x", x_j)
 
-    def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
+    def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray, obs: dict[str, np.ndarray]) -> None:
         """Set the reference parameters and cost weights along the MPC horizon."""
         horizon_passes_gate, theta_target_gate = self._check_horizon_gate_pass()
         self._update_horizon_progress_bounds(horizon_passes_gate, theta_target_gate)
@@ -471,9 +503,13 @@ class AttitudeMPC(Controller):
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
         target_gate_pos = gates_pos[target_gate_idx] if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos) else None
 
+        gate_unobserved = False
+        if target_gate_idx >= 0 and "gates_visited" in obs and target_gate_idx < len(obs["gates_visited"]):
+            gate_unobserved = not obs["gates_visited"][target_gate_idx]
+
         for j in range(self._N + 1):
             x_j = self._acados_ocp_solver.get(j, "x")
-            theta_j = float(x_j[12])
+            theta_j = float(x_j[_X_THETA])
             theta_j = np.clip(theta_j, 0, self._s_total)
             p_j_pos = self._des_pos_spline(theta_j)
 
@@ -501,6 +537,24 @@ class AttitudeMPC(Controller):
             W[1, 1] = Q_c_dynamic
             W[2, 2] = max(Q_c_dynamic, self.mpcc_config.Q_c_z)
             self._acados_ocp_solver.cost_set(j, "W", W)
+
+            if j < self._N:
+                yref_j = self._acados_ocp_solver.cost_get(j, "yref")
+                target_v = self.mpcc_config.mu / self.mpcc_config.W_v_theta
+                if gate_unobserved and target_gate_pos is not None:
+                    dist_to_unobserved_gate = np.linalg.norm(target_gate_pos - p_j_pos)
+                    if dist_to_unobserved_gate < self.mpcc_config.unobserved_gate_dist_threshold:
+                        target_v = min(target_v, self.mpcc_config.unobserved_gate_velocity_cap)
+                
+                if "obstacles_visited" in obs and "obstacles_pos" in obs:
+                    for obs_idx, is_visited in enumerate(obs["obstacles_visited"]):
+                        if not is_visited:
+                            dist_to_unobserved_obs = np.linalg.norm(obs["obstacles_pos"][obs_idx] - p_j_pos)
+                            if dist_to_unobserved_obs < self.mpcc_config.unobserved_gate_dist_threshold:
+                                target_v = min(target_v, self.mpcc_config.unobserved_gate_velocity_cap)
+
+                yref_j[_YREF_V_THETA] = target_v
+                self._acados_ocp_solver.cost_set(j, "yref", yref_j)
 
     def _compute_hover_control(self, obs: dict[str, np.ndarray]) -> np.ndarray:
         """Compute hover fallback control if MPCC fails."""
@@ -550,8 +604,8 @@ class AttitudeMPC(Controller):
             self._update_current_theta(obs["pos"])
         elif self._tick > 0:
             x_prev = self._acados_ocp_solver.get(1, "x")
-            self._current_theta = float(x_prev[12])
-            self._current_v_theta = max(0.0, float(x_prev[13]))
+            self._current_theta = float(x_prev[_X_THETA])
+            self._current_v_theta = max(0.0, float(x_prev[_X_V_THETA]))
 
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
@@ -588,7 +642,7 @@ class AttitudeMPC(Controller):
         self._prev_capsule_params = capsule_params.copy()
 
         self._warm_start_solver(x0, replanned, obs)
-        self._set_mpc_horizon_parameters(capsule_params)
+        self._set_mpc_horizon_parameters(capsule_params, obs)
 
         dist_to_target_gate = -1.0
         gates_pos = getattr(self.planner, "gates_pos", None)
@@ -634,7 +688,7 @@ class AttitudeMPC(Controller):
                 del self._hover_pos
 
         u0 = self._acados_ocp_solver.get(0, "u")
-        return u0[0:4]
+        return u0[_U_CMD]
 
     def step_callback(
         self,
@@ -666,6 +720,7 @@ class AttitudeMPC(Controller):
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        self._finished = False
         if hasattr(self, "_hover_pos"):
             del self._hover_pos
         self.planner.episode_reset()
