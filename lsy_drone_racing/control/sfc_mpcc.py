@@ -335,9 +335,23 @@ class AttitudeMPC(Controller):
         self._s_total = float(s[-1])
 
     def _update_current_theta(self, pos: np.ndarray) -> None:
-        """Update the path progress parameter `theta` based on current drone position."""
+        """Update the path progress parameter `theta` based on current drone position.
+        
+        When replanning, we find the closest point on the new path ahead of the drone,
+        but bounded by the next target gate to avoid skipping gates.
+        """
+        gates_pos = getattr(self.planner, "gates_pos", None)
+        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
+        theta_target_gate = self._s_total
+
+        if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
+            target_gate_pos = gates_pos[target_gate_idx]
+            s_eval_gate = np.linspace(0, self._s_total, max(100, int(self._s_total * 10)))
+            dists_gate = np.linalg.norm(self._des_pos_spline(s_eval_gate) - target_gate_pos, axis=1)
+            theta_target_gate = float(s_eval_gate[np.argmin(dists_gate)])
+
         s_eval = np.linspace(
-            max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 0.5), 20
+            0.0, theta_target_gate, max(20, int(theta_target_gate * 40))
         )
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])

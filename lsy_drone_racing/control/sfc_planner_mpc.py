@@ -775,11 +775,15 @@ class SfcCorridorPlanner:
         # tangent aligned with the drone's current heading without forcing
         # the perpendicular exit_swing detour, which over-commits when the
         # drone has already started its turn.
+        is_far_from_prev_gate = True
         prev_gate_idx = self.target_gate_idx - 1
         if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(self.gates_pos):
             prev_pos = self.gates_pos[prev_gate_idx]
             prev_normal = gate_normals[prev_gate_idx]
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
+            if d_post <= self.config.PREV_GATE_EXIT_THRESHOLD:
+                is_far_from_prev_gate = False
+
             if 0.0 < d_post < self.config.PREV_GATE_EXIT_THRESHOLD:
                 next_pos = self.gates_pos[self.target_gate_idx]
                 # Test against prev_pos + prev_normal * anchor_gap, the canonical
@@ -787,12 +791,13 @@ class SfcCorridorPlanner:
                 exit_vector = next_pos - (prev_pos + prev_normal * self.config.anchor_gap)
                 if float(np.dot(exit_vector, prev_normal)) < self.config.EXIT_SWING_THRESHOLD:
                     clearance_dist = self.config.anchor_gap + self.config.EXIT_SWING_CLEARANCE
-                    clearance_pos = prev_pos + prev_normal * clearance_dist
-                    raw_path.append(
-                        SkeletonPoint(
-                            clearance_pos, False, None, None, None, gate_idx=prev_gate_idx
+                    if d_post < clearance_dist:
+                        clearance_pos = prev_pos + prev_normal * clearance_dist
+                        raw_path.append(
+                            SkeletonPoint(
+                                clearance_pos, False, None, None, None, gate_idx=prev_gate_idx
+                            )
                         )
-                    )
 
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
@@ -807,11 +812,15 @@ class SfcCorridorPlanner:
             # ENTRY SWING (U-turn approach logic). Computed against gate centre
             # rather than a pre_pos anchor — same dot-product test, ~0.5 m
             if np.dot(flow_dir, normal) < self.config.ENTRY_SWING_THRESHOLD:
-                if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * self.config.ENTRY_SWING_OFFSET
-                else:
-                    swing_pos = pos - right * self.config.ENTRY_SWING_OFFSET
-                raw_path.append(SkeletonPoint(swing_pos, False, None, None, None, gate_idx=i))
+                skip_entry_swing = (i == self.target_gate_idx) and is_far_from_prev_gate
+                
+                if not skip_entry_swing:
+                    if np.dot(raw_path[-1].pos - pos, right) > 0:
+                        swing_pos = pos + right * self.config.ENTRY_SWING_OFFSET
+                    else:
+                        swing_pos = pos - right * self.config.ENTRY_SWING_OFFSET
+                    
+                    raw_path.append(SkeletonPoint(swing_pos, False, None, None, None, gate_idx=i))
 
             raw_path.append(SkeletonPoint(pos, True, normal, right, up, gate_idx=i))
 

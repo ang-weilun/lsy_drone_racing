@@ -120,7 +120,7 @@ class PlannerConfig:
     """Constraint penalty multiplier forcing gate-control points to match gate centers exactly."""
 
     # --- Heuristics, Swing Waypoints & Exit Mechanics ---
-    PREV_GATE_EXIT_THRESHOLD: float = 1.0
+    PREV_GATE_EXIT_THRESHOLD: float = 0.5
     """Maximum distance (m) along gate normal within which the
     previous gate's clearance is maintained.
     """
