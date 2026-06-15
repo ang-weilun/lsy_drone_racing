@@ -693,14 +693,15 @@ class SfcCorridorPlanner:
         v_ref = corridor_params["ref"]
 
         # Override pre/post gate references to align with normals
+        cp_idx_map = [0]
+        curr_idx = pts_first_seg
+        for seg_idx in range(1, n_segments):
+            cp_idx_map.append(curr_idx)
+            curr_idx += pts_rest_seg
+        cp_idx_map.append(n_ctrl - 1)
+
         for i in range(1, len(skeleton_path) - 1):
             if skeleton_path[i].is_gate:
-                cp_idx_map = [0]
-                curr_idx = pts_first_seg
-                for seg_idx in range(1, n_segments):
-                    cp_idx_map.append(curr_idx)
-                    curr_idx += pts_rest_seg
-                cp_idx_map.append(n_ctrl - 1)
                 gate_cp_idx = cp_idx_map[i]
 
                 if gate_cp_idx >= self.MAX_CTRL:
