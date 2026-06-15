@@ -220,12 +220,12 @@ def create_ocp_solver(
     ocp.cost.yref_e = yref_e
 
     ocp.constraints.lbx = np.array(
-        [-config.MAX_ROLL_PITCH, -config.MAX_ROLL_PITCH, -config.MAX_YAW, config.MIN_V_THETA]
+        [-config.MAX_ROLL_PITCH, -config.MAX_ROLL_PITCH, -config.MAX_YAW, 0.0, config.MIN_V_THETA]
     )
     ocp.constraints.ubx = np.array(
-        [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, config.MAX_V_THETA]
+        [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, 1000.0, config.MAX_V_THETA]
     )
-    ocp.constraints.idxbx = np.array([3, 4, 5, 13])
+    ocp.constraints.idxbx = np.array([3, 4, 5, 12, 13])
 
     ocp.constraints.lbu = np.array(
         [
@@ -408,10 +408,55 @@ class AttitudeMPC(Controller):
                 self._acados_ocp_solver.set(j, "u", self._acados_ocp_solver.get(j + 1, "u"))
             self._acados_ocp_solver.set(0, "x", x0)
 
-    def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
-        """Set the reference parameters and cost weights along the MPC horizon."""
+    def _check_horizon_gate_pass(self) -> tuple[bool, float]:
+        """Check if the MPC horizon physically passes the target gate and find its arc-length."""
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
+        gates_quat = getattr(self.planner, "gates_quat", None)
+
+        horizon_passes_gate = False
+        theta_target_gate = self._s_total
+
+        if gates_pos is not None and gates_quat is not None and 0 <= target_gate_idx < len(gates_pos):
+            target_gate_pos = gates_pos[target_gate_idx]
+            gate_normal = R.from_quat(gates_quat[target_gate_idx]).apply([1.0, 0.0, 0.0])
+
+            s_eval = np.linspace(
+                max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 10.0), 500
+            )
+            dists = np.linalg.norm(self._des_pos_spline(s_eval) - target_gate_pos, axis=1)
+            theta_target_gate = s_eval[np.argmin(dists)] + 0.2
+
+            for j in range(self._N + 1):
+                x_j = self._acados_ocp_solver.get(j, "x")
+                pos_j = x_j[:3]
+                if (
+                    np.dot(pos_j - target_gate_pos, gate_normal) > -0.1
+                    and np.linalg.norm(pos_j - target_gate_pos) < 0.5
+                ):
+                    horizon_passes_gate = True
+                    break
+
+        return horizon_passes_gate, theta_target_gate
+
+    def _update_horizon_progress_bounds(self, horizon_passes_gate: bool, theta_target_gate: float) -> None:
+        """Update the upper bounds of the progress variable theta along the horizon."""
+        for j in range(1, self._N):
+            x_j = self._acados_ocp_solver.get(j, "x")
+            ubx_j = self._acados_ocp_solver.constraints_get(j, "ubx")
+            ubx_theta = 1000.0 if horizon_passes_gate else theta_target_gate
+            ubx_j[3] = max(ubx_theta, float(x_j[12]))
+            self._acados_ocp_solver.constraints_set(j, "ubx", ubx_j)
+
+    def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
+        """Set the reference parameters and cost weights along the MPC horizon."""
+        horizon_passes_gate, theta_target_gate = self._check_horizon_gate_pass()
+        self._update_horizon_progress_bounds(horizon_passes_gate, theta_target_gate)
+
+        gates_pos = getattr(self.planner, "gates_pos", None)
+        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
+        target_gate_pos = gates_pos[target_gate_idx] if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos) else None
+
         for j in range(self._N + 1):
             x_j = self._acados_ocp_solver.get(j, "x")
             theta_j = float(x_j[12])
@@ -430,8 +475,7 @@ class AttitudeMPC(Controller):
             self._acados_ocp_solver.set(j, "p", p_j)
 
             Q_c_dynamic = self.mpcc_config.Q_c
-            if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
-                target_gate_pos = gates_pos[target_gate_idx]
+            if target_gate_pos is not None:
                 dist_to_target_gate = np.linalg.norm(target_gate_pos - p_j_pos)
                 dynamic_addition = self.mpcc_config.dynamic_addition * np.exp(
                     -(dist_to_target_gate**2) / (2 * self.mpcc_config.dynamic_sigma**2)
