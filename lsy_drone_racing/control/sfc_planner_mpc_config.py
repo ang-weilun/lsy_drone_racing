@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 class PlannerConfig:
     """Configuration for the SFC B-Spline Path Planner."""
 
+    # --- Planner Mode ---
+    use_optimization: bool = False
+    """Whether to run the CasADi B-spline optimization. If False, uses the raw skeleton path."""
+
     # --- Optimizer Weights ---
     W_VEL: float = 2.0
     """Penalty on velocity (first derivative of control points)."""
@@ -46,7 +50,7 @@ class PlannerConfig:
     anchor_gap: float = 0.5
     """Distance (m) from gate to place entry/exit anchors along the normal."""
 
-    points_per_segment: int = 4
+    points_per_segment: int = 2
     """Number of B-spline control points per inter-gate segment."""
 
     safety_margin: float = 0.15

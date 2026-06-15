@@ -712,6 +712,9 @@ class SfcCorridorPlanner:
                 if gate_cp_idx + 1 < n_ctrl:
                     v_ref[gate_cp_idx + 1] = gate_pos + normal * self.config.anchor_gap
 
+        if not self.config.use_optimization:
+            return v_ref[:n_ctrl]
+
         v_end_mask = np.zeros(self.MAX_CTRL)
         v_end_mask[n_ctrl - 1] = 1.0
         v_end_pos = skeleton_path[-1].pos
