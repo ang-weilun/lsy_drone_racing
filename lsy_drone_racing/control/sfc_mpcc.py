@@ -7,6 +7,7 @@ state vector with path progress and virtual velocity, and enforces obstacle avoi
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import casadi as cs
@@ -14,12 +15,12 @@ import numpy as np
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from crazyflow.sim.visualize import draw_capsule, draw_line, draw_points
 from drone_models.core import load_params
-from drone_models.so_rpy import symbolic_dynamics_euler
+from drone_models.so_rpy_rotor_drag import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control import Controller, mpcc_trace
 from lsy_drone_racing.control.sfc_mpcc_config import MPCCConfig
 from lsy_drone_racing.control.sfc_planner_mpc import SfcCorridorPlanner
 from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
@@ -39,26 +40,42 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     Returns:
         AcadosModel: The constructed Acados model.
     """
+    # model_rotor_vel=False: 12-state base + drag; we add our own scalar thrust lag below.
     X_dot, X, U, _ = symbolic_dynamics_euler(
+        model_rotor_vel=False,
         mass=parameters["mass"],
         gravity_vec=parameters["gravity_vec"],
         J=parameters["J"],
         J_inv=parameters["J_inv"],
+        thrust_time_coef=parameters["thrust_time_coef"],
         acc_coef=parameters["acc_coef"],
         cmd_f_coef=parameters["cmd_f_coef"],
         rpy_coef=parameters["rpy_coef"],
         rpy_rates_coef=parameters["rpy_rates_coef"],
         cmd_rpy_coef=parameters["cmd_rpy_coef"],
+        drag_matrix=parameters["drag_matrix"],
     )
+
+    # Promote both commands to internal states so the cost can penalize command
+    # curvature and the OCP can't plan instantaneous thrust steps:
+    #   rpy command -> double-integrator chain (c_rpy -> vc_rpy <- a_rpy input)
+    #   thrust command -> scalar lag state f_thrust (thrust = cmd_f_coef * f_thrust, N)
+    c_rpy = cs.MX.sym("c_rpy", 3)  # commanded attitude (state), fed to the plant
+    vc_rpy = cs.MX.sym("vc_rpy", 3)  # command rate (state)
+    a_rpy = cs.MX.sym("a_rpy", 3)  # command acceleration (input, penalized)
+    f_thrust = cs.MX.sym("f_thrust")  # collective thrust state (N), lagged
+    cmd_thrust = cs.MX.sym("cmd_thrust")  # commanded collective thrust (input)
+    X_dot = cs.substitute(X_dot, U, cs.vertcat(c_rpy, f_thrust))
+    tau_thrust = float(parameters["thrust_time_coef"])
+    f_thrust_dot = (cmd_thrust - f_thrust) / tau_thrust
 
     theta = cs.MX.sym("theta")
     v_theta = cs.MX.sym("v_theta")
-    X_aug = cs.vertcat(X, theta, v_theta)
-
     delta_v_theta = cs.MX.sym("delta_v_theta")
-    U_aug = cs.vertcat(U, delta_v_theta)
 
-    X_dot_aug = cs.vertcat(X_dot, v_theta, delta_v_theta)
+    X_aug = cs.vertcat(X, f_thrust, theta, v_theta, c_rpy, vc_rpy)
+    U_aug = cs.vertcat(a_rpy, cmd_thrust, delta_v_theta)
+    X_dot_aug = cs.vertcat(X_dot, f_thrust_dot, v_theta, delta_v_theta, vc_rpy, a_rpy)
 
     p_theta_i = cs.MX.sym("theta_i")
     p_c_x = cs.MX.sym("c_x", 4)
@@ -95,7 +112,9 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         X[3:6],  # 3 (rpy)
         X[6:9],  # 3 (vel)
         X[9:12],  # 3 (drpy)
-        U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
+        a_rpy,  # 3 (rpy command curvature)
+        cmd_thrust,  # 1 (thrust command)
+        delta_v_theta,  # 1
         y_obs,  # 24 (obstacle avoidance)
     )
 
@@ -156,10 +175,10 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         config.Q_drpy,
         config.Q_drpy,
         config.Q_drpy,  # drpy (3)
-        config.R_cmd_rpy,
-        config.R_cmd_rpy,
-        config.R_cmd_rpy,
-        config.R_cmd_thrust,  # u (4)
+        config.R_curv_rpy,
+        config.R_curv_rpy,
+        config.R_curv_rpy,  # a_rpy (3) rpy command curvature
+        config.R_cmd_thrust,  # thrust (1)
         0.5,  # delta_v_theta (1)
     ] + [config.obstacle_penalty] * 24
 
@@ -219,28 +238,52 @@ def create_ocp_solver(
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
 
+    # State: [pos 0:3, rpy 3:6, vel 6:9, drpy 9:12, f_thrust 12, theta 13,
+    #         v_theta 14, c_rpy 15:18, vc_rpy 18:21]. c_rpy carries MAX_RPY_RATES
+    # since it is now what the plant receives (idxbx below).
+    thrust_min_coll = parameters["thrust_min"] * 4
+    thrust_max_coll = parameters["thrust_max"] * 4
     ocp.constraints.lbx = np.array(
-        [-config.MAX_ROLL_PITCH, -config.MAX_ROLL_PITCH, -config.MAX_YAW, config.MIN_V_THETA]
+        [
+            -config.MAX_ROLL_PITCH,
+            -config.MAX_ROLL_PITCH,
+            -config.MAX_YAW,
+            thrust_min_coll,
+            config.MIN_V_THETA,
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+        ]
     )
     ocp.constraints.ubx = np.array(
-        [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, config.MAX_V_THETA]
+        [
+            config.MAX_ROLL_PITCH,
+            config.MAX_ROLL_PITCH,
+            config.MAX_YAW,
+            thrust_max_coll,
+            config.MAX_V_THETA,
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+        ]
     )
-    ocp.constraints.idxbx = np.array([3, 4, 5, 13])
+    ocp.constraints.idxbx = np.array([3, 4, 5, 12, 14, 15, 16, 17])
 
+    # Inputs are now [a_rpy (command acceleration, 3), thrust, delta_v_theta].
     ocp.constraints.lbu = np.array(
         [
-            -config.MAX_RPY_RATES,
-            -config.MAX_RPY_RATES,
-            -config.MAX_RPY_RATES,
+            -config.MAX_CMD_RPY_ACC,
+            -config.MAX_CMD_RPY_ACC,
+            -config.MAX_CMD_RPY_ACC,
             parameters["thrust_min"] * 4,
             -config.MAX_DELTA_V_THETA,
         ]
     )
     ocp.constraints.ubu = np.array(
         [
-            config.MAX_RPY_RATES,
-            config.MAX_RPY_RATES,
-            config.MAX_RPY_RATES,
+            config.MAX_CMD_RPY_ACC,
+            config.MAX_CMD_RPY_ACC,
+            config.MAX_CMD_RPY_ACC,
             parameters["thrust_max"] * 4,
             config.MAX_DELTA_V_THETA,
         ]
@@ -287,21 +330,32 @@ class AttitudeMPC(Controller):
         self.mpcc_config = MPCCConfig()
         self.planner_config = PlannerConfig()
 
-        dt_fine = self.mpcc_config.dt_fine
-        dt_coarse = self.mpcc_config.dt_coarse
-        self._time_steps = np.concatenate(
-            [
-                np.full(self.mpcc_config.N_fine, dt_fine),
-                np.full(self.mpcc_config.N_coarse, dt_coarse),
-            ]
-        )
+        dt_first = 1.0 / config.env.freq
+        if self.mpcc_config.dt_fine != dt_first:
+            raise ValueError(
+                f"dt_fine ({self.mpcc_config.dt_fine}) must equal the control period "
+                f"({dt_first}): node-1 progress propagation and the RTI shift assume "
+                "the first shooting interval matches the tick length."
+            )
+        if self.mpcc_config.horizon_schedule == "linear":
+            n_steps = self.mpcc_config.N_fine + self.mpcc_config.N_coarse
+            self._time_steps = np.linspace(
+                self.mpcc_config.dt_fine, self.mpcc_config.dt_coarse, n_steps
+            )
+        else:
+            self._time_steps = np.concatenate(
+                [
+                    np.full(self.mpcc_config.N_fine, self.mpcc_config.dt_fine),
+                    np.full(self.mpcc_config.N_coarse, self.mpcc_config.dt_coarse),
+                ]
+            )
         self._N = len(self._time_steps)
         self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
 
         self.planner = SfcCorridorPlanner(obs, config.env.freq, self.planner_config)
         self._update_spline()
 
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self.drone_params["pos_limit_low"] = np.array(
             config.env.track.safety_limits.get("pos_limit_low", [-2.5, -1.5, 0.0])
         )
@@ -317,10 +371,25 @@ class AttitudeMPC(Controller):
 
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        # Command states carried across ticks (RTI shift), pinned at node 0 to link
+        # consecutive commands. Seed from current attitude, zero rate.
+        self._current_cmd_rpy = R.from_quat(obs["quat"]).as_euler("xyz")
+        self._current_vc_rpy = np.zeros(3)
+        # Thrust-lag state, carried open-loop and seeded at hover (F = m*g / cmd_f_coef).
+        hover_force = float(self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1])
+        self._hover_thrust = hover_force / float(self.drone_params["cmd_f_coef"])
+        self._current_thrust = self._hover_thrust
 
         self._tick = 0
         self._config = config
         self._finished = False
+
+        self._trace = mpcc_trace.make_recorder_if_enabled(self._N)
+        if self._trace is not None:
+            self._trace.set_meta(
+                seed=int(config.env.seed), freq=int(config.env.freq), n_gates=len(obs["gates_pos"])
+            )
+            self._record_replan_trace()
 
     def _update_spline(self) -> None:
         """Update the reference B-spline from the planner's control points."""
@@ -341,6 +410,35 @@ class AttitudeMPC(Controller):
         )
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
+
+    def _record_replan_trace(self) -> None:
+        """Snapshot the freshly built plan (spline, capsules, corridors) into the trace."""
+        s_dense = np.linspace(0.0, self._s_total, mpcc_trace.SPLINE_SAMPLES)
+        event = self.planner.last_replan_event
+        capsules = self.planner.capsules or []
+        # packed per capsule as [p1(3), p2(3), radius, is_gate] — layout consumed by trace_autopsy
+        capsule_arr = (
+            np.array(
+                [[*c.p1, *c.p2, c.radius, float(c.is_gate)] for c in capsules], dtype=np.float32
+            )
+            if capsules
+            else np.zeros((0, 8), np.float32)
+        )
+        a_blocks = [np.asarray(c.A, dtype=np.float32) for c in self.planner.corridors]
+        b_blocks = [np.asarray(c.b, dtype=np.float32) for c in self.planner.corridors]
+        offsets = np.concatenate(([0], np.cumsum([len(b) for b in b_blocks]))).astype(np.int32)
+        self._trace.record_replan(
+            tick=self._tick,
+            reason=str(event["reason"]) if event is not None else "init",
+            spline=self._des_pos_spline(s_dense).astype(np.float32),
+            capsules=capsule_arr,
+            corridor_A=np.concatenate(a_blocks) if a_blocks else np.zeros((0, 3), np.float32),
+            corridor_b=np.concatenate(b_blocks) if b_blocks else np.zeros(0, np.float32),
+            corridor_offsets=offsets,
+            gates_pos=self.planner.gates_pos.astype(np.float32),
+            gates_quat=self.planner.gates_quat.astype(np.float32),
+            obstacles_pos=self.planner.obstacles_pos.astype(np.float32),
+        )
 
     def _extract_closest_obstacles(
         self, ref_points: np.ndarray
@@ -377,7 +475,8 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
-        if self._tick == 0 or replanned:
+        if self._tick == 0:
+            # Cold start: coarse guess over the whole horizon.
             v_start_guess = max(0.5, self._current_v_theta)
             for j in range(self._N + 1):
                 if j == 0:
@@ -396,16 +495,30 @@ class AttitudeMPC(Controller):
                             obs["rpy"] * (1 - alpha),
                             obs["vel"] * (1 - alpha),
                             obs["drpy"] * (1 - alpha),
+                            [self._hover_thrust],
                             [theta_guess],
                             [v_start_guess],
+                            obs["rpy"] * (1 - alpha),
+                            np.zeros(3),
                         )
                     )
                 self._acados_ocp_solver.set(j, "x", x_guess)
         else:
+            # Normal tick and replan: shift the previous solution forward (RTI warm
+            # start). A replan only alters the reference ahead, which RTI tracks.
             for j in range(self._N):
                 self._acados_ocp_solver.set(j, "x", self._acados_ocp_solver.get(j + 1, "x"))
             for j in range(self._N - 1):
                 self._acados_ocp_solver.set(j, "u", self._acados_ocp_solver.get(j + 1, "u"))
+            if replanned:
+                # Spline rebuilt at the drone (theta resets to 0): re-anchor each
+                # node's progress, keeping the shifted physical/command states.
+                v_start = max(0.5, self._current_v_theta)
+                for j in range(self._N + 1):
+                    x_node = self._acados_ocp_solver.get(j, "x")
+                    x_node[13] = float(np.clip(self._shooting_nodes[j] * v_start, 0, self._s_total))
+                    x_node[14] = v_start
+                    self._acados_ocp_solver.set(j, "x", x_node)
             self._acados_ocp_solver.set(0, "x", x0)
 
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
@@ -414,7 +527,7 @@ class AttitudeMPC(Controller):
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
         for j in range(self._N + 1):
             x_j = self._acados_ocp_solver.get(j, "x")
-            theta_j = float(x_j[12])
+            theta_j = float(x_j[13])
             theta_j = np.clip(theta_j, 0, self._s_total)
             p_j_pos = self._des_pos_spline(theta_j)
 
@@ -486,14 +599,20 @@ class AttitudeMPC(Controller):
             as a float32 array.
         """
         replanned = self.planner.update(obs)
+        if self._tick > 0:
+            # Carry the propagated states from the previous solve's node 1 (RTI shift
+            # target). theta carries on a normal tick; on a replan it re-anchors below.
+            x_prev = self._acados_ocp_solver.get(1, "x")
+            self._current_thrust = float(x_prev[12])
+            self._current_v_theta = max(0.0, float(x_prev[14]))
+            self._current_cmd_rpy = np.asarray(x_prev[15:18])
+            self._current_vc_rpy = np.asarray(x_prev[18:21])
+            if not replanned:
+                self._current_theta = float(x_prev[13])
         if replanned:
             self._update_spline()
             self._current_theta = 0.0
             self._update_current_theta(obs["pos"])
-        elif self._tick > 0:
-            x_prev = self._acados_ocp_solver.get(1, "x")
-            self._current_theta = float(x_prev[12])
-            self._current_v_theta = max(0.0, float(x_prev[13]))
 
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
@@ -518,8 +637,11 @@ class AttitudeMPC(Controller):
                 obs["rpy"],
                 obs["vel"],
                 obs["drpy"],
+                [self._current_thrust],
                 [self._current_theta],
                 [self._current_v_theta],
+                self._current_cmd_rpy,
+                self._current_vc_rpy,
             )
         )
 
@@ -542,12 +664,14 @@ class AttitudeMPC(Controller):
         if replanned or param_diff > 0.5:
             num_iters = self.mpcc_config.NLP_SOLVER_MAX_ITER
 
+        t_solve_start = time.perf_counter()
         for _ in range(num_iters):
             self._acados_ocp_solver.options_set("rti_phase", 1)
             self._acados_ocp_solver.solve()
 
             self._acados_ocp_solver.options_set("rti_phase", 2)
             status = self._acados_ocp_solver.solve()
+        solve_time = time.perf_counter() - t_solve_start
 
         is_hovering = status not in [0, 2] or hasattr(self, "_hover_pos")
 
@@ -568,15 +692,39 @@ class AttitudeMPC(Controller):
         # Record flown trajectory
         self.planner.add_trajectory_point(obs["pos"])
 
-        if status not in [0, 2]:
+        fallback = status not in [0, 2]
+        if fallback:
             logger.warning(f"MPCC solver failed with status {status}. Entering hover mode.")
-            return self._compute_hover_control(obs)
+            cmd = self._compute_hover_control(obs)
         else:
             if hasattr(self, "_hover_pos"):
                 del self._hover_pos
+            # rpy = command state at node 1 (applied this tick); thrust = input at node 0.
+            cmd_rpy = self._acados_ocp_solver.get(1, "x")[15:18]
+            cmd_thrust = self._acados_ocp_solver.get(0, "u")[3]
+            cmd = np.concatenate([cmd_rpy, [cmd_thrust]]).astype(np.float32)
 
-        u0 = self._acados_ocp_solver.get(0, "u")
-        return u0[0:4]
+        if self._trace is not None:
+            if replanned:
+                self._record_replan_trace()
+            horizon = np.array([self._acados_ocp_solver.get(j, "x") for j in range(self._N + 1)])
+            e_c, e_l = mpcc_trace.contour_lag_errors(
+                obs["pos"], self._current_theta, self._des_pos_spline
+            )
+            self._trace.record_tick(
+                obs=obs,
+                action=cmd,
+                status=int(status),
+                solve_time=solve_time,
+                fallback=fallback,
+                theta=self._current_theta,
+                v_theta=self._current_v_theta,
+                e_contour=e_c,
+                e_lag=e_l,
+                horizon_pos=horizon[:, 0:3],  # x[0:3] = pos, x[13] = path progress theta
+                horizon_theta=horizon[:, 13],
+            )
+        return cmd
 
     def step_callback(
         self,
@@ -600,14 +748,25 @@ class AttitudeMPC(Controller):
         Returns:
             bool: True if the drone has completed the track/finished the episode.
         """
+        if self._trace is not None:
+            self._trace.record_step_result(
+                int(obs["target_gate"]), bool(terminated), bool(truncated)
+            )
         self._tick += 1
         return self._finished
 
     def episode_callback(self) -> None:
         """Reset the controller state and variables at the start of a new episode."""
+        if self._trace is not None:
+            path = self._trace.save()
+            logger.info(f"Saved MPCC trace to {path}")
+            self._trace = None
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        self._current_cmd_rpy = np.zeros(3)
+        self._current_vc_rpy = np.zeros(3)
+        self._current_thrust = self._hover_thrust
         if hasattr(self, "_hover_pos"):
             del self._hover_pos
         self.planner.episode_reset()
