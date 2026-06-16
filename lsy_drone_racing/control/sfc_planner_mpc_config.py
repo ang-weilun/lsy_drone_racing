@@ -8,7 +8,7 @@ class PlannerConfig:
     """Configuration for the SFC B-Spline Path Planner."""
 
     # --- Planner Mode ---
-    use_optimization: bool = False
+    use_optimization: bool = True
     """Whether to run the CasADi B-spline optimization. If False, uses the raw skeleton path."""
 
     # --- Optimizer Weights ---
@@ -96,15 +96,6 @@ class PlannerConfig:
     """Maximum number of linear inequality halfspaces /
     separating planes allowed per control point.
     """
-
-    IPOPT_MAX_ITER: int = 100
-    """Maximum iterations allowed for the IPOPT solver."""
-
-    IPOPT_TOL: float = 1e-4
-    """Tolerance for convergence in IPOPT solver."""
-
-    IPOPT_ACCEPTABLE_TOL: float = 1e-3
-    """Acceptable tolerance for IPOPT solver before termination under slow progress."""
 
     # --- Optimization Objective Weights ---
     W_P0_REF: float = 10.0

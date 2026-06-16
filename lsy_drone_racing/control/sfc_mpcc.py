@@ -7,6 +7,7 @@ state vector with path progress and virtual velocity, and enforces obstacle avoi
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import casadi as cs
@@ -14,12 +15,12 @@ import numpy as np
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from crazyflow.sim.visualize import draw_capsule, draw_line, draw_points
 from drone_models.core import load_params
-from drone_models.so_rpy import symbolic_dynamics_euler
+from drone_models.so_rpy_rotor_drag import symbolic_dynamics_euler
 from drone_models.utils.rotation import ang_vel2rpy_rates
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control import Controller, mpcc_trace
 from lsy_drone_racing.control.sfc_mpcc_config import MPCCConfig
 from lsy_drone_racing.control.sfc_planner_mpc import SfcCorridorPlanner
 from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
@@ -39,26 +40,42 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     Returns:
         AcadosModel: The constructed Acados model.
     """
+    # model_rotor_vel=False: 12-state base + drag; we add our own scalar thrust lag below.
     X_dot, X, U, _ = symbolic_dynamics_euler(
+        model_rotor_vel=False,
         mass=parameters["mass"],
         gravity_vec=parameters["gravity_vec"],
         J=parameters["J"],
         J_inv=parameters["J_inv"],
+        thrust_time_coef=parameters["thrust_time_coef"],
         acc_coef=parameters["acc_coef"],
         cmd_f_coef=parameters["cmd_f_coef"],
         rpy_coef=parameters["rpy_coef"],
         rpy_rates_coef=parameters["rpy_rates_coef"],
         cmd_rpy_coef=parameters["cmd_rpy_coef"],
+        drag_matrix=parameters["drag_matrix"],
     )
+
+    # Promote both commands to internal states so the cost can penalize command
+    # curvature and the OCP can't plan instantaneous thrust steps:
+    #   rpy command -> double-integrator chain (c_rpy -> vc_rpy <- a_rpy input)
+    #   thrust command -> scalar lag state f_thrust (thrust = cmd_f_coef * f_thrust, N)
+    c_rpy = cs.MX.sym("c_rpy", 3)  # commanded attitude (state), fed to the plant
+    vc_rpy = cs.MX.sym("vc_rpy", 3)  # command rate (state)
+    a_rpy = cs.MX.sym("a_rpy", 3)  # command acceleration (input, penalized)
+    f_thrust = cs.MX.sym("f_thrust")  # collective thrust state (N), lagged
+    cmd_thrust = cs.MX.sym("cmd_thrust")  # commanded collective thrust (input)
+    X_dot = cs.substitute(X_dot, U, cs.vertcat(c_rpy, f_thrust))
+    tau_thrust = float(parameters["thrust_time_coef"])
+    f_thrust_dot = (cmd_thrust - f_thrust) / tau_thrust
 
     theta = cs.MX.sym("theta")
     v_theta = cs.MX.sym("v_theta")
-    X_aug = cs.vertcat(X, theta, v_theta)
-
     delta_v_theta = cs.MX.sym("delta_v_theta")
-    U_aug = cs.vertcat(U, delta_v_theta)
 
-    X_dot_aug = cs.vertcat(X_dot, v_theta, delta_v_theta)
+    X_aug = cs.vertcat(X, f_thrust, theta, v_theta, c_rpy, vc_rpy)
+    U_aug = cs.vertcat(a_rpy, cmd_thrust, delta_v_theta)
+    X_dot_aug = cs.vertcat(X_dot, f_thrust_dot, v_theta, delta_v_theta, vc_rpy, a_rpy)
 
     p_theta_i = cs.MX.sym("theta_i")
     p_c_x = cs.MX.sym("c_x", 4)
@@ -95,7 +112,9 @@ def create_acados_model(parameters: dict) -> AcadosModel:
         X[3:6],  # 3 (rpy)
         X[6:9],  # 3 (vel)
         X[9:12],  # 3 (drpy)
-        U_aug,  # 5 (r_des, p_des, y_des, thrust_des, delta_v_theta)
+        a_rpy,  # 3 (rpy command curvature)
+        cmd_thrust,  # 1 (thrust command)
+        delta_v_theta,  # 1
         y_obs,  # 24 (obstacle avoidance)
     )
 
@@ -156,10 +175,10 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
         config.Q_drpy,
         config.Q_drpy,
         config.Q_drpy,  # drpy (3)
-        config.R_cmd_rpy,
-        config.R_cmd_rpy,
-        config.R_cmd_rpy,
-        config.R_cmd_thrust,  # u (4)
+        config.R_curv_rpy,
+        config.R_curv_rpy,
+        config.R_curv_rpy,  # a_rpy (3) rpy command curvature
+        config.R_cmd_thrust,  # thrust (1)
         0.5,  # delta_v_theta (1)
     ] + [config.obstacle_penalty] * 24
 
@@ -219,28 +238,54 @@ def create_ocp_solver(
     ocp.cost.yref = yref
     ocp.cost.yref_e = yref_e
 
+    thrust_min_coll = parameters["thrust_min"] * 4
+    thrust_max_coll = parameters["thrust_max"] * 4
     ocp.constraints.lbx = np.array(
-        [-config.MAX_ROLL_PITCH, -config.MAX_ROLL_PITCH, -config.MAX_YAW, 0.0, config.MIN_V_THETA]
+        [
+            -config.MAX_ROLL_PITCH,
+            -config.MAX_ROLL_PITCH,
+            -config.MAX_YAW,
+            thrust_min_coll,
+            0.0, # theta
+            config.MIN_V_THETA,
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+            -config.MAX_RPY_RATES,
+        ]
     )
     ocp.constraints.ubx = np.array(
-        [config.MAX_ROLL_PITCH, config.MAX_ROLL_PITCH, config.MAX_YAW, 1000.0, config.MAX_V_THETA]
+        [
+            config.MAX_ROLL_PITCH,
+            config.MAX_ROLL_PITCH,
+            config.MAX_YAW,
+            thrust_max_coll,
+            1000.0, # theta
+            config.MAX_V_THETA,
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+            config.MAX_RPY_RATES,
+        ]
     )
-    ocp.constraints.idxbx = np.array([_X_RPY.start, _X_RPY.start + 1, _X_RPY.start + 2, _X_THETA, _X_V_THETA])
+    ocp.constraints.idxbx = np.array([
+        _X_RPY.start, _X_RPY.start + 1, _X_RPY.start + 2,
+        _X_F_THRUST, _X_THETA, _X_V_THETA,
+        _X_C_RPY.start, _X_C_RPY.start + 1, _X_C_RPY.start + 2
+    ])
 
     ocp.constraints.lbu = np.array(
         [
-            -config.MAX_RPY_RATES,
-            -config.MAX_RPY_RATES,
-            -config.MAX_RPY_RATES,
+            -config.MAX_CMD_RPY_ACC,
+            -config.MAX_CMD_RPY_ACC,
+            -config.MAX_CMD_RPY_ACC,
             parameters["thrust_min"] * 4,
             -config.MAX_DELTA_V_THETA,
         ]
     )
     ocp.constraints.ubu = np.array(
         [
-            config.MAX_RPY_RATES,
-            config.MAX_RPY_RATES,
-            config.MAX_RPY_RATES,
+            config.MAX_CMD_RPY_ACC,
+            config.MAX_CMD_RPY_ACC,
+            config.MAX_CMD_RPY_ACC,
             parameters["thrust_max"] * 4,
             config.MAX_DELTA_V_THETA,
         ]
@@ -275,8 +320,8 @@ def create_ocp_solver(
 # ---------------------------------------------------------------------------
 # Index constants for the augmented state, input, and cost vectors.
 #
-# Augmented state x (14):  [pos(3), rpy(3), vel(3), drpy(3), theta, v_theta]
-# Augmented input u (5):   [cmd_roll, cmd_pitch, cmd_yaw, thrust, delta_v_theta]
+# Augmented state x (21):  [pos(3), rpy(3), vel(3), drpy(3), f_thrust, theta, v_theta, c_rpy(3), vc_rpy(3)]
+# Augmented input u (5):   [a_rpy(3), cmd_thrust, delta_v_theta]
 # ---------------------------------------------------------------------------
 
 # -- State indices --
@@ -284,23 +329,32 @@ _X_POS = slice(0, 3)
 _X_RPY = slice(3, 6)
 _X_VEL = slice(6, 9)
 _X_DRPY = slice(9, 12)
-_X_THETA = 12
-_X_V_THETA = 13
+_X_F_THRUST = 12
+_X_THETA = 13
+_X_V_THETA = 14
+_X_C_RPY = slice(15, 18)
+_X_VC_RPY = slice(18, 21)
 
 # -- Input indices --
-_U_CMD = slice(0, 4)  # [roll_des, pitch_des, yaw_des, thrust_des]
+_U_A_RPY = slice(0, 3)
+_U_THRUST = 3
+_U_DELTA_V_THETA = 4
 
 # -- Cost reference (yref) indices --
 _YREF_V_THETA = 4     # virtual velocity reference
 _YREF_THRUST = 17     # hover thrust reference (stage cost only)
 
 # -- Bounded-state (ubx) index mapping --
-# idxbx = [3, 4, 5, 12, 13] => ubx positions 0..4
+# idxbx = [3, 4, 5, 12, 13, 14, 15, 16, 17] => ubx positions 0..8
 _UBX_ROLL = 0
 _UBX_PITCH = 1
 _UBX_YAW = 2
-_UBX_THETA = 3
-_UBX_V_THETA = 4
+_UBX_F_THRUST = 3
+_UBX_THETA = 4
+_UBX_V_THETA = 5
+_UBX_C_ROLL = 6
+_UBX_C_PITCH = 7
+_UBX_C_YAW = 8
 
 
 class AttitudeMPC(Controller):
@@ -327,7 +381,7 @@ class AttitudeMPC(Controller):
         self.planner = SfcCorridorPlanner(obs, config.env.freq, self.planner_config)
         self._update_spline()
 
-        self.drone_params = load_params("so_rpy", config.sim.drone_model)
+        self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
         self.drone_params["pos_limit_low"] = np.array(
             config.env.track.safety_limits.get("pos_limit_low", [-2.5, -1.5, 0.0])
         )
@@ -343,10 +397,25 @@ class AttitudeMPC(Controller):
 
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        # Command states carried across ticks (RTI shift), pinned at node 0 to link
+        # consecutive commands. Seed from current attitude, zero rate.
+        self._current_cmd_rpy = R.from_quat(obs["quat"]).as_euler("xyz")
+        self._current_vc_rpy = np.zeros(3)
+        # Thrust-lag state, carried open-loop and seeded at hover (F = m*g / cmd_f_coef).
+        hover_force = float(self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1])
+        self._hover_thrust = hover_force / float(self.drone_params["cmd_f_coef"])
+        self._current_thrust = self._hover_thrust
 
         self._tick = 0
         self._config = config
         self._finished = False
+
+        self._trace = mpcc_trace.make_recorder_if_enabled(self._N)
+        if self._trace is not None:
+            self._trace.set_meta(
+                seed=int(config.env.seed), freq=int(config.env.freq), n_gates=len(obs["gates_pos"])
+            )
+            self._record_replan_trace()
 
     def _update_spline(self) -> None:
         """Update the reference B-spline from the planner's control points."""
@@ -381,6 +450,35 @@ class AttitudeMPC(Controller):
         )
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
+
+    def _record_replan_trace(self) -> None:
+        """Snapshot the freshly built plan (spline, capsules, corridors) into the trace."""
+        s_dense = np.linspace(0.0, self._s_total, mpcc_trace.SPLINE_SAMPLES)
+        event = self.planner.last_replan_event
+        capsules = self.planner.capsules or []
+        # packed per capsule as [p1(3), p2(3), radius, is_gate] — layout consumed by trace_autopsy
+        capsule_arr = (
+            np.array(
+                [[*c.p1, *c.p2, c.radius, float(c.is_gate)] for c in capsules], dtype=np.float32
+            )
+            if capsules
+            else np.zeros((0, 8), np.float32)
+        )
+        a_blocks = [np.asarray(c.A, dtype=np.float32) for c in self.planner.corridors]
+        b_blocks = [np.asarray(c.b, dtype=np.float32) for c in self.planner.corridors]
+        offsets = np.concatenate(([0], np.cumsum([len(b) for b in b_blocks]))).astype(np.int32)
+        self._trace.record_replan(
+            tick=self._tick,
+            reason=str(event["reason"]) if event is not None else "init",
+            spline=self._des_pos_spline(s_dense).astype(np.float32),
+            capsules=capsule_arr,
+            corridor_A=np.concatenate(a_blocks) if a_blocks else np.zeros((0, 3), np.float32),
+            corridor_b=np.concatenate(b_blocks) if b_blocks else np.zeros(0, np.float32),
+            corridor_offsets=offsets,
+            gates_pos=self.planner.gates_pos.astype(np.float32),
+            gates_quat=self.planner.gates_quat.astype(np.float32),
+            obstacles_pos=self.planner.obstacles_pos.astype(np.float32),
+        )
 
     def _extract_closest_obstacles(
         self, ref_points: np.ndarray
@@ -436,8 +534,11 @@ class AttitudeMPC(Controller):
                             obs["rpy"] * (1 - alpha),
                             obs["vel"] * (1 - alpha),
                             obs["drpy"] * (1 - alpha),
+                            [self._hover_thrust],
                             [theta_guess],
                             [v_start_guess],
+                            obs["rpy"] * (1 - alpha),
+                            np.zeros(3),
                         )
                     )
                 self._acados_ocp_solver.set(j, "x", x_guess)
@@ -503,10 +604,6 @@ class AttitudeMPC(Controller):
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
         target_gate_pos = gates_pos[target_gate_idx] if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos) else None
 
-        gate_unobserved = False
-        if target_gate_idx >= 0 and "gates_visited" in obs and target_gate_idx < len(obs["gates_visited"]):
-            gate_unobserved = not obs["gates_visited"][target_gate_idx]
-
         for j in range(self._N + 1):
             x_j = self._acados_ocp_solver.get(j, "x")
             theta_j = float(x_j[_X_THETA])
@@ -538,23 +635,31 @@ class AttitudeMPC(Controller):
             W[2, 2] = max(Q_c_dynamic, self.mpcc_config.Q_c_z)
             self._acados_ocp_solver.cost_set(j, "W", W)
 
+            target_v = self.mpcc_config.mu / self.mpcc_config.W_v_theta
+            
+            if "gates_visited" in obs and gates_pos is not None:
+                for g_idx, is_visited in enumerate(obs["gates_visited"]):
+                    if not is_visited:
+                        dist = np.linalg.norm(gates_pos[g_idx] - p_j_pos)
+                        if dist < self.mpcc_config.unobserved_dist_threshold:
+                            target_v = min(target_v, self.mpcc_config.unobserved_velocity_cap)
+            
+            if "obstacles_visited" in obs and "obstacles_pos" in obs:
+                for obs_idx, is_visited in enumerate(obs["obstacles_visited"]):
+                    if not is_visited:
+                        dist = np.linalg.norm(obs["obstacles_pos"][obs_idx] - p_j_pos)
+                        # Obstacles are avoided, so the path won't get as close as to a gate
+                        if dist < self.mpcc_config.unobserved_dist_threshold + 0.8:
+                            target_v = min(target_v, self.mpcc_config.unobserved_velocity_cap)
+
             if j < self._N:
                 yref_j = self._acados_ocp_solver.cost_get(j, "yref")
-                target_v = self.mpcc_config.mu / self.mpcc_config.W_v_theta
-                if gate_unobserved and target_gate_pos is not None:
-                    dist_to_unobserved_gate = np.linalg.norm(target_gate_pos - p_j_pos)
-                    if dist_to_unobserved_gate < self.mpcc_config.unobserved_gate_dist_threshold:
-                        target_v = min(target_v, self.mpcc_config.unobserved_gate_velocity_cap)
-                
-                if "obstacles_visited" in obs and "obstacles_pos" in obs:
-                    for obs_idx, is_visited in enumerate(obs["obstacles_visited"]):
-                        if not is_visited:
-                            dist_to_unobserved_obs = np.linalg.norm(obs["obstacles_pos"][obs_idx] - p_j_pos)
-                            if dist_to_unobserved_obs < self.mpcc_config.unobserved_gate_dist_threshold:
-                                target_v = min(target_v, self.mpcc_config.unobserved_gate_velocity_cap)
-
                 yref_j[_YREF_V_THETA] = target_v
                 self._acados_ocp_solver.cost_set(j, "yref", yref_j)
+            else:
+                yref_e = self._acados_ocp_solver.cost_get(self._N, "yref")
+                yref_e[_YREF_V_THETA] = target_v
+                self._acados_ocp_solver.cost_set(self._N, "yref", yref_e)
 
     def _compute_hover_control(self, obs: dict[str, np.ndarray]) -> np.ndarray:
         """Compute hover fallback control if MPCC fails."""
@@ -598,14 +703,18 @@ class AttitudeMPC(Controller):
             as a float32 array.
         """
         replanned = self.planner.update(obs)
+        if self._tick > 0:
+            x_prev = self._acados_ocp_solver.get(1, "x")
+            self._current_thrust = float(x_prev[_X_F_THRUST])
+            self._current_v_theta = max(0.0, float(x_prev[_X_V_THETA]))
+            self._current_cmd_rpy = np.asarray(x_prev[_X_C_RPY])
+            self._current_vc_rpy = np.asarray(x_prev[_X_VC_RPY])
+            if not replanned:
+                self._current_theta = float(x_prev[_X_THETA])
         if replanned:
             self._update_spline()
             self._current_theta = 0.0
             self._update_current_theta(obs["pos"])
-        elif self._tick > 0:
-            x_prev = self._acados_ocp_solver.get(1, "x")
-            self._current_theta = float(x_prev[_X_THETA])
-            self._current_v_theta = max(0.0, float(x_prev[_X_V_THETA]))
 
         if self._current_theta >= self._s_total - 0.1:
             self._finished = True
@@ -630,8 +739,11 @@ class AttitudeMPC(Controller):
                 obs["rpy"],
                 obs["vel"],
                 obs["drpy"],
+                [self._current_thrust],
                 [self._current_theta],
                 [self._current_v_theta],
+                self._current_cmd_rpy,
+                self._current_vc_rpy,
             )
         )
 
@@ -654,12 +766,14 @@ class AttitudeMPC(Controller):
         if replanned or param_diff > 0.5:
             num_iters = self.mpcc_config.NLP_SOLVER_MAX_ITER
 
+        t_solve_start = time.perf_counter()
         for _ in range(num_iters):
             self._acados_ocp_solver.options_set("rti_phase", 1)
             self._acados_ocp_solver.solve()
 
             self._acados_ocp_solver.options_set("rti_phase", 2)
             status = self._acados_ocp_solver.solve()
+        solve_time = time.perf_counter() - t_solve_start
 
         is_hovering = status not in [0, 2] or hasattr(self, "_hover_pos")
 
@@ -680,15 +794,39 @@ class AttitudeMPC(Controller):
         # Record flown trajectory
         self.planner.add_trajectory_point(obs["pos"])
 
-        if status not in [0, 2]:
+        fallback = status not in [0, 2]
+        if fallback:
             logger.warning(f"MPCC solver failed with status {status}. Entering hover mode.")
-            return self._compute_hover_control(obs)
+            cmd = self._compute_hover_control(obs)
         else:
             if hasattr(self, "_hover_pos"):
                 del self._hover_pos
+            # rpy = command state at node 1 (applied this tick); thrust = input at node 0.
+            cmd_rpy = self._acados_ocp_solver.get(1, "x")[_X_C_RPY]
+            cmd_thrust = self._acados_ocp_solver.get(0, "u")[_U_THRUST]
+            cmd = np.concatenate([cmd_rpy, [cmd_thrust]]).astype(np.float32)
 
-        u0 = self._acados_ocp_solver.get(0, "u")
-        return u0[_U_CMD]
+        if self._trace is not None:
+            if replanned:
+                self._record_replan_trace()
+            horizon = np.array([self._acados_ocp_solver.get(j, "x") for j in range(self._N + 1)])
+            e_c, e_l = mpcc_trace.contour_lag_errors(
+                obs["pos"], self._current_theta, self._des_pos_spline
+            )
+            self._trace.record_tick(
+                obs=obs,
+                action=cmd,
+                status=int(status),
+                solve_time=solve_time,
+                fallback=fallback,
+                theta=self._current_theta,
+                v_theta=self._current_v_theta,
+                e_contour=e_c,
+                e_lag=e_l,
+                horizon_pos=horizon[:, 0:3],
+                horizon_theta=horizon[:, _X_THETA],
+            )
+        return cmd
 
     def step_callback(
         self,
@@ -712,14 +850,25 @@ class AttitudeMPC(Controller):
         Returns:
             bool: True if the drone has completed the track/finished the episode.
         """
+        if self._trace is not None:
+            self._trace.record_step_result(
+                int(obs["target_gate"]), bool(terminated), bool(truncated)
+            )
         self._tick += 1
         return self._finished
 
     def episode_callback(self) -> None:
         """Reset the controller state and variables at the start of a new episode."""
+        if self._trace is not None:
+            path = self._trace.save()
+            logger.info(f"Saved MPCC trace to {path}")
+            self._trace = None
         self._tick = 0
         self._current_theta = 0.0
         self._current_v_theta = 0.5
+        self._current_cmd_rpy = np.zeros(3)
+        self._current_vc_rpy = np.zeros(3)
+        self._current_thrust = self._hover_thrust
         self._finished = False
         if hasattr(self, "_hover_pos"):
             del self._hover_pos

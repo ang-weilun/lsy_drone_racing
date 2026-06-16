@@ -36,11 +36,11 @@ class MPCCConfig:
     W_v_theta: float = 5.0
     """Penalty on virtual velocity. Higher values penalize high virtual velocities."""
 
-    obstacle_penalty: float = 5000.0
+    obstacle_penalty: float = 10000.0
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
-    mu: float = 10.0
+    mu: float = 15.0
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
@@ -50,7 +50,7 @@ class MPCCConfig:
     Q_drpy: float = 20.0
     """Penalty on roll, pitch, yaw rates (angular velocity). Increase for smoother flight."""
 
-    R_cmd_rpy: float = 50.0
+    R_curv_rpy: float = 50.0
     """Penalty on desired roll, pitch, yaw commands. Increase to limit aggressive control inputs."""
 
     R_cmd_thrust: float = 100.0
@@ -60,7 +60,7 @@ class MPCCConfig:
     """Penalty on linear velocity."""
 
     # --- Dynamic Tuning ---
-    dynamic_addition: float = 300.0
+    dynamic_addition: float = 500.0
     """Additional contouring penalty weight added near target gates."""
 
     dynamic_sigma: float = 0.3
@@ -86,14 +86,17 @@ class MPCCConfig:
     MAX_V_THETA: float = 3.0
     """Maximum virtual speed (m/s) allowed along the spline path."""
 
-    unobserved_gate_velocity_cap: float = 0.7
-    """Velocity cap when approaching an unobserved gate."""
+    unobserved_velocity_cap: float = 0.4
+    """Velocity cap when approaching an unobserved gate or obstacle."""
 
-    unobserved_gate_dist_threshold: float = 0.5
-    """Distance threshold to start capping velocity for an unobserved gate."""
+    unobserved_dist_threshold: float = 0.7
+    """Distance threshold to start capping velocity for an unobserved gate or obstacle."""
 
     MAX_RPY_RATES: float = 0.5
     """Maximum desired roll, pitch, and yaw rates (rad/s)."""
+
+    MAX_CMD_RPY_ACC: float = 3000.0
+    """Bound on |rpy command acceleration| (rad/s^2), the command double-integrator input."""
 
     MAX_DELTA_V_THETA: float = 2.0
     """Maximum rate of change of the virtual progress speed (m/s^2) / acceleration input."""
