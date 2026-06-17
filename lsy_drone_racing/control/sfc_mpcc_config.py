@@ -52,9 +52,18 @@ class MPCCConfig:
     Q_drpy: float = 20.0
     """Penalty on roll, pitch, yaw rates. Increase for smoother flight."""
 
-    R_curv_rpy: float = 1e-7
+    R_curv_rpy: float = 1e-4
     """Penalty on rpy command curvature (2nd derivative): taxes high-frequency
-    chatter, not magnitude or slope. Small -- only needs to break the QP nullspace.
+    chatter, not magnitude or slope. The per-step attitude command sits in a near-flat
+    QP valley (slow attitude dynamics barely move over one 20 ms tick), so a single RTI
+    step wanders tick-to-tick -> ~8-11 Hz command chatter (seen in sim and on the real
+    drone). This penalty adds curvature to that flat direction so the step is pinned.
+    A sweep showed jitter is NON-monotonic here: the old 1e-7 sat ON a resonance hump
+    (jitterier than ~zero); >=1e-4 collapses it (command HF -86%, dominant freq 8-11 Hz
+    -> ~cornering). Raising further (1e-3) is smoother still but stiffens the command
+    enough to cost gate-reveal re-track authority on the randomized levels (level2 SR
+    6/12 at 1e-4 vs 4/12 at 1e-3); 1e-4 is the knee. The L2 SR cost is a late-reveal
+    artifact and does not apply on mocap hardware. See memory mpcc-jitter-curvature-tuning.
     """
 
     R_cmd_thrust: float = 100.0
