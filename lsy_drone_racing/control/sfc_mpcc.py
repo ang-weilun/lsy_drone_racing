@@ -31,11 +31,12 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def create_acados_model(parameters: dict) -> AcadosModel:
+def create_acados_model(parameters: dict, config: MPCCConfig) -> AcadosModel:
     """Create the Acados model for the MPCC.
 
     Args:
         parameters: Dictionary containing the drone parameters.
+        config: MPCC configuration providing the cost weights.
 
     Returns:
         AcadosModel: The constructed Acados model.
@@ -82,8 +83,9 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     p_c_y = cs.MX.sym("c_y", 4)
     p_c_z = cs.MX.sym("c_z", 4)
     p_capsules = cs.MX.sym("capsules", 24 * 7)
+    p_q_c_dyn = cs.MX.sym("q_c_dyn")  # per-node contouring weight (dynamic gate boost)
 
-    p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules)
+    p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules, p_q_c_dyn)
 
     t_val = theta - p_theta_i
     p_d_x = p_c_x[0] * t_val**3 + p_c_x[1] * t_val**2 + p_c_x[2] * t_val + p_c_x[3]
@@ -127,8 +129,32 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.x = X_aug
     model.u = U_aug
     model.p = p
-    model.cost_y_expr = y_expr
-    model.cost_y_expr_e = y_expr_e
+    # MPCC objective as an EXTERNAL cost (rather than NONLINEAR_LS) so the progress
+    # term can later become a true linear reward. Here it is the identical
+    # Gauss-Newton least-squares objective: 0.5 * (y - yref)^T W (y - yref).
+    v_ref = config.mu / config.W_v_theta
+    hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
+
+    yref = cs.DM.zeros(y_expr.rows())
+    yref[4] = v_ref
+    yref[17] = hover_thrust
+    yref_e = cs.DM.zeros(y_expr_e.rows())
+    yref_e[4] = v_ref
+
+    w_vec, w_e_vec = _cost_weight_vectors(config, p_q_c_dyn)
+    res = y_expr - yref
+    res_e = y_expr_e - yref_e
+    model.cost_expr_ext_cost = 0.5 * cs.sum1(w_vec * res**2)
+    model.cost_expr_ext_cost_e = 0.5 * cs.sum1(w_e_vec * res_e**2)
+
+    # Gauss-Newton Hessian J^T W J supplied explicitly. acados orders the stage
+    # variables [u, x]; verified against NONLINEAR_LS (max|du| ~ 1e-14).
+    w_diag = cs.diag(w_vec)
+    we_diag = cs.diag(w_e_vec)
+    jac = cs.jacobian(y_expr, cs.vertcat(U_aug, X_aug))
+    jac_e = cs.jacobian(y_expr_e, X_aug)
+    model.cost_expr_ext_cost_custom_hess = cs.mtimes([jac.T, w_diag, jac])
+    model.cost_expr_ext_cost_custom_hess_e = cs.mtimes([jac_e.T, we_diag, jac_e])
 
     return model
 
@@ -158,48 +184,45 @@ def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
     return y_obs
 
 
-def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Get the cost weight matrices for the MPCC."""
-    W_diag = [
-        config.Q_c,
-        config.Q_c,
-        config.Q_c_z,  # e_c (3)
-        config.Q_l,  # e_l (1)
-        config.W_v_theta,  # v_theta (1)
-        config.Q_rpy,
-        config.Q_rpy,
-        config.Q_rpy,  # rpy (3)
-        config.Q_vel,
-        config.Q_vel,
-        config.Q_vel,  # vel (3)
-        config.Q_drpy,
-        config.Q_drpy,
-        config.Q_drpy,  # drpy (3)
-        config.R_curv_rpy,
-        config.R_curv_rpy,
-        config.R_curv_rpy,  # a_rpy (3) rpy command curvature
-        config.R_cmd_thrust,  # thrust (1)
-        0.5,  # delta_v_theta (1)
-    ] + [config.obstacle_penalty] * 24
+def _cost_weight_vectors(config: MPCCConfig, q_c_dyn: cs.MX) -> tuple[cs.MX, cs.MX]:
+    """Build the diagonal cost-weight vectors for the stage and terminal residuals.
 
-    W_e_diag = [
-        config.Q_c,
-        config.Q_c,
-        config.Q_c_z,  # e_c (3)
-        config.Q_l,  # e_l (1)
-        config.W_v_theta,  # v_theta (1)
-        config.Q_rpy,
-        config.Q_rpy,
-        config.Q_rpy,  # rpy (3)
-        config.Q_vel,
-        config.Q_vel,
-        config.Q_vel,  # vel (3)
-        config.Q_drpy,
-        config.Q_drpy,
-        config.Q_drpy,  # drpy (3)
-    ] + [config.obstacle_penalty] * 24
+    The three contouring weights are driven by ``q_c_dyn`` (a model parameter) so the
+    near-gate Gaussian boost is applied per node at runtime; all other weights are
+    static config constants. The vertical contour weight is ``max(q_c_dyn, Q_c_z)`` so
+    altitude is never penalized less than the floor ``Q_c_z``.
 
-    return np.diag(W_diag), np.diag(W_e_diag)
+    Parameters
+    ----------
+    config : MPCCConfig
+        Cost-weight configuration.
+    q_c_dyn : casadi.MX
+        Symbolic per-node contouring weight (model parameter).
+
+    Returns
+    -------
+    tuple of casadi.MX
+        Column vectors of weights matching ``y_expr`` (length 43) and ``y_expr_e``
+        (length 38).
+    """
+    q_c_z = cs.fmax(q_c_dyn, config.Q_c_z)
+    stage = (
+        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, config.W_v_theta]  # e_c, e_l, v_theta
+        + [config.Q_rpy] * 3  # rpy
+        + [config.Q_vel] * 3  # vel
+        + [config.Q_drpy] * 3  # drpy
+        + [config.R_curv_rpy] * 3  # a_rpy (command curvature)
+        + [config.R_cmd_thrust, config.R_delta_v_theta]  # thrust, delta_v_theta
+        + [config.obstacle_penalty] * 24
+    )
+    terminal = (
+        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, config.W_v_theta]
+        + [config.Q_rpy] * 3
+        + [config.Q_vel] * 3
+        + [config.Q_drpy] * 3
+        + [config.obstacle_penalty] * 24
+    )
+    return cs.vertcat(*stage), cs.vertcat(*terminal)
 
 
 def create_ocp_solver(
@@ -207,11 +230,9 @@ def create_ocp_solver(
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Create the Acados OCP solver for the MPCC."""
     ocp = AcadosOcp()
-    ocp.model = create_acados_model(parameters)
+    ocp.model = create_acados_model(parameters, config)
 
     nx = ocp.model.x.rows()
-    ny = ocp.model.cost_y_expr.rows()
-    ny_e = ocp.model.cost_y_expr_e.rows()
     np_dim = ocp.model.p.rows()
 
     N = len(time_steps)
@@ -221,22 +242,10 @@ def create_ocp_solver(
     shooting_nodes[1:] = np.cumsum(time_steps)
     ocp.solver_options.shooting_nodes = shooting_nodes
 
-    ocp.cost.cost_type = "NONLINEAR_LS"
-    ocp.cost.cost_type_e = "NONLINEAR_LS"
-
-    ocp.cost.W, ocp.cost.W_e = _get_cost_weights(config)
-
-    v_ref = config.mu / config.W_v_theta
-
-    yref = np.zeros(ny)
-    yref[4] = v_ref
-    yref[17] = parameters["mass"] * -parameters["gravity_vec"][-1]
-
-    yref_e = np.zeros(ny_e)
-    yref_e[4] = v_ref
-
-    ocp.cost.yref = yref
-    ocp.cost.yref_e = yref_e
+    # The objective is defined on the model as an EXTERNAL cost with an explicit
+    # Gauss-Newton Hessian (see create_acados_model); there is no W/yref to set here.
+    ocp.cost.cost_type = "EXTERNAL"
+    ocp.cost.cost_type_e = "EXTERNAL"
 
     # State: [pos 0:3, rpy 3:6, vel 6:9, drpy 9:12, f_thrust 12, theta 13,
     #         v_theta 14, c_rpy 15:18, vc_rpy 18:21]. c_rpy carries MAX_RPY_RATES
@@ -291,7 +300,10 @@ def create_ocp_solver(
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
 
     ocp.constraints.x0 = np.zeros(nx)
-    ocp.parameter_values = np.zeros(np_dim)
+    # Default contouring weight = base Q_c; _set_reference overwrites it per node/tick.
+    param_init = np.zeros(np_dim)
+    param_init[-1] = config.Q_c
+    ocp.parameter_values = param_init
 
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
@@ -539,23 +551,20 @@ class AttitudeMPC(Controller):
             c_y = self._des_pos_spline.c[:, segment, 1]
             c_z = self._des_pos_spline.c[:, segment, 2]
 
-            p_j = np.concatenate(([theta_i], c_x, c_y, c_z, capsule_params))
-            self._acados_ocp_solver.set(j, "p", p_j)
-
-            Q_c_dynamic = self.mpcc_config.Q_c
+            # Contouring weight q_c_dyn rides in the parameter vector (the cost is now
+            # EXTERNAL, so there is no W to set per node). The vertical floor Q_c_z is
+            # applied inside the cost expression via fmax.
+            q_c_dyn = self.mpcc_config.Q_c
             if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
                 target_gate_pos = gates_pos[target_gate_idx]
                 dist_to_target_gate = np.linalg.norm(target_gate_pos - p_j_pos)
                 dynamic_addition = self.mpcc_config.dynamic_addition * np.exp(
                     -(dist_to_target_gate**2) / (2 * self.mpcc_config.dynamic_sigma**2)
                 )
-                Q_c_dynamic += dynamic_addition
+                q_c_dyn += dynamic_addition
 
-            W = self._acados_ocp_solver.cost_get(j, "W")
-            W[0, 0] = Q_c_dynamic
-            W[1, 1] = Q_c_dynamic
-            W[2, 2] = max(Q_c_dynamic, self.mpcc_config.Q_c_z)
-            self._acados_ocp_solver.cost_set(j, "W", W)
+            p_j = np.concatenate(([theta_i], c_x, c_y, c_z, capsule_params, [q_c_dyn]))
+            self._acados_ocp_solver.set(j, "p", p_j)
 
     def _compute_hover_control(self, obs: dict[str, np.ndarray]) -> np.ndarray:
         """Compute hover fallback control if MPCC fails."""

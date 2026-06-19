@@ -69,6 +69,9 @@ class MPCCConfig:
     R_cmd_thrust: float = 100.0
     """Penalty on desired thrust command."""
 
+    R_delta_v_theta: float = 0.5
+    """Penalty on the virtual-progress acceleration input (smooths v_theta)."""
+
     Q_vel: float = 0.0
     """Linear-velocity penalty. Zero: cost references vel=0, so >0 rewards flying slow."""
 
