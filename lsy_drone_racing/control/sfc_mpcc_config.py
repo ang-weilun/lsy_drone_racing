@@ -86,6 +86,22 @@ class MPCCConfig:
     dynamic_sigma: float = 0.8
     """Std (m) of the Gaussian near-gate weight. Widened to bite at the 0.7 m reveal radius."""
 
+    # --- Contour tunnel (lateral corridor for emergent width) ---
+    tunnel_w_gate: float = 0.18
+    """Tunnel half-width (m) at a gate: pinched to ~aperture/2 to keep the crossing centered."""
+
+    tunnel_w_wide: float = 0.6
+    """Tunnel half-width (m) between gates: opened so a wider/faster line can emerge."""
+
+    tunnel_sigma: float = 0.55
+    """Arc-length std (m) of the pinch: how sharply the tunnel narrows toward a gate."""
+
+    TUNNEL_SLACK_LIN: float = 20000.0
+    """Linear slack penalty on leaving the tunnel (one-sided, lower bound)."""
+
+    TUNNEL_SLACK_QUAD: float = 80000.0
+    """Quadratic slack penalty on leaving the tunnel."""
+
     # --- Hover Controller Gains ---
     hover_kp: np.ndarray = field(default_factory=lambda: np.array([0.4, 0.4, 1.25]))
     """Proportional gains for the hover fallback controller [x, y, z]."""
