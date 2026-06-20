@@ -192,6 +192,11 @@ def create_acados_model(parameters: dict, config: MPCCConfig) -> AcadosModel:
     model.cost_expr_ext_cost_custom_hess = cs.mtimes([jac.T, w_diag, jac])
     model.cost_expr_ext_cost_custom_hess_e = cs.mtimes([jac_e.T, we_diag, jac_e])
 
+    # Stage 1b -- contour tunnel: keep the body within the theta-varying radius
+    # p_tunnel_r of the reference. Slacked in create_ocp_solver so a transient excursion
+    # penalizes rather than makes the QP infeasible. (Intermediate nodes only.)
+    model.con_h_expr = p_tunnel_r**2 - cs.dot(e_c_vec, e_c_vec)
+
     return model
 
 
@@ -337,6 +342,17 @@ def create_ocp_solver(
         ]
     )
     ocp.constraints.idxbu = np.array([0, 1, 2, 3, 4])
+
+    # Stage 1b -- soft contour tunnel (one h-row): tunnel_r^2 - ||e_c||^2 >= 0, slacked
+    # on the lower bound so leaving the tunnel is penalized, never infeasible
+    # (TUNNEL_SLACK_LIN/QUAD). Intermediate nodes only (no terminal con_h).
+    ocp.constraints.lh = np.array([0.0])
+    ocp.constraints.uh = np.array([1.0e9])
+    ocp.constraints.idxsh = np.array([0])
+    ocp.cost.zl = np.array([config.TUNNEL_SLACK_LIN])
+    ocp.cost.zu = np.array([0.0])
+    ocp.cost.Zl = np.array([config.TUNNEL_SLACK_QUAD])
+    ocp.cost.Zu = np.array([0.0])
 
     ocp.constraints.x0 = np.zeros(nx)
     # Default contouring weight = base Q_c; _set_mpc_horizon_parameters overwrites it per
@@ -630,8 +646,16 @@ class AttitudeMPC(Controller):
                 )
                 q_c_dyn += dynamic_addition
 
-            # Stage 1a: constant wide tunnel (the Gaussian pinch is added in Stage 1b).
-            tunnel_r = self.mpcc_config.tunnel_w_wide
+            # Tunnel radius Gaussian-pinched to tunnel_w_gate at the nearest upcoming
+            # gate, opening to tunnel_w_wide between gates (lets a wider line emerge).
+            w_wide = self.mpcc_config.tunnel_w_wide
+            if has_target:
+                upcoming = self._theta_gates[target_gate_idx:]
+                d_gate = float(np.min(np.abs(theta_j - upcoming)))
+                pinch = np.exp(-(d_gate**2) / (2 * self.mpcc_config.tunnel_sigma**2))
+                tunnel_r = w_wide - (w_wide - self.mpcc_config.tunnel_w_gate) * pinch
+            else:
+                tunnel_r = w_wide
             p_j = np.concatenate(
                 (
                     [theta_i],
