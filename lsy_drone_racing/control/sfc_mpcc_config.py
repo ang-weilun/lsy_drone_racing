@@ -119,8 +119,13 @@ class MPCCConfig:
     MIN_V_THETA: float = 0.1
     """Minimum virtual speed (m/s) allowed along the spline path."""
 
-    MAX_V_THETA: float = 3.0
-    """Maximum virtual speed (m/s) allowed along the spline path."""
+    MAX_V_THETA: float = 3.5
+    """Maximum virtual speed (m/s) allowed along the spline path. Raised 3.0 -> 3.5:
+    with the contour tunnel centering the line at gates, the higher speed cap no longer
+    collapses success rate the way it did on the bare controller (a cap x tunnel sweep
+    gave L2 11/12 at 3.5 vs the old SR loss at >=3.5 without the tunnel). The tunnel
+    keeps the crossing centered; the cap lets the drone carry more speed between gates.
+    """
 
     MAX_RPY_RATES: float = 0.9
     """Bound on the commanded attitude angles u[0:3] (rad). Misnomer kept for diff hygiene."""
