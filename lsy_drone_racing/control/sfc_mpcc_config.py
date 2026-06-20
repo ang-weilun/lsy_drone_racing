@@ -35,15 +35,17 @@ class MPCCConfig:
     Q_l: float = 150.0
     """Lag error penalty (falling behind / rushing ahead of the virtual reference point)."""
 
-    W_v_theta: float = 5.0
-    """Penalty on virtual velocity."""
+    mu_progress: float = 20.0
+    """Linear progress reward: the cost includes ``-mu_progress * v_theta`` so the
+    solver maximizes path progress directly (classic MPCC), instead of tracking an
+    unreachable virtual-speed setpoint. The marginal value of speed is constant (the
+    old least-squares pull weakened as v_theta approached the setpoint). Top speed is
+    bounded by ``MAX_V_THETA``, not by this weight. The achieved speed is traded off
+    against contour/lag cost online; sweep this to move along that tradeoff.
+    """
 
     obstacle_penalty: float = 5000.0
     """Penalty for entering the obstacle barrier."""
-
-    # --- Reference Parameters ---
-    mu: float = 20.0
-    """Speed scaling; reference virtual velocity v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
     Q_rpy: float = 10.0

@@ -129,23 +129,24 @@ def create_acados_model(parameters: dict, config: MPCCConfig) -> AcadosModel:
     model.x = X_aug
     model.u = U_aug
     model.p = p
-    # MPCC objective as an EXTERNAL cost (rather than NONLINEAR_LS) so the progress
-    # term can later become a true linear reward. Here it is the identical
-    # Gauss-Newton least-squares objective: 0.5 * (y - yref)^T W (y - yref).
-    v_ref = config.mu / config.W_v_theta
+    # MPCC objective as an EXTERNAL cost: a Gauss-Newton least-squares part
+    # 0.5 * (y - yref)^T W (y - yref) plus a true LINEAR progress reward
+    # -mu_progress * v_theta (classic MPCC). v_theta carries zero quadratic weight
+    # (see _cost_weight_vectors); the linear term drives it to its MAX_V_THETA bound,
+    # with the achieved speed traded off against contour/lag online. EXTERNAL is
+    # required here because a least-squares cost cannot express a linear reward.
     hover_thrust = parameters["mass"] * -parameters["gravity_vec"][-1]
 
     yref = cs.DM.zeros(y_expr.rows())
-    yref[4] = v_ref
     yref[17] = hover_thrust
     yref_e = cs.DM.zeros(y_expr_e.rows())
-    yref_e[4] = v_ref
 
     w_vec, w_e_vec = _cost_weight_vectors(config, p_q_c_dyn)
     res = y_expr - yref
     res_e = y_expr_e - yref_e
-    model.cost_expr_ext_cost = 0.5 * cs.sum1(w_vec * res**2)
-    model.cost_expr_ext_cost_e = 0.5 * cs.sum1(w_e_vec * res_e**2)
+    progress = config.mu_progress * v_theta
+    model.cost_expr_ext_cost = 0.5 * cs.sum1(w_vec * res**2) - progress
+    model.cost_expr_ext_cost_e = 0.5 * cs.sum1(w_e_vec * res_e**2) - progress
 
     # Gauss-Newton Hessian J^T W J supplied explicitly. acados orders the stage
     # variables [u, x]; verified against NONLINEAR_LS (max|du| ~ 1e-14).
@@ -205,9 +206,12 @@ def _cost_weight_vectors(config: MPCCConfig, q_c_dyn: cs.MX) -> tuple[cs.MX, cs.
         Column vectors of weights matching ``y_expr`` (length 43) and ``y_expr_e``
         (length 38).
     """
+    # v_theta (slot 4) carries no quadratic weight: progress is the linear reward
+    # -mu_progress * v_theta added in create_acados_model, not a setpoint pull.
+    no_v_theta_quad = 0.0
     q_c_z = cs.fmax(q_c_dyn, config.Q_c_z)
     stage = (
-        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, config.W_v_theta]  # e_c, e_l, v_theta
+        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, no_v_theta_quad]  # e_c, e_l, v_theta
         + [config.Q_rpy] * 3  # rpy
         + [config.Q_vel] * 3  # vel
         + [config.Q_drpy] * 3  # drpy
@@ -216,7 +220,7 @@ def _cost_weight_vectors(config: MPCCConfig, q_c_dyn: cs.MX) -> tuple[cs.MX, cs.
         + [config.obstacle_penalty] * 24
     )
     terminal = (
-        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, config.W_v_theta]
+        [q_c_dyn, q_c_dyn, q_c_z, config.Q_l, no_v_theta_quad]
         + [config.Q_rpy] * 3
         + [config.Q_vel] * 3
         + [config.Q_drpy] * 3
