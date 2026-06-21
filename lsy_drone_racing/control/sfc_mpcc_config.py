@@ -51,8 +51,13 @@ class MPCCConfig:
     Q_rpy: float = 10.0
     """Attitude (roll, pitch, yaw) penalty. Kept low so it doesn't fight cornering bank."""
 
-    Q_drpy: float = 20.0
-    """Penalty on roll, pitch, yaw rates. Increase for smoother flight."""
+    Q_drpy: float = 5.0
+    """Penalty on roll/pitch/yaw body rates. Lowered 20 -> 5: a time-optimal-oracle cost
+    diagnosis showed body-rate damping was the dominant speed limiter -- at 20 its per-tick
+    penalty exceeded the entire progress reward, so the controller would not maneuver. 5 is
+    the L3 optimum from a paired so_rpy_rotor_drag seed=42 sweep (L3 48->50% SR @ 6.38->5.58s,
+    L2 75->83% @ 5.16->4.90s); below 5 the extra agility clips randomized L3 gates (44% at 2,
+    38% at 1), 20 over-damps. No jitter cost (R_curv_rpy handles command chatter)."""
 
     R_curv_rpy: float = 1e-4
     """Penalty on rpy command curvature (2nd derivative): taxes high-frequency
