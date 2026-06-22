@@ -21,7 +21,7 @@ def get_obstacle_capsules(obstacles_pos: NDArray | list[NDArray], config) -> lis
     
     Args:
         obstacles_pos: List or array of obstacle positions [N, 3]
-        config: PlannerConfig containing safety margins and dimensions
+        config: EnvironmentConfig containing safety margins and dimensions
     Returns:
         List of obstacle capsules.
     """
@@ -47,7 +47,7 @@ def get_gate_capsules(gates_pos: NDArray | list[NDArray], gates_quat: NDArray | 
     Args:
         gates_pos: List or array of gate positions [N, 3]
         gates_quat: List or array of gate quaternions [N, 4]
-        config: PlannerConfig containing safety margins and dimensions
+        config: EnvironmentConfig containing safety margins and dimensions
     Returns:
         List of gate capsules.
     """
