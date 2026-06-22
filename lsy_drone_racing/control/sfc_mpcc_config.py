@@ -10,7 +10,7 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Planner Configuration ---
-    planner_type: str = "tube"
+    planner_type: str = "sfc"
     """Which planner to use: 'sfc' for CasADi B-spline SFC, or 'tube' for lightweight Tube SFC."""
 
     TUBE_RADIUS: float = 1.0
@@ -60,7 +60,7 @@ class MPCCConfig:
     """L2 penalty weight for soft state bounds (altitude, attitude)."""
 
     # --- Reference Parameters ---
-    mu: float = 20.0
+    mu: float = 10.0
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---

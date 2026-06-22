@@ -191,28 +191,32 @@ class TubePlanner:
 
         # Remove 3D duplicates and enforce minimum Z
         unique_pts = [pts_array_raw[0]]
-        unique_weights = [w_array_raw[0]]
         for i in range(1, len(pts_array_raw)):
             pt = pts_array_raw[i].copy()
             pt[2] = max(0.15, pt[2])  # Ensure Z is at least 0.15 to avoid ground collisions
             if np.linalg.norm(pt - unique_pts[-1]) > 1e-2:
                 unique_pts.append(pt)
-                unique_weights.append(w_array_raw[i])
 
         pts_array = np.array(unique_pts)
-        w_array = np.array(unique_weights)
 
-        # Fit B-spline with weights. s=1.0 allows smoothing.
-        k = min(len(pts_array) - 1, 3)
-        if k < 1:
+        if len(pts_array) < 2:
             self.control_points = pts_array
             return
 
-        tck, u = splprep([pts_array[:, 0], pts_array[:, 1], pts_array[:, 2]], w=w_array, s=1.0, k=k)
+        # Fit PCHIP spline to prevent overshoots and loops
+        from scipy.interpolate import PchipInterpolator
+        
+        diffs_pts = np.diff(pts_array, axis=0)
+        chords_pts = np.linalg.norm(diffs_pts, axis=1)
+        u_pts = np.concatenate(([0.0], np.cumsum(chords_pts)))
+        if u_pts[-1] > 0:
+            u_pts /= u_pts[-1]
+
+        pchip = PchipInterpolator(u_pts, pts_array)
 
         # Sample smoothed points densely
         u_fine = np.linspace(0, 1, max(100, len(pts_array) * 10))
-        smooth_pts = np.vstack(splev(u_fine, tck)).T
+        smooth_pts = pchip(u_fine)
 
         self.control_points = smooth_pts
 

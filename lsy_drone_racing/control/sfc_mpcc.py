@@ -400,16 +400,17 @@ _YREF_V_THETA = 4     # virtual velocity reference
 _YREF_THRUST = 17     # hover thrust reference (stage cost only)
 
 # -- Bounded-state (ubx) index mapping --
-# idxbx = [3, 4, 5, 12, 13, 14, 15, 16, 17] => ubx positions 0..8
-_UBX_ROLL = 0
-_UBX_PITCH = 1
-_UBX_YAW = 2
-_UBX_F_THRUST = 3
-_UBX_THETA = 4
-_UBX_V_THETA = 5
-_UBX_C_ROLL = 6
-_UBX_C_PITCH = 7
-_UBX_C_YAW = 8
+# idxbx = [2, 3, 4, 5, 12, 13, 14, 15, 16, 17] => ubx positions 0..9
+_UBX_Z = 0
+_UBX_ROLL = 1
+_UBX_PITCH = 2
+_UBX_YAW = 3
+_UBX_F_THRUST = 4
+_UBX_THETA = 5
+_UBX_V_THETA = 6
+_UBX_C_ROLL = 7
+_UBX_C_PITCH = 8
+_UBX_C_YAW = 9
 
 
 class AttitudeMPC(Controller):
@@ -489,23 +490,11 @@ class AttitudeMPC(Controller):
         self._s_total = float(s[-1])
 
     def _update_current_theta(self, pos: np.ndarray) -> None:
-        """Update the path progress parameter `theta` based on current drone position.
-        
-        When replanning, we find the closest point on the new path ahead of the drone,
-        but bounded by the next target gate to avoid skipping gates.
-        """
-        gates_pos = getattr(self.planner, "gates_pos", None)
-        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
-        theta_target_gate = self._s_total
-
-        if gates_pos is not None and 0 <= target_gate_idx < len(gates_pos):
-            target_gate_pos = gates_pos[target_gate_idx]
-            s_eval_gate = np.linspace(0, self._s_total, max(100, int(self._s_total * 10)))
-            dists_gate = np.linalg.norm(self._des_pos_spline(s_eval_gate) - target_gate_pos, axis=1)
-            theta_target_gate = float(s_eval_gate[np.argmin(dists_gate)])
-
+        """Update the path progress parameter `theta` based on current drone position."""
+        lookahead = min(self._s_total, self._current_theta + 5.0)
+        start_eval = max(0.0, self._current_theta - 1.0)
         s_eval = np.linspace(
-            0.0, theta_target_gate, max(20, int(theta_target_gate * 40))
+            start_eval, lookahead, max(20, int((lookahead - start_eval) * 40))
         )
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
@@ -615,56 +604,8 @@ class AttitudeMPC(Controller):
                     self._acados_ocp_solver.set(j, "x", x_node)
             self._acados_ocp_solver.set(0, "x", x0)
 
-    def _check_horizon_gate_pass(self) -> tuple[bool, float]:
-        """Check if the MPC horizon physically passes the target gate and find its arc-length."""
-        gates_pos = getattr(self.planner, "gates_pos", None)
-        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
-        gates_quat = getattr(self.planner, "gates_quat", None)
-
-        horizon_passes_gate = False
-        theta_target_gate = self._s_total
-
-        if gates_pos is not None and gates_quat is not None and 0 <= target_gate_idx < len(gates_pos):
-            target_gate_pos = gates_pos[target_gate_idx]
-            gate_normal = R.from_quat(gates_quat[target_gate_idx]).apply([1.0, 0.0, 0.0])
-
-            s_eval = np.linspace(
-                max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 10.0), 500
-            )
-            dists = np.linalg.norm(self._des_pos_spline(s_eval) - target_gate_pos, axis=1)
-            theta_target_gate = s_eval[np.argmin(dists)] + 0.2
-
-            for j in range(self._N + 1):
-                x_j = self._acados_ocp_solver.get(j, "x")
-                pos_j = x_j[_X_POS]
-                if (
-                    np.dot(pos_j - target_gate_pos, gate_normal) > -0.1
-                    and np.linalg.norm(pos_j - target_gate_pos) < 0.5
-                ):
-                    horizon_passes_gate = True
-                    break
-
-        return horizon_passes_gate, theta_target_gate
-
-    def _update_horizon_progress_bounds(self, horizon_passes_gate: bool, theta_target_gate: float) -> None:
-        """Update the upper bounds of the progress variable theta along the horizon."""
-        for j in range(1, self._N):
-            x_j = self._acados_ocp_solver.get(j, "x")
-            ubx_j = self._acados_ocp_solver.constraints_get(j, "ubx")
-            ubx_theta = 1000.0 if horizon_passes_gate else theta_target_gate
-            
-            ubx_j[_UBX_THETA] = ubx_theta
-            self._acados_ocp_solver.constraints_set(j, "ubx", ubx_j)
-            
-            if float(x_j[_X_THETA]) > ubx_theta:
-                x_j[_X_THETA] = ubx_theta
-                x_j[_X_V_THETA] = 0.0
-                self._acados_ocp_solver.set(j, "x", x_j)
-
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray, obs: dict[str, np.ndarray]) -> None:
         """Set the reference parameters and cost weights along the MPC horizon."""
-        horizon_passes_gate, theta_target_gate = self._check_horizon_gate_pass()
-        self._update_horizon_progress_bounds(horizon_passes_gate, theta_target_gate)
 
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
@@ -705,7 +646,8 @@ class AttitudeMPC(Controller):
             
             if self.mpcc_config.planner_type == "tube":
                 if hasattr(self.planner, "evaluate_corridor_spatial"):
-                    tube_info = self.planner.evaluate_corridor_spatial(theta_j)
+                    u_norm = theta_j / self._s_total if self._s_total > 1e-3 else 0.0
+                    tube_info = self.planner.evaluate_corridor_spatial(u_norm)
                     if tube_info is not None:
                         _, radius = tube_info
                         if j > 0:
