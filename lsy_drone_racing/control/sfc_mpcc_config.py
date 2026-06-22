@@ -40,30 +40,30 @@ class MPCCConfig:
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
-    mu: float = 15.0
+    mu: float = 20.0
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
-    Q_rpy: float = 50.0
+    Q_rpy: float = 10.0
     """Penalty on roll, pitch, yaw attitude."""
 
     Q_drpy: float = 20.0
     """Penalty on roll, pitch, yaw rates (angular velocity). Increase for smoother flight."""
 
-    R_curv_rpy: float = 50.0
+    R_curv_rpy: float = 1e-4
     """Penalty on desired roll, pitch, yaw commands. Increase to limit aggressive control inputs."""
 
     R_cmd_thrust: float = 100.0
     """Penalty on desired thrust command."""
 
-    Q_vel: float = 1.0
+    Q_vel: float = 0.0
     """Penalty on linear velocity."""
 
     # --- Dynamic Tuning ---
-    dynamic_addition: float = 500.0
+    dynamic_addition: float = 1200.0
     """Additional contouring penalty weight added near target gates."""
 
-    dynamic_sigma: float = 0.3
+    dynamic_sigma: float = 0.8
     """Standard deviation (m) for the Gaussian dynamic weight addition near gates."""
 
     # --- Hover Controller Gains ---
@@ -92,7 +92,7 @@ class MPCCConfig:
     unobserved_dist_threshold: float = 0.7
     """Distance threshold to start capping velocity for an unobserved gate or obstacle."""
 
-    MAX_RPY_RATES: float = 0.5
+    MAX_RPY_RATES: float = 0.9
     """Maximum desired roll, pitch, and yaw rates (rad/s)."""
 
     MAX_CMD_RPY_ACC: float = 3000.0

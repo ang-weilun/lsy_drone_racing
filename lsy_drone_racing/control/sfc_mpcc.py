@@ -515,7 +515,7 @@ class AttitudeMPC(Controller):
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
-        if self._tick == 0 or replanned:
+        if self._tick == 0:
             v_start_guess = max(0.5, self._current_v_theta)
             for j in range(self._N + 1):
                 if j == 0:
@@ -547,6 +547,13 @@ class AttitudeMPC(Controller):
                 self._acados_ocp_solver.set(j, "x", self._acados_ocp_solver.get(j + 1, "x"))
             for j in range(self._N - 1):
                 self._acados_ocp_solver.set(j, "u", self._acados_ocp_solver.get(j + 1, "u"))
+            if replanned:
+                v_start = max(0.5, self._current_v_theta)
+                for j in range(self._N + 1):
+                    x_node = self._acados_ocp_solver.get(j, "x")
+                    x_node[_X_THETA] = float(np.clip(self._shooting_nodes[j] * v_start, 0, self._s_total))
+                    x_node[_X_V_THETA] = v_start
+                    self._acados_ocp_solver.set(j, "x", x_node)
             self._acados_ocp_solver.set(0, "x", x0)
 
     def _check_horizon_gate_pass(self) -> tuple[bool, float]:
