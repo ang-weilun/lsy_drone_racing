@@ -22,16 +22,17 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller, mpcc_trace
 from lsy_drone_racing.control.sfc_mpcc_config import MPCCConfig
-from lsy_drone_racing.control.sfc_planner_mpc import SfcCorridorPlanner
-from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
-
+from lsy_drone_racing.control.planner.sfc_planner_mpc import SfcCorridorPlanner
+from lsy_drone_racing.control.planner.sfc_planner_mpc_config import PlannerConfig
+from lsy_drone_racing.control.planner.tube_planner import TubePlanner
+from lsy_drone_racing.control.planner.tube_planner_config import TubePlannerConfig
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def create_acados_model(parameters: dict) -> AcadosModel:
+def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
     """Create the Acados model for the MPCC.
 
     Args:
@@ -130,6 +131,10 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.cost_y_expr = y_expr
     model.cost_y_expr_e = y_expr_e
 
+    # Add nonlinear constraint for Tube SFC planner: sumsqr(e_c_vec) <= R^2
+    if config.planner_type == "tube":
+        model.con_h_expr = cs.sumsqr(e_c_vec)
+        model.con_h_expr_e = cs.sumsqr(e_c_vec)
     return model
 
 
@@ -207,7 +212,7 @@ def create_ocp_solver(
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Create the Acados OCP solver for the MPCC."""
     ocp = AcadosOcp()
-    ocp.model = create_acados_model(parameters)
+    ocp.model = create_acados_model(parameters, config)
 
     nx = ocp.model.x.rows()
     ny = ocp.model.cost_y_expr.rows()
@@ -242,6 +247,7 @@ def create_ocp_solver(
     thrust_max_coll = parameters["thrust_max"] * 4
     ocp.constraints.lbx = np.array(
         [
+            0.0, # min Z
             -config.MAX_ROLL_PITCH,
             -config.MAX_ROLL_PITCH,
             -config.MAX_YAW,
@@ -255,6 +261,7 @@ def create_ocp_solver(
     )
     ocp.constraints.ubx = np.array(
         [
+            3.0, # max Z
             config.MAX_ROLL_PITCH,
             config.MAX_ROLL_PITCH,
             config.MAX_YAW,
@@ -267,6 +274,7 @@ def create_ocp_solver(
         ]
     )
     ocp.constraints.idxbx = np.array([
+        _X_POS.start + 2, # Z position
         _X_RPY.start, _X_RPY.start + 1, _X_RPY.start + 2,
         _X_F_THRUST, _X_THETA, _X_V_THETA,
         _X_C_RPY.start, _X_C_RPY.start + 1, _X_C_RPY.start + 2
@@ -294,6 +302,12 @@ def create_ocp_solver(
 
     ocp.constraints.x0 = np.zeros(nx)
     ocp.parameter_values = np.zeros(np_dim)
+
+    if config.planner_type == "tube":
+        ocp.constraints.lh = np.array([0.0])
+        ocp.constraints.uh = np.array([config.TUBE_RADIUS**2])
+        ocp.constraints.lh_e = np.array([0.0])
+        ocp.constraints.uh_e = np.array([config.TUBE_RADIUS**2])
 
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
@@ -370,7 +384,6 @@ class AttitudeMPC(Controller):
         """
         super().__init__(obs, info, config)
         self.mpcc_config = MPCCConfig()
-        self.planner_config = PlannerConfig()
 
         self._time_steps = np.linspace(
             self.mpcc_config.dt_min, self.mpcc_config.dt_max, self.mpcc_config.N
@@ -378,7 +391,12 @@ class AttitudeMPC(Controller):
         self._N = len(self._time_steps)
         self._shooting_nodes = np.concatenate(([0.0], np.cumsum(self._time_steps)))
 
-        self.planner = SfcCorridorPlanner(obs, config.env.freq, self.planner_config)
+        if self.mpcc_config.planner_type == "tube":
+            self.planner_config = TubePlannerConfig()
+            self.planner = TubePlanner(obs, config.env.freq, self.planner_config)
+        else:
+            self.planner_config = PlannerConfig()
+            self.planner = SfcCorridorPlanner(obs, config.env.freq, self.planner_config)
         self._update_spline()
 
         self.drone_params = load_params("so_rpy_rotor_drag", config.sim.drone_model)
@@ -644,6 +662,13 @@ class AttitudeMPC(Controller):
 
             target_v = self.mpcc_config.mu / self.mpcc_config.W_v_theta
             
+            if self.mpcc_config.planner_type == "tube":
+                if hasattr(self.planner, "evaluate_corridor_spatial"):
+                    tube_info = self.planner.evaluate_corridor_spatial(theta_j)
+                    if tube_info is not None:
+                        _, radius = tube_info
+                        if j > 0:
+                            self._acados_ocp_solver.constraints_set(j, "uh", np.array([radius**2]))
             if "gates_visited" in obs and gates_pos is not None:
                 for g_idx, is_visited in enumerate(obs["gates_visited"]):
                     if not is_visited:

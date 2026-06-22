@@ -14,8 +14,10 @@ import numpy as np
 from scipy.interpolate import BSpline
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control.environment import Capsule, get_obstacle_capsules, get_gate_capsules
-from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
+from lsy_drone_racing.control.planner_utils.environment import Capsule, get_obstacle_capsules, get_gate_capsules
+from lsy_drone_racing.control.planner_utils.environment_config import EnvironmentConfig
+from lsy_drone_racing.control.planner_utils.skeleton import SkeletonPoint
+from lsy_drone_racing.control.planner.sfc_planner_mpc_config import PlannerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +25,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-class SkeletonPoint(NamedTuple):
-    """Represents a skeleton point in the planned path with gate information."""
 
-    pos: NDArray
-    is_gate: bool
-    gate_normal: NDArray | None
-    gate_right: NDArray | None
-    gate_up: NDArray | None
-    gate_idx: int | None = None
 
 
 class FlightCorridor:
@@ -121,6 +115,7 @@ class SfcCorridorPlanner:
         """
         self._freq = freq
         self.config = config or PlannerConfig()
+        self.env_config = EnvironmentConfig()
 
         self.gates_pos = obs["gates_pos"].copy()
         self.gates_quat = obs["gates_quat"].copy()
@@ -243,8 +238,8 @@ class SfcCorridorPlanner:
         skeleton_path = self._calculate_anchors(current_pos[:3])
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
-        capsules = get_obstacle_capsules(self.obstacles_pos, self.config)
-        capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.config))
+        capsules = get_obstacle_capsules(self.obstacles_pos, self.env_config)
+        capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.env_config))
         self.capsules = capsules
         corridors = self._generate_flight_corridors(skeleton_path, capsules)
         self.corridors = corridors
@@ -307,7 +302,7 @@ class SfcCorridorPlanner:
                         # Frame outer radius is 0.36m; allow a small slack so the
                         # pre/post anchors (which sit on the normal axis) still
                         # qualify as a through-segment.
-                        near_radius = self.config.gate_outer / 2.0 + 0.10
+                        near_radius = self.env_config.gate_outer / 2.0 + 0.10
                         if d1 * d2 < 0.0:
                             t = -d1 / (d2 - d1)
                             crossing = pt1.pos + t * (pt2.pos - pt1.pos)
@@ -779,12 +774,12 @@ class SfcCorridorPlanner:
         obs_circles = []
         margin = self.config.OBSTACLE_AVOIDANCE_MARGIN
         for p in self.obstacles_pos:
-            obs_circles.append((p[:2], self.config.pole_radius + margin))
+            obs_circles.append((p[:2], self.env_config.pole_radius + margin))
         for j, (p, q) in enumerate(zip(self.gates_pos, self.gates_quat)):
             rot = R.from_quat(q)
             right = rot.apply([0, 1, 0])
-            bar_dist = self.config.gate_bar_dist
-            obs_radius = self.config.gate_bar_radius + self.config.OBSTACLE_AVOIDANCE_MARGIN
+            bar_dist = self.env_config.gate_bar_dist
+            obs_radius = self.env_config.gate_bar_radius + self.config.OBSTACLE_AVOIDANCE_MARGIN
             obs_circles.append(((p - right * bar_dist)[:2], obs_radius))
             obs_circles.append(((p + right * bar_dist)[:2], obs_radius))
 

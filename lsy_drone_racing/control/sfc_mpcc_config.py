@@ -9,14 +9,21 @@ import numpy as np
 class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
+    # --- Planner Configuration ---
+    planner_type: str = "tube"
+    """Which planner to use: 'sfc' for CasADi B-spline SFC, or 'tube' for lightweight Tube SFC."""
+
+    TUBE_RADIUS: float = 1.0
+    """Radius (m) of the flight corridor tube around the path. Used when planner_type is 'tube'."""
+
     # --- Horizon Parameters ---
-    N: int = 40
+    N: int = 50
     """Number of time steps in the horizon."""
 
     dt_min: float = 0.02
     """Time step duration for the first horizon step (s)."""
 
-    dt_max: float = 0.08
+    dt_max: float = 0.1
     """Time step duration for the last horizon step (s)."""
 
     # --- Cost Weights ---
@@ -63,7 +70,7 @@ class MPCCConfig:
     dynamic_addition: float = 1200.0
     """Additional contouring penalty weight added near target gates."""
 
-    dynamic_sigma: float = 0.8
+    dynamic_sigma: float = 0.4
     """Standard deviation (m) for the Gaussian dynamic weight addition near gates."""
 
     # --- Hover Controller Gains ---
