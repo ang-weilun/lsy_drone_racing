@@ -52,8 +52,8 @@ class TubePlanner:
             pos = self.des_pos_spline(u)
 
         # 1m at max, reducing to 40cm gate opening size (20cm radius)
-        default_radius = 1.0
-        gate_radius = 0.2
+        default_radius = getattr(self.config, "tube_radius", 1.0)
+        gate_radius = getattr(self.config, "gate_tube_radius", 0.2)
 
         radius = default_radius
         if len(self.gates_pos) > 0:
