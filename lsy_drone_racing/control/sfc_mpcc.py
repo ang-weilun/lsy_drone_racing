@@ -913,7 +913,7 @@ class AttitudeMPC(Controller):
             sim: The simulator environment instance.
         """
         if hasattr(self.planner, "capsules") and self.planner.capsules is not None:
-            safety_margin = getattr(self.planner.config, "safety_margin", 0.0)
+            safety_margin = getattr(self.planner.env_config, "safety_margin", 0.0)
             for cap in self.planner.capsules:
                 rgba_phys = (
                     np.array([1.0, 0.0, 0.0, 0.3])
