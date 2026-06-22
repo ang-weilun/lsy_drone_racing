@@ -14,6 +14,7 @@ import numpy as np
 from scipy.interpolate import BSpline
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.control.environment import Capsule, get_obstacle_capsules, get_gate_capsules
 from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
 
 logger = logging.getLogger(__name__)
@@ -30,16 +31,6 @@ class SkeletonPoint(NamedTuple):
     gate_normal: NDArray | None
     gate_right: NDArray | None
     gate_up: NDArray | None
-    gate_idx: int | None = None
-
-
-class Capsule(NamedTuple):
-    """Represents a capsule obstacle (cylinder with spherical ends)."""
-
-    p1: NDArray
-    p2: NDArray
-    radius: float
-    is_gate: bool
     gate_idx: int | None = None
 
 
@@ -252,7 +243,8 @@ class SfcCorridorPlanner:
         skeleton_path = self._calculate_anchors(current_pos[:3])
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
-        capsules = self._get_all_obstacle_capsules()
+        capsules = get_obstacle_capsules(self.obstacles_pos, self.config)
+        capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.config))
         self.capsules = capsules
         corridors = self._generate_flight_corridors(skeleton_path, capsules)
         self.corridors = corridors
@@ -276,80 +268,6 @@ class SfcCorridorPlanner:
             knots[i + k] = np.mean(u_params[i : i + k])
 
         self._des_pos_spline = BSpline(knots, control_points, k)
-
-    def _get_all_obstacle_capsules(self) -> list[Capsule]:
-        capsules = []
-        margin = self.config.safety_margin
-
-        for p in self.obstacles_pos:
-            capsules.append(
-                Capsule(
-                    np.array([p[0], p[1], 0.0]),
-                    np.array([p[0], p[1], self.config.pole_height]),
-                    self.config.pole_radius + margin,
-                    False,
-                )
-            )
-
-        for gate_i, (pos, quat) in enumerate(zip(self.gates_pos, self.gates_quat)):
-            rot = R.from_quat(quat)
-            up = rot.apply([0, 0, 1])
-            right = rot.apply([0, 1, 0])
-
-            stand_h = pos[2] - self.config.gate_outer / 2.0
-            if stand_h > 0:
-                capsules.append(
-                    Capsule(
-                        pos - up * (self.config.gate_outer / 2.0),
-                        pos - up * (self.config.gate_outer / 2.0 + stand_h),
-                        self.config.gate_stand_radius + margin,
-                        True,
-                        gate_i,
-                    )
-                )
-
-            bar_dist = self.config.gate_bar_dist
-            bar_radius = self.config.gate_bar_radius + margin
-            half_outer = self.config.gate_outer / 2.0
-
-            capsules.append(
-                Capsule(
-                    pos + up * bar_dist - right * half_outer,
-                    pos + up * bar_dist + right * half_outer,
-                    bar_radius,
-                    True,
-                    gate_i,
-                )
-            )
-            capsules.append(
-                Capsule(
-                    pos - up * bar_dist - right * half_outer,
-                    pos - up * bar_dist + right * half_outer,
-                    bar_radius,
-                    True,
-                    gate_i,
-                )
-            )
-            capsules.append(
-                Capsule(
-                    pos - right * bar_dist + up * half_outer,
-                    pos - right * bar_dist - up * half_outer,
-                    bar_radius,
-                    True,
-                    gate_i,
-                )
-            )
-            capsules.append(
-                Capsule(
-                    pos + right * bar_dist + up * half_outer,
-                    pos + right * bar_dist - up * half_outer,
-                    bar_radius,
-                    True,
-                    gate_i,
-                )
-            )
-
-        return capsules
 
     def _generate_flight_corridors(
         self, skeleton_path: list[SkeletonPoint], capsules: list[Capsule]
