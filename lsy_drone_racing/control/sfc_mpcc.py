@@ -303,11 +303,52 @@ def create_ocp_solver(
     ocp.constraints.x0 = np.zeros(nx)
     ocp.parameter_values = np.zeros(np_dim)
 
+    # Soft bounds and constraint penalties
+    idxsbx = np.array([0, 1, 2, 3, 7, 8, 9]) # soft indices for Z, RPY, CMD_RPY
+    ocp.constraints.idxsbx = idxsbx
+    
+    num_soft_h = 1 if config.planner_type == "tube" else 0
+    ns = len(idxsbx) + num_soft_h
+
+    zl = np.zeros(ns)
+    zu = np.zeros(ns)
+    Zl = np.zeros(ns)
+    Zu = np.zeros(ns)
+
+    l1_x = config.STATE_BOUND_SOFT_PENALTY_L1
+    l2_x = config.STATE_BOUND_SOFT_PENALTY_L2
+    zl[:len(idxsbx)] = l1_x
+    zu[:len(idxsbx)] = l1_x
+    Zl[:len(idxsbx)] = l2_x
+    Zu[:len(idxsbx)] = l2_x
+
     if config.planner_type == "tube":
         ocp.constraints.lh = np.array([0.0])
         ocp.constraints.uh = np.array([config.TUBE_RADIUS**2])
         ocp.constraints.lh_e = np.array([0.0])
         ocp.constraints.uh_e = np.array([config.TUBE_RADIUS**2])
+        
+        # Soften tube constraint
+        ocp.constraints.idxsh = np.array([0])
+        ocp.constraints.idxsh_e = np.array([0])
+
+        l1_h = config.TUBE_SOFT_PENALTY_L1
+        l2_h = config.TUBE_SOFT_PENALTY_L2
+        zl[len(idxsbx):] = l1_h
+        zu[len(idxsbx):] = l1_h
+        Zl[len(idxsbx):] = l2_h
+        Zu[len(idxsbx):] = l2_h
+
+        # Terminal slacks (only tube constraint)
+        ocp.cost.zl_e = np.array([l1_h])
+        ocp.cost.zu_e = np.array([l1_h])
+        ocp.cost.Zl_e = np.array([l2_h])
+        ocp.cost.Zu_e = np.array([l2_h])
+
+    ocp.cost.zl = zl
+    ocp.cost.zu = zu
+    ocp.cost.Zl = Zl
+    ocp.cost.Zu = Zu
 
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"

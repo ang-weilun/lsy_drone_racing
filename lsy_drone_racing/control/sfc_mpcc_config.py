@@ -46,6 +46,19 @@ class MPCCConfig:
     obstacle_penalty: float = 10000.0
     """Penalty for entering the obstacle barrier."""
 
+    # --- Soft Constraint Penalties ---
+    TUBE_SOFT_PENALTY_L1: float = 10000.0
+    """L1 penalty weight for soft tube constraint."""
+
+    TUBE_SOFT_PENALTY_L2: float = 10000.0
+    """L2 penalty weight for soft tube constraint."""
+
+    STATE_BOUND_SOFT_PENALTY_L1: float = 10000.0
+    """L1 penalty weight for soft state bounds (altitude, attitude)."""
+
+    STATE_BOUND_SOFT_PENALTY_L2: float = 10000.0
+    """L2 penalty weight for soft state bounds (altitude, attitude)."""
+
     # --- Reference Parameters ---
     mu: float = 20.0
     """Speed scaling parameter. Reference virtual velocity is v_ref = mu / W_v_theta."""
@@ -54,7 +67,7 @@ class MPCCConfig:
     Q_rpy: float = 10.0
     """Penalty on roll, pitch, yaw attitude."""
 
-    Q_drpy: float = 20.0
+    Q_drpy: float = 10.0
     """Penalty on roll, pitch, yaw rates (angular velocity). Increase for smoother flight."""
 
     R_curv_rpy: float = 1e-4
