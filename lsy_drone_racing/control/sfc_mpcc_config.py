@@ -11,11 +11,17 @@ class MPCCConfig:
 
     # --- Planner Configuration ---
     planner_type: str = "pmm"
-    """Which planner to use: 'sfc' for CasADi B-spline SFC, 'tube' for lightweight Tube SFC, or 'pmm' for Point-Mass Model."""
+    """Which planner to use:
+    'sfc' for CasADi B-spline SFC,
+    'tube' for lightweight Tube SFC,
+    'pmm' for Point-Mass Model."""
 
     TUBE_RADIUS: float = 1.0
     gate_tube_radius: float = 0.4
     """Radius (m) of the flight corridor tube around the path. Used when planner_type is 'tube'."""
+
+    use_soft_tube_constraint: bool = False
+    """If True, enforces a soft penalty for leaving the TUBE_RADIUS cylinder around the path."""
 
     # --- Horizon Parameters ---
     N: int = 50
@@ -46,6 +52,10 @@ class MPCCConfig:
 
     obstacle_penalty: float = 10000.0
     """Penalty for entering the obstacle barrier."""
+
+    gate_margin_reduction: float = 0.12
+    """Amount (m) by which to reduce the gate capsule radius in the obstacle penalty. 
+    Prevents aggressive braking at gates by shrinking their effective avoidance margin."""
 
     # --- Soft Constraint Penalties ---
     TUBE_SOFT_PENALTY_L1: float = 10000.0

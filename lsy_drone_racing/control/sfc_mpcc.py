@@ -84,7 +84,7 @@ def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
     p_c_x = cs.MX.sym("c_x", 4)
     p_c_y = cs.MX.sym("c_y", 4)
     p_c_z = cs.MX.sym("c_z", 4)
-    p_capsules = cs.MX.sym("capsules", 24 * 7)
+    p_capsules = cs.MX.sym("capsules", 24 * 8)
 
     p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules)
 
@@ -106,7 +106,8 @@ def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
     e_l = cs.dot(t_vec, e) / t_norm
     e_c_vec = e - e_l * (t_vec / t_norm)
 
-    y_obs = _build_obstacle_barrier(p_capsules, pos)
+    gate_margin_reduction = getattr(config, "gate_margin_reduction", 0.12)
+    y_obs = _build_obstacle_barrier(p_capsules, pos, gate_margin_reduction)
 
     y_expr = cs.vertcat(
         e_c_vec,  # 3
@@ -123,7 +124,12 @@ def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
 
     y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12], y_obs)
 
-    model = AcadosModel()
+    if getattr(config, "use_soft_tube_constraint", False):
+        model = AcadosModel()
+        model.con_h_expr = cs.sumsqr(e_c_vec)
+        model.con_h_expr_e = cs.sumsqr(e_c_vec)
+    else:
+        model = AcadosModel()
     model.name = "sfc_mpcc_model"
     model.f_expl_expr = X_dot_aug
     model.f_impl_expr = None
@@ -133,17 +139,17 @@ def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
     model.cost_y_expr = y_expr
     model.cost_y_expr_e = y_expr_e
 
-    # Add nonlinear constraint for Tube SFC planner: sumsqr(e_c_vec) <= R^2
     return model
 
 
-def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
+def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX, gate_margin_reduction: float = 0.12) -> cs.MX:
     """Build the C1-continuous barrier function for obstacle avoidance."""
     y_obs = cs.MX.zeros(24)
     for i in range(24):
-        p1 = p_capsules[i * 7 + 0 : i * 7 + 3]
-        p2 = p_capsules[i * 7 + 3 : i * 7 + 6]
-        r = p_capsules[i * 7 + 6]
+        p1 = p_capsules[i * 8 + 0 : i * 8 + 3]
+        p2 = p_capsules[i * 8 + 3 : i * 8 + 6]
+        r = p_capsules[i * 8 + 6]
+        is_gate = p_capsules[i * 8 + 7]
 
         v = p2 - p1
         w = pos - p1
@@ -156,9 +162,12 @@ def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
 
         closest_pt = p1 + t * v
         diff = pos - closest_pt
+        # Reduce the safety margin for gates so the opening is wide enough
+        # but the penalty still prevents crashing into the physical frame
+        r_eff = r - is_gate * gate_margin_reduction
 
         d2 = cs.dot(diff, diff)
-        y_obs[i] = cs.fmax(0.0, 1.0 - d2 / (r**2 + 1e-6)) ** 2
+        y_obs[i] = cs.fmax(0.0, 1.0 - d2 / (r_eff**2 + 1e-6)) ** 2
     return y_obs
 
 
@@ -306,8 +315,19 @@ def create_ocp_solver(
     idxsbx = np.array([0, 1, 2, 3, 7, 8, 9]) # soft indices for Z, RPY, CMD_RPY
     ocp.constraints.idxsbx = idxsbx
 
-    num_soft_h = 0
+    if getattr(config, "use_soft_tube_constraint", False):
+        ocp.constraints.lh = np.array([0.0])
+        ocp.constraints.uh = np.array([config.TUBE_RADIUS**2])
+        ocp.constraints.idxsh = np.array([0])
+        ocp.constraints.lh_e = np.array([0.0])
+        ocp.constraints.uh_e = np.array([config.TUBE_RADIUS**2])
+        ocp.constraints.idxsh_e = np.array([0])
+        num_soft_h = 1
+    else:
+        num_soft_h = 0
+
     ns = len(idxsbx) + num_soft_h
+    ns_e = num_soft_h
 
     zl = np.zeros(ns)
     zu = np.zeros(ns)
@@ -320,6 +340,22 @@ def create_ocp_solver(
     zu[:len(idxsbx)] = l1_x
     Zl[:len(idxsbx)] = l2_x
     Zu[:len(idxsbx)] = l2_x
+
+    if num_soft_h > 0:
+        zl[-1] = config.TUBE_SOFT_PENALTY_L1 if hasattr(config, "TUBE_SOFT_PENALTY_L1") else 0.0
+        zu[-1] = config.TUBE_SOFT_PENALTY_L1 if hasattr(config, "TUBE_SOFT_PENALTY_L1") else 0.0
+        Zl[-1] = config.TUBE_SOFT_PENALTY_L2
+        Zu[-1] = config.TUBE_SOFT_PENALTY_L2
+
+        zl_e = np.array([zl[-1]])
+        zu_e = np.array([zu[-1]])
+        Zl_e = np.array([Zl[-1]])
+        Zu_e = np.array([Zu[-1]])
+        
+        ocp.cost.zl_e = zl_e
+        ocp.cost.zu_e = zu_e
+        ocp.cost.Zl_e = Zl_e
+        ocp.cost.Zu_e = Zu_e
 
     ocp.cost.zl = zl
     ocp.cost.zu = zu
@@ -511,9 +547,9 @@ class AttitudeMPC(Controller):
         self, ref_points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """Extract the closest obstacle capsules and gate flags for the MPC horizon."""
-        capsule_params = np.zeros(168)
+        capsule_params = np.zeros(24 * 8)
         for i in range(24):
-            capsule_params[i * 7 : i * 7 + 6] = 1000.0
+            capsule_params[i * 8 : i * 8 + 6] = 1000.0
         is_gate_flags = np.zeros(24, dtype=bool)
         min_obs_dist = -1.0
 
@@ -530,10 +566,13 @@ class AttitudeMPC(Controller):
 
                 for i, idx in enumerate(closest_idx):
                     cap = capsules[idx]
-                    capsule_params[i * 7 : i * 7 + 3] = cap.p1
-                    capsule_params[i * 7 + 3 : i * 7 + 6] = cap.p2
-                    capsule_params[i * 7 + 6] = cap.radius
-                    is_gate_flags[i] = getattr(cap, "is_gate", False)
+                    capsule_params[i * 8 : i * 8 + 3] = cap.p1
+                    capsule_params[i * 8 + 3 : i * 8 + 6] = cap.p2
+                    capsule_params[i * 8 + 6] = cap.radius
+                    
+                    is_gate = getattr(cap, "is_gate", False)
+                    capsule_params[i * 8 + 7] = 1.0 if is_gate else 0.0
+                    is_gate_flags[i] = is_gate
 
         return capsule_params, is_gate_flags, min_obs_dist
 
