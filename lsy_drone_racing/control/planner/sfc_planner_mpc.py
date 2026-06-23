@@ -171,7 +171,7 @@ class SfcCorridorPlanner(BasePlanner):
                 - Third derivative (jerk vector).
         """
         if not hasattr(self, "_des_pos_spline") or self._des_pos_spline is None:
-            cp_last = np.asarray(self._control_points[-1], dtype=np.float64)
+            cp_last = np.asarray(self.control_points[-1], dtype=np.float64)
             return cp_last, np.zeros(3), np.zeros(3), np.zeros(3)
 
         u_clamped = float(np.clip(u, 0.0, 1.0))
@@ -209,10 +209,6 @@ class SfcCorridorPlanner(BasePlanner):
         """Get the optimized B-spline representing the drone's target path."""
         return self._des_pos_spline
 
-    @property
-    def control_points(self) -> NDArray:
-        """Get the optimized B-spline control points."""
-        return self._control_points
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
         skeleton_path = self._calculate_anchors(current_pos[:3])
@@ -225,7 +221,7 @@ class SfcCorridorPlanner(BasePlanner):
         self.corridors = corridors
 
         control_points = self._optimize_control_points(skeleton_path, corridors, current_vel)
-        self._control_points = control_points
+        self.control_points = control_points
 
         k = 3
         n_ctrl = len(control_points)
@@ -872,7 +868,7 @@ class SfcCorridorPlanner(BasePlanner):
         """
         return {
             "knots": np.asarray(self._des_pos_spline.t, dtype=np.float64).copy(),
-            "control_points": np.asarray(self._control_points, dtype=np.float64).copy(),
+            "control_points": np.asarray(self.control_points, dtype=np.float64).copy(),
             "k": int(self._des_pos_spline.k),
             "target_gate_idx": int(self.target_gate_idx),
         }
