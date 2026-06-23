@@ -10,7 +10,7 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Planner Configuration ---
-    planner_type: str = "sfc"
+    planner_type: str = "pmm"
     """Which planner to use:
     'sfc' for CasADi B-spline SFC,
     'tube' for lightweight Tube SFC,
@@ -20,7 +20,7 @@ class MPCCConfig:
     gate_tube_radius: float = 0.4
     """Radius (m) of the flight corridor tube around the path. Used when planner_type is 'tube'."""
 
-    use_soft_tube_constraint: bool = True
+    use_soft_tube_constraint: bool = False
     """If True, enforces a soft penalty for leaving the TUBE_RADIUS cylinder around the path."""
 
     # --- Horizon Parameters ---
@@ -53,7 +53,7 @@ class MPCCConfig:
     obstacle_penalty: float = 10000.0
     """Penalty for entering the obstacle barrier."""
 
-    gate_margin_reduction: float = 0.12
+    gate_margin_reduction: float = 0.0
     """Amount (m) by which to reduce the gate capsule radius in the obstacle penalty. 
     Prevents aggressive braking at gates by shrinking their effective avoidance margin."""
 

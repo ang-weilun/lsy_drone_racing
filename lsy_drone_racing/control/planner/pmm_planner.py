@@ -110,8 +110,27 @@ class PmmPlanner(BasePlanner):
                 gate_changed = True
             self.target_gate_idx = env_target
 
-        if gate_changed:
+        env_changed = False
+        if "gates_pos" in obs and not np.array_equal(obs["gates_pos"], self.gates_pos):
+            self.gates_pos = obs["gates_pos"].copy()
+            if "gates_quat" in obs:
+                self.gates_quat = obs["gates_quat"].copy()
+            env_changed = True
+
+        if "obstacles_pos" in obs and not np.array_equal(obs["obstacles_pos"], self.obstacles_pos):
+            self.obstacles_pos = obs["obstacles_pos"].copy()
+            env_changed = True
+
+        if env_changed:
+            self.capsules = get_obstacle_capsules(self.obstacles_pos, self.env_config)
+            self.capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.env_config))
+
+        if gate_changed or env_changed:
             self._build_trajectory(obs["pos"], obs.get("vel", np.zeros(3)))
+            if env_changed:
+                self.last_replan_event = {"reason": "env_changed"}
+            elif gate_changed:
+                self.last_replan_event = {"reason": "gate_changed"}
             return True
 
         return False
