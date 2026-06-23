@@ -35,8 +35,30 @@ class PmmPlanner(BasePlanner):
 
         # Get the next Hg gates
         end_idx = min(len(self.gates_pos), self.target_gate_idx + self.config.gate_horizon)
-        p_waypoints = self.gates_pos[self.target_gate_idx:end_idx]
-        q_waypoints = self.gates_quat[self.target_gate_idx:end_idx]
+        raw_p_waypoints = self.gates_pos[self.target_gate_idx:end_idx]
+        raw_q_waypoints = self.gates_quat[self.target_gate_idx:end_idx]
+
+        from scipy.spatial.transform import Rotation as R
+        p_waypoints = []
+        q_waypoints = []
+        
+        anchor_dist = getattr(self.config, "base_anchor_dist", 0.5)
+        last_pt = current_pos
+        
+        for i in range(len(raw_p_waypoints)):
+            pos = raw_p_waypoints[i]
+            rot = R.from_quat(raw_q_waypoints[i])
+            normal = rot.apply([1.0, 0.0, 0.0])
+            
+            dist_to_gate = np.linalg.norm(pos - last_pt)
+            eff_anchor = min(anchor_dist, max(0.1, dist_to_gate / 3.0))
+            
+            p_post = pos + normal * eff_anchor
+            
+            p_waypoints.extend([pos, p_post])
+            q_waypoints.extend([raw_q_waypoints[i], raw_q_waypoints[i]])
+            
+            last_pt = p_post
 
         # Call Cone Refocusing
         sols, vs = pmm_cone_refocusing(current_pos, current_vel, p_waypoints, q_waypoints, self.config)
@@ -72,21 +94,6 @@ class PmmPlanner(BasePlanner):
             v_curr = np.array([vx_f, vy_f, vz_f])
 
         pts_array = np.array(pts)
-
-        # Straighten path through gates to prevent MPCC from cutting corners
-        from scipy.spatial.transform import Rotation as R
-        for g_idx in range(self.target_gate_idx, end_idx):
-            gate_pos = self.gates_pos[g_idx]
-            normal = R.from_quat(self.gates_quat[g_idx]).apply([1.0, 0.0, 0.0])
-            
-            diffs = pts_array - gate_pos
-            dists = np.linalg.norm(diffs, axis=1)
-            mask = dists < 0.6
-            
-            if np.any(mask):
-                projs = gate_pos + np.outer(np.dot(diffs[mask], normal), normal)
-                alphas = np.clip((0.6 - dists[mask]) / 0.4, 0.0, 1.0)[:, None]
-                pts_array[mask] = (1 - alphas) * pts_array[mask] + alphas * projs
 
         # Remove consecutive duplicates
         unique_pts = [pts_array[0]]
