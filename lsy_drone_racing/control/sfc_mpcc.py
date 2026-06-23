@@ -26,6 +26,8 @@ from lsy_drone_racing.control.planner.sfc_planner_mpc import SfcCorridorPlanner
 from lsy_drone_racing.control.planner.sfc_planner_mpc_config import PlannerConfig
 from lsy_drone_racing.control.planner.tube_planner import TubePlanner
 from lsy_drone_racing.control.planner.tube_planner_config import TubePlannerConfig
+from lsy_drone_racing.control.planner.pmm_planner import PmmPlanner
+from lsy_drone_racing.control.planner.pmm_planner_config import PmmPlannerConfig
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -132,9 +134,6 @@ def create_acados_model(parameters: dict, config: Any) -> AcadosModel:
     model.cost_y_expr_e = y_expr_e
 
     # Add nonlinear constraint for Tube SFC planner: sumsqr(e_c_vec) <= R^2
-    if config.planner_type == "tube":
-        model.con_h_expr = cs.sumsqr(e_c_vec)
-        model.con_h_expr_e = cs.sumsqr(e_c_vec)
     return model
 
 
@@ -306,8 +305,8 @@ def create_ocp_solver(
     # Soft bounds and constraint penalties
     idxsbx = np.array([0, 1, 2, 3, 7, 8, 9]) # soft indices for Z, RPY, CMD_RPY
     ocp.constraints.idxsbx = idxsbx
-    
-    num_soft_h = 1 if config.planner_type == "tube" else 0
+
+    num_soft_h = 0
     ns = len(idxsbx) + num_soft_h
 
     zl = np.zeros(ns)
@@ -321,29 +320,6 @@ def create_ocp_solver(
     zu[:len(idxsbx)] = l1_x
     Zl[:len(idxsbx)] = l2_x
     Zu[:len(idxsbx)] = l2_x
-
-    if config.planner_type == "tube":
-        ocp.constraints.lh = np.array([0.0])
-        ocp.constraints.uh = np.array([config.TUBE_RADIUS**2])
-        ocp.constraints.lh_e = np.array([0.0])
-        ocp.constraints.uh_e = np.array([config.TUBE_RADIUS**2])
-        
-        # Soften tube constraint
-        ocp.constraints.idxsh = np.array([0])
-        ocp.constraints.idxsh_e = np.array([0])
-
-        l1_h = config.TUBE_SOFT_PENALTY_L1
-        l2_h = config.TUBE_SOFT_PENALTY_L2
-        zl[len(idxsbx):] = l1_h
-        zu[len(idxsbx):] = l1_h
-        Zl[len(idxsbx):] = l2_h
-        Zu[len(idxsbx):] = l2_h
-
-        # Terminal slacks (only tube constraint)
-        ocp.cost.zl_e = np.array([l1_h])
-        ocp.cost.zu_e = np.array([l1_h])
-        ocp.cost.Zl_e = np.array([l2_h])
-        ocp.cost.Zu_e = np.array([l2_h])
 
     ocp.cost.zl = zl
     ocp.cost.zu = zu
@@ -436,6 +412,9 @@ class AttitudeMPC(Controller):
         if self.mpcc_config.planner_type == "tube":
             self.planner_config = TubePlannerConfig()
             self.planner = TubePlanner(obs, config.env.freq, self.planner_config)
+        elif self.mpcc_config.planner_type == "pmm":
+            self.planner_config = PmmPlannerConfig()
+            self.planner = PmmPlanner(obs, config.env.freq, self.planner_config)
         else:
             self.planner_config = PlannerConfig()
             self.planner = SfcCorridorPlanner(obs, config.env.freq, self.planner_config)
@@ -604,8 +583,56 @@ class AttitudeMPC(Controller):
                     self._acados_ocp_solver.set(j, "x", x_node)
             self._acados_ocp_solver.set(0, "x", x0)
 
+    def _check_horizon_gate_pass(self) -> tuple[bool, float]:
+        """Check if the MPC horizon physically passes the target gate and find its arc-length."""
+        gates_pos = getattr(self.planner, "gates_pos", None)
+        target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
+        gates_quat = getattr(self.planner, "gates_quat", None)
+
+        horizon_passes_gate = False
+        theta_target_gate = self._s_total
+
+        if gates_pos is not None and gates_quat is not None and 0 <= target_gate_idx < len(gates_pos):
+            target_gate_pos = gates_pos[target_gate_idx]
+            gate_normal = R.from_quat(gates_quat[target_gate_idx]).apply([1.0, 0.0, 0.0])
+
+            s_eval = np.linspace(
+                max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 10.0), 500
+            )
+            dists = np.linalg.norm(self._des_pos_spline(s_eval) - target_gate_pos, axis=1)
+            theta_target_gate = s_eval[np.argmin(dists)] + 0.2
+
+            for j in range(self._N + 1):
+                x_j = self._acados_ocp_solver.get(j, "x")
+                pos_j = x_j[_X_POS]
+                if (
+                    np.dot(pos_j - target_gate_pos, gate_normal) > -0.1
+                    and np.linalg.norm(pos_j - target_gate_pos) < 0.5
+                ):
+                    horizon_passes_gate = True
+                    break
+
+        return horizon_passes_gate, theta_target_gate
+
+    def _update_horizon_progress_bounds(self, horizon_passes_gate: bool, theta_target_gate: float) -> None:
+        """Update the upper bounds of the progress variable theta along the horizon."""
+        for j in range(1, self._N):
+            x_j = self._acados_ocp_solver.get(j, "x")
+            ubx_j = self._acados_ocp_solver.constraints_get(j, "ubx")
+            ubx_theta = 1000.0 if horizon_passes_gate else theta_target_gate
+
+            ubx_j[_UBX_THETA] = ubx_theta
+            self._acados_ocp_solver.constraints_set(j, "ubx", ubx_j)
+
+            if float(x_j[_X_THETA]) > ubx_theta:
+                x_j[_X_THETA] = ubx_theta
+                x_j[_X_V_THETA] = 0.0
+                self._acados_ocp_solver.set(j, "x", x_j)
+
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray, obs: dict[str, np.ndarray]) -> None:
         """Set the reference parameters and cost weights along the MPC horizon."""
+        horizon_passes_gate, theta_target_gate = self._check_horizon_gate_pass()
+        self._update_horizon_progress_bounds(horizon_passes_gate, theta_target_gate)
 
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
@@ -644,14 +671,6 @@ class AttitudeMPC(Controller):
 
             target_v = self.mpcc_config.mu / self.mpcc_config.W_v_theta
             
-            if self.mpcc_config.planner_type == "tube":
-                if hasattr(self.planner, "evaluate_corridor_spatial"):
-                    u_norm = theta_j / self._s_total if self._s_total > 1e-3 else 0.0
-                    tube_info = self.planner.evaluate_corridor_spatial(u_norm)
-                    if tube_info is not None:
-                        _, radius = tube_info
-                        if j > 0:
-                            self._acados_ocp_solver.constraints_set(j, "uh", np.array([radius**2]))
             if "gates_visited" in obs and gates_pos is not None:
                 for g_idx, is_visited in enumerate(obs["gates_visited"]):
                     if not is_visited:
@@ -816,10 +835,18 @@ class AttitudeMPC(Controller):
         else:
             if hasattr(self, "_hover_pos"):
                 del self._hover_pos
-            # rpy = command state at node 1 (applied this tick); thrust = input at node 0.
-            cmd_rpy = self._acados_ocp_solver.get(1, "x")[_X_C_RPY]
-            cmd_thrust = self._acados_ocp_solver.get(0, "u")[_U_THRUST]
-            cmd = np.concatenate([cmd_rpy, [cmd_thrust]]).astype(np.float32)
+            u0 = self._acados_ocp_solver.get(0, "u")
+            x1 = self._acados_ocp_solver.get(1, "x")
+            
+            cmd = np.zeros(4)
+            cmd[0:3] = x1[_X_C_RPY]
+            cmd[3] = u0[_U_THRUST]
+            
+            self._current_cmd_rpy = x1[_X_C_RPY]
+            self._current_vc_rpy = x1[_X_VC_RPY]
+            self._current_theta = float(x1[_X_THETA])
+            self._current_v_theta = float(x1[_X_V_THETA])
+            self._current_thrust = float(x1[_X_F_THRUST])
 
         if self._trace is not None:
             if replanned:

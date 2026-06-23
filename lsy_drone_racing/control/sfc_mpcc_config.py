@@ -10,7 +10,7 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Planner Configuration ---
-    planner_type: str = "tube"
+    planner_type: str = "pmm"
     """Which planner to use: 'sfc' for CasADi B-spline SFC, 'tube' for lightweight Tube SFC, or 'pmm' for Point-Mass Model."""
 
     TUBE_RADIUS: float = 1.0
