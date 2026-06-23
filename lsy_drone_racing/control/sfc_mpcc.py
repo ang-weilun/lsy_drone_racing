@@ -316,10 +316,10 @@ def create_ocp_solver(
     ocp.constraints.idxsbx = idxsbx
 
     if getattr(config, "use_soft_tube_constraint", False):
-        ocp.constraints.lh = np.array([0.0])
+        ocp.constraints.lh = np.array([-1e3])
         ocp.constraints.uh = np.array([config.TUBE_RADIUS**2])
         ocp.constraints.idxsh = np.array([0])
-        ocp.constraints.lh_e = np.array([0.0])
+        ocp.constraints.lh_e = np.array([-1e3])
         ocp.constraints.uh_e = np.array([config.TUBE_RADIUS**2])
         ocp.constraints.idxsh_e = np.array([0])
         num_soft_h = 1
