@@ -21,15 +21,7 @@ class PmmPlanner(BasePlanner):
     """A Point-Mass Model planner that implements time-optimal trajectory generation via Cone Refocusing."""
 
     def __init__(self, obs: dict[str, np.ndarray], freq: int, config: PmmPlannerConfig) -> None:
-        self.env_config = EnvironmentConfig()
         super().__init__(obs, freq, config)
-
-        self.capsules: list[Capsule] = []
-        self.corridors: list[Any] = []
-        
-        self.capsules = get_obstacle_capsules(self.obstacles_pos, self.env_config)
-        self.capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.env_config))
-
         self._build_trajectory(obs["pos"], obs.get("vel", np.zeros(3)))
 
     def _build_trajectory(self, current_pos: np.ndarray, current_vel: np.ndarray) -> None:

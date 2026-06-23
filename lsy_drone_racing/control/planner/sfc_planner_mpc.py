@@ -114,7 +114,6 @@ class SfcCorridorPlanner(BasePlanner):
             freq: Controller operating frequency (Hz).
             config: Path planner configuration dataclass.
         """
-        self.env_config = EnvironmentConfig()
         super().__init__(obs, freq, config or PlannerConfig())
 
         initial_vel = obs.get("vel", np.zeros(3))

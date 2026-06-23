@@ -21,14 +21,7 @@ class TubePlanner(BasePlanner):
     """A lightweight planner that connects gates via spline and outputs tube obstacles."""
 
     def __init__(self, obs: dict[str, np.ndarray], freq: int, config: Any) -> None:
-        self.env_config = EnvironmentConfig()
         super().__init__(obs, freq, config)
-
-        self.capsules: list[Capsule] = []
-        self.corridors: list[Any] = []  # Not used by the tube constraint
-        self.skeleton_path: list[SkeletonPoint] = []
-        self.control_points: np.ndarray | None = None
-
         self._build_spline(obs["pos"], obs.get("vel", np.zeros(3)))
 
     def evaluate_corridor_spatial(self, u: float) -> tuple[Any, float]:

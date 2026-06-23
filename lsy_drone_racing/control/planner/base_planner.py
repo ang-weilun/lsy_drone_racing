@@ -4,6 +4,17 @@ from typing import Any
 
 import numpy as np
 
+from lsy_drone_racing.control.planner_utils.environment import (
+    Capsule,
+    get_obstacle_capsules,
+    get_gate_capsules,
+)
+from lsy_drone_racing.control.planner_utils.environment_config import EnvironmentConfig
+
+# Forward declaration for type hinting since SkeletonPoint is in sfc_planner_mpc
+class SkeletonPoint:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,6 +32,13 @@ class BasePlanner(ABC):
         self.target_gate_idx = int(obs.get("target_gate", 0))
         if self.target_gate_idx == -1:
             self.target_gate_idx = len(self.gates_pos)
+
+        self.env_config = EnvironmentConfig()
+        self.capsules: list[Capsule] = get_obstacle_capsules(self.obstacles_pos, self.env_config)
+        self.capsules.extend(get_gate_capsules(self.gates_pos, self.gates_quat, self.env_config))
+        self.corridors: list[Any] = []
+        self.skeleton_path: list[SkeletonPoint] = []
+        self.control_points: np.ndarray | None = None
 
         self._tick = 0
         self._last_replan_tick = -getattr(self.config, "REPLAN_DEBOUNCE_TICKS", 1000)
