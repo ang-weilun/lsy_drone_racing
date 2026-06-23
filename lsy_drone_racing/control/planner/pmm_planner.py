@@ -36,9 +36,10 @@ class PmmPlanner(BasePlanner):
         # Get the next Hg gates
         end_idx = min(len(self.gates_pos), self.target_gate_idx + self.config.gate_horizon)
         p_waypoints = self.gates_pos[self.target_gate_idx:end_idx]
+        q_waypoints = self.gates_quat[self.target_gate_idx:end_idx]
 
         # Call Cone Refocusing
-        sols, vs = pmm_cone_refocusing(current_pos, current_vel, p_waypoints, self.config)
+        sols, vs = pmm_cone_refocusing(current_pos, current_vel, p_waypoints, q_waypoints, self.config)
 
         if sols is None or len(sols) == 0:
             logger.warning("PMM Cone Refocusing failed to find a valid trajectory.")

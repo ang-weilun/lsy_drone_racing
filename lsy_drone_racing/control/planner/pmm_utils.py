@@ -119,7 +119,7 @@ def generate_3d_trajectory(p0, v0, pf, vf, u_min, u_max):
             
     return max_T, final_sols
 
-def dijkstra_search(p0, v0, p_waypoints, u_min, u_max, s_bins, v_min, v_max, theta_min, theta_max, psi_min, psi_max):
+def dijkstra_search(p0, v0, p_waypoints, q_waypoints, u_min, u_max, s_bins, bounds):
     """
     Velocity search graph using DP on layered DAG.
     p0, v0: current state
@@ -128,41 +128,48 @@ def dijkstra_search(p0, v0, p_waypoints, u_min, u_max, s_bins, v_min, v_max, the
     """
     Hg = len(p_waypoints)
     
-    v_norms = np.linspace(v_min, v_max, s_bins)
-    yaws = np.linspace(theta_min, theta_max, s_bins)
-    pitches = np.linspace(psi_min, psi_max, s_bins)
-    
-    sampled_velocities = []
-    for v in v_norms:
-        for yaw in yaws:
-            for pitch in pitches:
-                vx = v * np.cos(pitch) * np.cos(yaw)
-                vy = v * np.cos(pitch) * np.sin(yaw)
-                vz = v * np.sin(pitch)
-                sampled_velocities.append(np.array([vx, vy, vz]))
-    sampled_velocities = np.array(sampled_velocities)
-    num_samples = len(sampled_velocities)
+    layer_velocities = []
+    for i in range(Hg):
+        b = bounds[i]
+        v_norms = np.linspace(b['v_min'], b['v_max'], s_bins)
+        yaws = np.linspace(b['theta_min'], b['theta_max'], s_bins)
+        pitches = np.linspace(b['psi_min'], b['psi_max'], s_bins)
+        
+        vels = []
+        for v in v_norms:
+            for yaw in yaws:
+                for pitch in pitches:
+                    vx = v * np.cos(pitch) * np.cos(yaw)
+                    vy = v * np.cos(pitch) * np.sin(yaw)
+                    vz = v * np.sin(pitch)
+                    vels.append(np.array([vx, vy, vz]))
+        layer_velocities.append(np.array(vels))
+        
+    num_samples = s_bins**3
     
     # dp[layer][j] = min total time to reach waypoint layer with velocity j
     dp = np.full((Hg, num_samples), float('inf'))
     parent = np.zeros((Hg, num_samples), dtype=int)
     sols = [[None]*num_samples for _ in range(Hg)]
     
-    # layer 0: from p0, v0 to p_waypoints[0], sampled_velocities[j]
+    # layer 0: from p0, v0 to p_waypoints[0], layer_velocities[0][j]
+    vels_0 = layer_velocities[0]
     for j in range(num_samples):
-        T, sol = generate_3d_trajectory(p0, v0, p_waypoints[0], sampled_velocities[j], u_min, u_max)
+        T, sol = generate_3d_trajectory(p0, v0, p_waypoints[0], vels_0[j], u_min, u_max)
         if T is not None:
             dp[0, j] = T
             sols[0][j] = sol
             
-    # layer i: from p_waypoints[i-1], sampled_velocities[k] to p_waypoints[i], sampled_velocities[j]
+    # layer i: from p_waypoints[i-1], layer_velocities[i-1][k] to p_waypoints[i], layer_velocities[i][j]
     for i in range(1, Hg):
+        vels_prev = layer_velocities[i-1]
+        vels_curr = layer_velocities[i]
         for k in range(num_samples):
             if dp[i-1, k] == float('inf'):
                 continue
-            vk = sampled_velocities[k]
+            vk = vels_prev[k]
             for j in range(num_samples):
-                vj = sampled_velocities[j]
+                vj = vels_curr[j]
                 T, sol = generate_3d_trajectory(p_waypoints[i-1], vk, p_waypoints[i], vj, u_min, u_max)
                 if T is not None:
                     if dp[i-1, k] + T < dp[i, j]:
@@ -183,20 +190,36 @@ def dijkstra_search(p0, v0, p_waypoints, u_min, u_max, s_bins, v_min, v_max, the
     best_vs = []
     for i in range(Hg - 1, -1, -1):
         best_sols.append(sols[i][curr_j])
-        best_vs.append(sampled_velocities[curr_j])
+        best_vs.append(layer_velocities[i][curr_j])
         curr_j = parent[i, curr_j]
         
     best_sols.reverse()
     best_vs.reverse()
     return best_T, best_sols, best_vs
 
-def pmm_cone_refocusing(p0, v0, p_waypoints, config):
+def pmm_cone_refocusing(p0, v0, p_waypoints, q_waypoints, config):
     """
-    Implements Algorithm 1: PMM generation via cone refocusing.
+    Implements Algorithm 1: PMM generation via cone refocusing, per-gate directional bounding.
     """
-    v_min, v_max = config.v_min, config.v_max
-    theta_min, theta_max = -np.pi, np.pi
-    psi_min, psi_max = -np.pi/2 + 0.1, np.pi/2 - 0.1
+    Hg = len(p_waypoints)
+    from scipy.spatial.transform import Rotation as R
+    
+    bounds = []
+    for i in range(Hg):
+        rot = R.from_quat(q_waypoints[i])
+        normal = rot.apply([1.0, 0.0, 0.0])
+        yaw = np.arctan2(normal[1], normal[0])
+        pitch = np.arcsin(np.clip(normal[2], -1.0, 1.0))
+        
+        b = {
+            'v_min': config.v_min,
+            'v_max': config.v_max,
+            'theta_min': yaw - np.pi/3,
+            'theta_max': yaw + np.pi/3,
+            'psi_min': max(-np.pi/2 + 0.1, pitch - np.pi/4),
+            'psi_max': min(np.pi/2 - 0.1, pitch + np.pi/4)
+        }
+        bounds.append(b)
     
     prev_T = float('inf')
     best_sols = None
@@ -204,8 +227,7 @@ def pmm_cone_refocusing(p0, v0, p_waypoints, config):
     
     for k in range(config.K):
         T, sols, vs = dijkstra_search(
-            p0, v0, p_waypoints, config.u_min, config.u_max, config.s, 
-            v_min, v_max, theta_min, theta_max, psi_min, psi_max
+            p0, v0, p_waypoints, q_waypoints, config.u_min, config.u_max, config.s, bounds
         )
         
         if T is None:
@@ -219,22 +241,23 @@ def pmm_cone_refocusing(p0, v0, p_waypoints, config):
             
         prev_T = T
         
-        # Refocus cone around the first velocity in the path
-        v_opt = vs[0]
-        v_norm_opt = np.linalg.norm(v_opt)
-        yaw_opt = np.arctan2(v_opt[1], v_opt[0])
-        pitch_opt = np.arcsin(np.clip(v_opt[2] / (v_norm_opt + 1e-6), -1.0, 1.0))
-        
-        # Shrink window
-        dv = (v_max - v_min) / 2.0
-        dtheta = (theta_max - theta_min) / 2.0
-        dpsi = (psi_max - psi_min) / 2.0
-        
-        v_min = max(0.1, v_norm_opt - dv)
-        v_max = v_norm_opt + dv
-        theta_min = yaw_opt - dtheta
-        theta_max = yaw_opt + dtheta
-        psi_min = max(-np.pi/2 + 0.1, pitch_opt - dpsi)
-        psi_max = min(np.pi/2 - 0.1, pitch_opt + dpsi)
-        
+        # Refocus cone for each gate individually
+        for i in range(Hg):
+            v_opt = vs[i]
+            v_norm_opt = np.linalg.norm(v_opt)
+            yaw_opt = np.arctan2(v_opt[1], v_opt[0])
+            pitch_opt = np.arcsin(np.clip(v_opt[2] / (v_norm_opt + 1e-6), -1.0, 1.0))
+            
+            # Shrink window
+            dv = (bounds[i]['v_max'] - bounds[i]['v_min']) / 2.0
+            dtheta = (bounds[i]['theta_max'] - bounds[i]['theta_min']) / 2.0
+            dpsi = (bounds[i]['psi_max'] - bounds[i]['psi_min']) / 2.0
+            
+            bounds[i]['v_min'] = max(0.1, v_norm_opt - dv)
+            bounds[i]['v_max'] = v_norm_opt + dv
+            bounds[i]['theta_min'] = yaw_opt - dtheta
+            bounds[i]['theta_max'] = yaw_opt + dtheta
+            bounds[i]['psi_min'] = max(-np.pi/2 + 0.1, pitch_opt - dpsi)
+            bounds[i]['psi_max'] = min(np.pi/2 - 0.1, pitch_opt + dpsi)
+            
     return best_sols, best_vs
