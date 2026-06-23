@@ -12,28 +12,17 @@ from lsy_drone_racing.control.planner_utils.environment import (
     get_gate_capsules,
 )
 from lsy_drone_racing.control.planner_utils.environment_config import EnvironmentConfig
+from lsy_drone_racing.control.planner.base_planner import BasePlanner
 
 logger = logging.getLogger(__name__)
 
 
-class TubePlanner:
+class TubePlanner(BasePlanner):
     """A lightweight planner that connects gates via spline and outputs tube obstacles."""
 
     def __init__(self, obs: dict[str, np.ndarray], freq: int, config: Any) -> None:
-        self.config = config
         self.env_config = EnvironmentConfig()
-        self.freq = freq
-        self._tick = 0
-        self._last_replan_tick = -1000
-        self.last_replan_event: dict[str, Any] | None = None
-
-        self.gates_pos = obs.get("gates_pos", np.array([]))
-        self.gates_quat = obs.get("gates_quat", np.array([]))
-        self.obstacles_pos = obs.get("obstacles_pos", np.array([]))
-
-        self.target_gate_idx = int(obs.get("target_gate", 0))
-        if self.target_gate_idx == -1:
-            self.target_gate_idx = len(self.gates_pos)
+        super().__init__(obs, freq, config)
 
         self.capsules: list[Capsule] = []
         self.corridors: list[Any] = []  # Not used by the tube constraint
@@ -55,13 +44,15 @@ class TubePlanner:
         default_radius = getattr(self.config, "tube_radius", 1.0)
         gate_radius = getattr(self.config, "gate_tube_radius", 0.2)
 
+        gate_radius_transition_dist = getattr(self.config, "gate_radius_transition_dist", 2.0)
+
         radius = default_radius
         if len(self.gates_pos) > 0:
             dists = np.linalg.norm(self.gates_pos - pos, axis=1)
             min_dist = np.min(dists)
-            if min_dist < 2.0:
+            if min_dist < gate_radius_transition_dist:
                 # Smooth reduction all the way to the gate center
-                t = min_dist / 2.0
+                t = min_dist / gate_radius_transition_dist
                 radius = gate_radius + t * (default_radius - gate_radius)
 
         return None, radius
@@ -81,12 +72,15 @@ class TubePlanner:
             right = rot.apply([0.0, 1.0, 0.0])
 
             # Anchor points to ensure straight passage through the gate opening
-            anchor_dist = 0.5
+            anchor_dist = getattr(self.config, "base_anchor_dist", 0.5)
 
             # If the distance to the gate is small, scale down the anchor distance
             # to prevent self-intersecting loops or excessive wiggles.
             dist_to_gate = np.linalg.norm(pos - pts[-1])
-            eff_anchor = min(anchor_dist, max(0.1, dist_to_gate / 3.0))
+            eff_anchor = min(
+                anchor_dist, 
+                max(getattr(self.config, "min_anchor_dist", 0.1), dist_to_gate / getattr(self.config, "anchor_dist_scaling", 3.0))
+            )
 
             p_pre = pos - normal * eff_anchor
             p_post = pos + normal * eff_anchor
@@ -103,7 +97,10 @@ class TubePlanner:
                     # Swing to the side the drone is already on, to create a wider arc
                     swing_dir = right if lat_dist > 0 else -right
 
-                    swing_dist = min(1.5, max(0.5, dist_to_gate * 0.4))
+                    swing_dist = min(
+                        getattr(self.config, "max_swing_dist", 1.5), 
+                        max(getattr(self.config, "min_swing_dist", 0.5), dist_to_gate * getattr(self.config, "swing_dist_scaling", 0.4))
+                    )
                     # Move outward laterally and slightly backward from the gate
                     swing_pos = pos + swing_dir * swing_dist - normal * (swing_dist * 0.5)
 
@@ -124,7 +121,7 @@ class TubePlanner:
             self.env_config, "safety_margin", 0.1
         )
 
-        for _ in range(5):
+        for _ in range(getattr(self.config, "obstacle_avoidance_iterations", 5)):
             new_pts = [pts[0]]
             new_weights = [weights[0]]
             collision_found = False
@@ -172,7 +169,7 @@ class TubePlanner:
                         vec = np.array([-dir_AB[1], dir_AB[0]])
                     vec = vec / np.linalg.norm(vec)
 
-                    safe_pt2 = O2 + vec * (req_dist + 0.1)
+                    safe_pt2 = O2 + vec * (req_dist + getattr(self.config, "obstacle_clearance_margin", 0.1))
                     safe_pt = closest_proj.copy()
                     safe_pt[:2] = safe_pt2
                     new_pts.append(safe_pt)
@@ -193,7 +190,8 @@ class TubePlanner:
         unique_pts = [pts_array_raw[0]]
         for i in range(1, len(pts_array_raw)):
             pt = pts_array_raw[i].copy()
-            pt[2] = max(0.15, pt[2])  # Ensure Z is at least 0.15 to avoid ground collisions
+            min_z = getattr(self.config, "min_z_height", 0.15)
+            pt[2] = max(min_z, pt[2])  # Ensure Z is at least min_z to avoid ground collisions
             if np.linalg.norm(pt - unique_pts[-1]) > 1e-2:
                 unique_pts.append(pt)
 
@@ -215,10 +213,15 @@ class TubePlanner:
         pchip = PchipInterpolator(u_pts, pts_array)
 
         # Sample smoothed points densely
-        u_fine = np.linspace(0, 1, max(100, len(pts_array) * 10))
+        samples = max(
+            getattr(self.config, "min_spline_samples", 100), 
+            len(pts_array) * getattr(self.config, "spline_samples_multiplier", 10)
+        )
+        u_fine = np.linspace(0, 1, samples)
         smooth_pts = pchip(u_fine)
 
-        self.control_points = smooth_pts
+        downsample_factor = getattr(self.config, "visualization_downsample_factor", 5)
+        self.control_points = smooth_pts[::downsample_factor]
 
         # Compute chord lengths for parameterization
         diffs = np.diff(smooth_pts, axis=0)
@@ -266,13 +269,3 @@ class TubePlanner:
 
     def des_pos_spline(self, u: np.ndarray | float) -> np.ndarray:
         return self._spline(u)
-
-    def episode_reset(self) -> None:
-        self._tick = 0
-        self._last_replan_tick = -1000
-
-    def add_trajectory_point(self, pos: np.ndarray) -> None:
-        pass
-
-    def get_trajectory_history(self) -> list:
-        return []

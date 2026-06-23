@@ -10,10 +10,11 @@ class MPCCConfig:
     """Configuration for the Model Predictive Contouring Controller (MPCC)."""
 
     # --- Planner Configuration ---
-    planner_type: str = "sfc"
-    """Which planner to use: 'sfc' for CasADi B-spline SFC, or 'tube' for lightweight Tube SFC."""
+    planner_type: str = "tube"
+    """Which planner to use: 'sfc' for CasADi B-spline SFC, 'tube' for lightweight Tube SFC, or 'pmm' for Point-Mass Model."""
 
     TUBE_RADIUS: float = 1.0
+    gate_tube_radius: float = 0.4
     """Radius (m) of the flight corridor tube around the path. Used when planner_type is 'tube'."""
 
     # --- Horizon Parameters ---

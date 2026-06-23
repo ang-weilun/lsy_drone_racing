@@ -18,6 +18,7 @@ from lsy_drone_racing.control.planner_utils.environment import Capsule, get_obst
 from lsy_drone_racing.control.planner_utils.environment_config import EnvironmentConfig
 from lsy_drone_racing.control.planner_utils.skeleton import SkeletonPoint
 from lsy_drone_racing.control.planner.sfc_planner_mpc_config import PlannerConfig
+from lsy_drone_racing.control.planner.base_planner import BasePlanner
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def closest_points_segments(
     return p1 + t * d1, p2 + s * d2
 
 
-class SfcCorridorPlanner:
+class SfcCorridorPlanner(BasePlanner):
     """Pure SFC trajectory planner. Build once, update each tick, evaluate at any time."""
 
     def __init__(
@@ -113,20 +114,9 @@ class SfcCorridorPlanner:
             freq: Controller operating frequency (Hz).
             config: Path planner configuration dataclass.
         """
-        self._freq = freq
-        self.config = config or PlannerConfig()
         self.env_config = EnvironmentConfig()
+        super().__init__(obs, freq, config or PlannerConfig())
 
-        self.gates_pos = obs["gates_pos"].copy()
-        self.gates_quat = obs["gates_quat"].copy()
-        self.obstacles_pos = obs.get("obstacles_pos", np.array([])).copy()
-        self.target_gate_idx = 0
-        self._tick = 0
-        self._last_replan_tick = -self.config.REPLAN_DEBOUNCE_TICKS
-
-        self.replan_events: list[dict] = []
-        self.last_replan_event: dict | None = None
-        self._traj_history = []
         initial_vel = obs.get("vel", np.zeros(3))
         self._build_spline(obs["pos"], initial_vel)
         self._record_replan_event(reason="init")
@@ -224,15 +214,6 @@ class SfcCorridorPlanner:
     def control_points(self) -> NDArray:
         """Get the optimized B-spline control points."""
         return self._control_points
-
-    def episode_reset(self) -> None:
-        """Reset the planner state for a new episode."""
-        self.target_gate_idx = 0
-        self._tick = 0
-        self._last_replan_tick = -self.config.REPLAN_DEBOUNCE_TICKS
-        self.replan_events = []
-        self.last_replan_event = None
-        self._traj_history = []
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
         skeleton_path = self._calculate_anchors(current_pos[:3])
@@ -905,21 +886,3 @@ class SfcCorridorPlanner:
         }
         self.replan_events.append(evt)
         self.last_replan_event = evt
-
-    def add_trajectory_point(self, pos: NDArray) -> None:
-        """Add a position point to the flown trajectory history buffer.
-
-        Args:
-            pos: 3D position vector [x, y, z] to record.
-        """
-        self._traj_history.append(pos.copy())
-
-    def get_trajectory_history(self) -> NDArray:
-        """Retrieve the recorded flown trajectory history.
-
-        Returns:
-            An Nx3 array of historical position coordinates.
-        """
-        if len(self._traj_history) == 0:
-            return np.empty((0, 3))
-        return np.array(self._traj_history)
