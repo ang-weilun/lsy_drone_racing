@@ -500,6 +500,10 @@ class AttitudeMPC(Controller):
         diffs = np.diff(pts, axis=0)
         chords = np.linalg.norm(diffs, axis=1)
         s = np.concatenate(([0], np.cumsum(chords)))
+        
+        # If the points are identical (e.g. race finished hover), prevent CubicSpline crash
+        if s[-1] < 1e-6:
+            s = np.linspace(0, 1, len(s))
 
         self._des_pos_spline = CubicSpline(s, pts)
         self._s_total = float(s[-1])

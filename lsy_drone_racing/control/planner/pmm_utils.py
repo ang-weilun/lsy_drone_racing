@@ -211,13 +211,18 @@ def pmm_cone_refocusing(p0, v0, p_waypoints, q_waypoints, config):
         yaw = np.arctan2(normal[1], normal[0])
         pitch = np.arcsin(np.clip(normal[2], -1.0, 1.0))
         
+        # Narrow the cone to force a straight pass through the gate.
+        # Use a slightly wider cone for the immediate next gate (i == 0) in case the drone is close and off-axis.
+        cone_angle_yaw = np.pi/6 if i == 0 else np.pi/10
+        cone_angle_pitch = np.pi/6 if i == 0 else np.pi/10
+        
         b = {
             'v_min': config.v_min,
             'v_max': config.v_max,
-            'theta_min': yaw - np.pi/3,
-            'theta_max': yaw + np.pi/3,
-            'psi_min': max(-np.pi/2 + 0.1, pitch - np.pi/4),
-            'psi_max': min(np.pi/2 - 0.1, pitch + np.pi/4)
+            'theta_min': yaw - cone_angle_yaw,
+            'theta_max': yaw + cone_angle_yaw,
+            'psi_min': max(-np.pi/2 + 0.1, pitch - cone_angle_pitch),
+            'psi_max': min(np.pi/2 - 0.1, pitch + cone_angle_pitch)
         }
         bounds.append(b)
     

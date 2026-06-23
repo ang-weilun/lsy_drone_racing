@@ -35,8 +35,40 @@ class PmmPlanner(BasePlanner):
 
         # Get the next Hg gates
         end_idx = min(len(self.gates_pos), self.target_gate_idx + self.config.gate_horizon)
-        p_waypoints = self.gates_pos[self.target_gate_idx:end_idx]
-        q_waypoints = self.gates_quat[self.target_gate_idx:end_idx]
+        raw_p_waypoints = self.gates_pos[self.target_gate_idx:end_idx]
+        raw_q_waypoints = self.gates_quat[self.target_gate_idx:end_idx]
+
+        from scipy.spatial.transform import Rotation as R
+        p_waypoints = []
+        q_waypoints = []
+        
+        anchor_dist = getattr(self.config, "base_anchor_dist", 0.5)
+        last_pt = current_pos
+        
+        for i in range(len(raw_p_waypoints)):
+            pos = raw_p_waypoints[i]
+            rot = R.from_quat(raw_q_waypoints[i])
+            normal = rot.apply([1.0, 0.0, 0.0])
+            
+            dist_to_gate = np.linalg.norm(pos - last_pt)
+            eff_anchor = min(anchor_dist, max(0.1, dist_to_gate / 3.0))
+            
+            p_pre = pos - normal * eff_anchor
+            p_post = pos + normal * eff_anchor
+            
+            if i == 0:
+                dist_along_normal = np.dot(pos - current_pos, normal)
+                if dist_along_normal > eff_anchor + 0.1:
+                    p_waypoints.append(p_pre)
+                    q_waypoints.append(raw_q_waypoints[i])
+            else:
+                p_waypoints.append(p_pre)
+                q_waypoints.append(raw_q_waypoints[i])
+                
+            p_waypoints.extend([pos, p_post])
+            q_waypoints.extend([raw_q_waypoints[i], raw_q_waypoints[i]])
+            
+            last_pt = p_post
 
         # Call Cone Refocusing
         sols, vs = pmm_cone_refocusing(current_pos, current_vel, p_waypoints, q_waypoints, self.config)
