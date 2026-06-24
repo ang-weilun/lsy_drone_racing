@@ -31,22 +31,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 # Parameter-vector layout (see create_acados_model): theta_i(1) + 3 spline-coeff
-# blocks(4 each) + capsules(24*7) place q_c_dyn at index 181; the tunnel/gate params
-# follow it. q_c_dyn is therefore no longer the last entry.
+# blocks(4 each) + capsules(24*7) place q_c_dyn at index 181, with the tunnel radius
+# following it. q_c_dyn is therefore not the last entry, so it is indexed explicitly.
 _Q_C_DYN_IDX = 1 + 4 * 3 + 24 * 7  # 181
-# theta_gate sentinel when there is no target gate: large so ahead = theta - theta_gate
-# stays <= 0 and the crossing lock / turnstile go inert.
-_THETA_GATE_INERT = 1.0e6
-
-
-def _gate_forward_normal(quat: NDArray) -> NDArray:
-    """Unit forward (through-the-gate) normal in world frame from a gate quaternion.
-
-    The gate's local +x axis is taken as the travel direction through the opening; the
-    sign convention is verified against a trace at Stage 2a (where the crossing lock
-    first consumes it). Carried inertly before then.
-    """
-    return R.from_quat(quat).apply([1.0, 0.0, 0.0])
 
 
 def create_acados_model(parameters: dict, config: MPCCConfig) -> AcadosModel:
@@ -102,25 +89,9 @@ def create_acados_model(parameters: dict, config: MPCCConfig) -> AcadosModel:
     p_c_z = cs.MX.sym("c_z", 4)
     p_capsules = cs.MX.sym("capsules", 24 * 7)
     p_q_c_dyn = cs.MX.sym("q_c_dyn")  # per-node contouring weight (dynamic gate boost)
-    # Tunnel + crossing-lock parameters. Carried inertly at Stage 1a (no expression uses
-    # them yet); consumed from Stage 1b (tunnel) and Stage 2a (crossing lock) onward.
-    p_tunnel_r = cs.MX.sym("tunnel_r")  # lateral contour-tunnel half-width (m)
-    p_gate_g = cs.MX.sym("gate_g", 3)  # target-gate center (world)
-    p_gate_n = cs.MX.sym("gate_n", 3)  # target-gate forward normal (world, unit)
-    p_theta_gate = cs.MX.sym("theta_gate")  # target-gate arc length on the reference
+    p_tunnel_r = cs.MX.sym("tunnel_r")  # lateral contour-tunnel half-width (m), see con_h
 
-    p = cs.vertcat(
-        p_theta_i,
-        p_c_x,
-        p_c_y,
-        p_c_z,
-        p_capsules,
-        p_q_c_dyn,
-        p_tunnel_r,
-        p_gate_g,
-        p_gate_n,
-        p_theta_gate,
-    )
+    p = cs.vertcat(p_theta_i, p_c_x, p_c_y, p_c_z, p_capsules, p_q_c_dyn, p_tunnel_r)
 
     t_val = theta - p_theta_i
     p_d_x = p_c_x[0] * t_val**3 + p_c_x[1] * t_val**2 + p_c_x[2] * t_val + p_c_x[3]
@@ -233,16 +204,11 @@ def _cost_weight_vectors(config: MPCCConfig, q_c_dyn: cs.MX) -> tuple[cs.MX, cs.
     static config constants. The vertical contour weight is ``max(q_c_dyn, Q_c_z)`` so
     altitude is never penalized less than the floor ``Q_c_z``.
 
-    Parameters
-    ----------
-    config : MPCCConfig
-        Cost-weight configuration.
-    q_c_dyn : casadi.MX
-        Symbolic per-node contouring weight (model parameter).
+    Args:
+        config: Cost-weight configuration.
+        q_c_dyn: Symbolic per-node contouring weight (model parameter).
 
-    Returns
-    -------
-    tuple of casadi.MX
+    Returns:
         Column vectors of weights matching ``y_expr`` (length 43) and ``y_expr_e``
         (length 38).
     """
@@ -356,8 +322,8 @@ def create_ocp_solver(
 
     ocp.constraints.x0 = np.zeros(nx)
     # Default contouring weight = base Q_c; _set_mpc_horizon_parameters overwrites it per
-    # node/tick. q_c_dyn is no longer the last param (tunnel/gate params follow), so index
-    # it explicitly -- [-1] here would silently zero q_c_dyn and mis-init theta_gate.
+    # node/tick. q_c_dyn is not the last param (the tunnel radius follows), so index it
+    # explicitly -- [-1] here would set tunnel_r instead and leave q_c_dyn zeroed.
     param_init = np.zeros(np_dim)
     param_init[_Q_C_DYN_IDX] = config.Q_c
     ocp.parameter_values = param_init
@@ -473,8 +439,8 @@ class AttitudeMPC(Controller):
         self._s_total = float(s[-1])
 
         # Arc-length progress theta of each gate center on the reference spline (absolute
-        # gate index), consumed by the tunnel pinch and the crossing lock. Brute-force
-        # projection, recomputed only on replan -- off the 50 Hz hot path.
+        # gate index), consumed by the tunnel pinch. Brute-force projection, recomputed
+        # only on replan -- off the 50 Hz hot path.
         s_dense = np.linspace(0.0, self._s_total, 400)
         spline_dense = self._des_pos_spline(s_dense)
         self._theta_gates = np.array(
@@ -606,19 +572,8 @@ class AttitudeMPC(Controller):
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
         """Set the reference parameters and cost weights along the MPC horizon."""
         gates_pos = getattr(self.planner, "gates_pos", None)
-        gates_quat = getattr(self.planner, "gates_quat", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
         has_target = gates_pos is not None and 0 <= target_gate_idx < len(gates_pos)
-
-        # Target-gate geometry (constant over the horizon) for the crossing lock: center
-        # g, forward normal n, arc-length theta_gate. Sentinel when there is no target.
-        gate_g = np.zeros(3)
-        gate_n = np.zeros(3)
-        theta_gate = _THETA_GATE_INERT
-        if has_target:
-            gate_g = np.asarray(gates_pos[target_gate_idx], dtype=np.float64)
-            gate_n = _gate_forward_normal(gates_quat[target_gate_idx])
-            theta_gate = float(self._theta_gates[target_gate_idx])
 
         for j in range(self._N + 1):
             x_j = self._acados_ocp_solver.get(j, "x")
@@ -656,20 +611,7 @@ class AttitudeMPC(Controller):
                 tunnel_r = w_wide - (w_wide - self.mpcc_config.tunnel_w_gate) * pinch
             else:
                 tunnel_r = w_wide
-            p_j = np.concatenate(
-                (
-                    [theta_i],
-                    c_x,
-                    c_y,
-                    c_z,
-                    capsule_params,
-                    [q_c_dyn],
-                    [tunnel_r],
-                    gate_g,
-                    gate_n,
-                    [theta_gate],
-                )
-            )
+            p_j = np.concatenate(([theta_i], c_x, c_y, c_z, capsule_params, [q_c_dyn], [tunnel_r]))
             self._acados_ocp_solver.set(j, "p", p_j)
 
     def _compute_hover_control(self, obs: dict[str, np.ndarray]) -> np.ndarray:
