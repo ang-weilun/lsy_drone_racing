@@ -26,10 +26,10 @@ class MPCCConfig:
     """Step layout: "two_block" (N_fine x dt_fine then N_coarse x dt_coarse) or "linear" (ramp)."""
 
     # --- Cost Weights ---
-    Q_c: float = 150.0
+    Q_c: float = 50.0
     """Contouring error penalty (lateral/longitudinal)."""
 
-    Q_c_z: float = 400.0
+    Q_c_z: float = 250.0
     """Vertical contouring error penalty. Higher than Q_c to prevent altitude drops."""
 
     Q_l: float = 150.0
@@ -38,11 +38,11 @@ class MPCCConfig:
     W_v_theta: float = 5.0
     """Penalty on virtual velocity."""
 
-    obstacle_penalty: float = 5000.0
+    obstacle_penalty: float = 10000.0
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
-    mu: float = 20.0
+    mu: float = 15.0
     """Speed scaling; reference virtual velocity v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
@@ -73,12 +73,12 @@ class MPCCConfig:
     """Linear-velocity penalty. Zero: cost references vel=0, so >0 rewards flying slow."""
 
     # --- Dynamic Tuning ---
-    dynamic_addition: float = 1200.0
+    dynamic_addition: float = 750.0
     """Extra contouring weight near target gates. Sized for the 0.7 m sensor reveal
     (gate true pose snaps up to ~0.2 m): 300->1200 recovered L2 SR 5->14/20.
     """
 
-    dynamic_sigma: float = 0.8
+    dynamic_sigma: float = 0.4
     """Std (m) of the Gaussian near-gate weight. Widened to bite at the 0.7 m reveal radius."""
 
     # --- Hover Controller Gains ---

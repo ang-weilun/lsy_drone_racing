@@ -43,7 +43,7 @@ class PlannerConfig:
     """Minimum number of ticks to wait before allowing another replan."""
 
     # --- Geometry / Spline Builder ---
-    anchor_gap: float = 0.5
+    anchor_gap: float = 0.9
     """Distance (m) from gate to place entry/exit anchors along the normal."""
 
     points_per_segment: int = 4
@@ -116,7 +116,7 @@ class PlannerConfig:
     """Constraint penalty multiplier forcing gate-control points to match gate centers exactly."""
 
     # --- Heuristics, Swing Waypoints & Exit Mechanics ---
-    PREV_GATE_EXIT_THRESHOLD: float = 1.0
+    PREV_GATE_EXIT_THRESHOLD: float = 0.4
     """Maximum distance (m) along gate normal within which the
     previous gate's clearance is maintained.
     """
