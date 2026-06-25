@@ -121,32 +121,17 @@ class PlannerConfig:
     previous gate's clearance is maintained.
     """
 
-    ENTRY_SWING_THRESHOLD: float = -0.1
-    """Threshold on velocity-normal alignment below which the
-    drone triggers entry swing (U-turn approach).
-    """
-
-    ENTRY_SWING_OFFSET: float = 0.5
-    """Lateral offset distance (m) added to entry swing waypoints to widen approach turns."""
-
-    EXIT_SWING_THRESHOLD: float = -0.2
-    """Threshold on exit velocity-normal alignment below which
-    exit swing (hairpin turnaround) is triggered.
-    """
-
-    EXIT_SWING_CLEARANCE: float = 1.0
-    """Additional exit clearance distance (m) along the gate normal for turnaround anchors."""
-
-    EXIT_SWING_SIDE_OFFSET: float = 1.0
-    """Lateral offset distance (m) added to exit swing waypoints to define turnaround radius."""
-
-    EXIT_SWING_BACK_OFFSET: float = 0.7
-    """Axial backtracking offset distance (m) against the
-    normal axis to stabilize hairpin exit turns.
-    """
-
     FINISH_LINE_EXT_DIST: float = 0.75
     """Extension distance (m) along the final gate normal to place the finish line waypoint."""
+
+    HERMITE_TANGENT_SCALE_GATE: float = 1.0
+    """Scaling factor for the gate normal vector when used as a tangent for Hermite splines."""
+
+    HERMITE_TANGENT_SCALE_DRONE: float = 0.5
+    """Scaling factor for the drone velocity vector when used as a tangent for Hermite splines."""
+
+    HERMITE_SAMPLES_PER_SEGMENT: int = 5
+    """Number of intermediate samples to take along the Hermite curve between anchors."""
 
     # --- Obstacle Avoidance Heuristics ---
     OBSTACLE_AVOIDANCE_MARGIN: float = 0.15

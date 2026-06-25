@@ -249,7 +249,7 @@ class SfcCorridorPlanner:
         self._traj_history = []
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
-        skeleton_path = self._calculate_anchors(current_pos[:3])
+        skeleton_path = self._calculate_anchors(current_pos[:3], current_vel)
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
         capsules = self._get_all_obstacle_capsules()
@@ -757,159 +757,155 @@ class SfcCorridorPlanner:
             logger.warning(f"SFC CasADi QP failed: {e}. Relaxing constraints.")
             return v_ref[:n_ctrl]
 
-    def _build_raw_skeleton(self, current_pos: NDArray) -> list[SkeletonPoint]:
+    def _build_analytical_skeleton(self, current_pos: NDArray, current_vel: NDArray) -> list[SkeletonPoint]:
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
-        # Preserve the just-passed gate's clearance anchor when a replan fires
-        # mid-exit. Without this, the new skeleton goes straight from the
-        # drone (still inside the previous gate's exit zone) to the next
-        # gate's pre_pos, ignoring the forward-along-normal commitment the
-        # drone is currently flying out on. The drone ends up flying with
-        # momentum along the old route while the spline pulls it onto a path
-        # that demands an instantaneous direction change. Re-emitting only
-        # the clearance anchor (along the prev gate's normal) keeps the
-        # tangent aligned with the drone's current heading without forcing
-        # the perpendicular exit_swing detour, which over-commits when the
-        # drone has already started its turn.
-        prev_gate_idx = self.target_gate_idx - 1
-        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(self.gates_pos):
-            prev_pos = self.gates_pos[prev_gate_idx]
-            prev_normal = gate_normals[prev_gate_idx]
-            d_post = float(np.dot(current_pos - prev_pos, prev_normal))
-            if 0.0 < d_post < self.config.PREV_GATE_EXIT_THRESHOLD:
-                next_pos = self.gates_pos[self.target_gate_idx]
-                # Test against prev_pos + prev_normal * anchor_gap, the canonical
-                # post-gate exit point (no post_pos anchor in skeleton anymore).
-                exit_vector = next_pos - (prev_pos + prev_normal * self.config.anchor_gap)
-                if float(np.dot(exit_vector, prev_normal)) < self.config.EXIT_SWING_THRESHOLD:
-                    clearance_dist = self.config.anchor_gap + self.config.EXIT_SWING_CLEARANCE
-                    clearance_pos = prev_pos + prev_normal * clearance_dist
-                    raw_path.append(
-                        SkeletonPoint(
-                            clearance_pos, False, None, None, None, gate_idx=prev_gate_idx
-                        )
-                    )
+        def cubic_hermite_spline(p0: NDArray, m0: NDArray, p1: NDArray, m1: NDArray, t: float) -> NDArray:
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2 * t3 - 3 * t2 + 1
+            h10 = t3 - 2 * t2 + t
+            h01 = -2 * t3 + 3 * t2
+            h11 = t3 - t2
+            return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
 
+        points_and_attrs = []
+        
+        # Add drone pos and vel as first point
+        points_and_attrs.append({
+            "pos": current_pos,
+            "dir": current_vel / np.linalg.norm(current_vel) if np.linalg.norm(current_vel) > 1e-3 else current_vel,
+            "is_drone": True
+        })
+        
+        # Add all subsequent gates
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
-            # pos[2] += 0.00  # Add upward bias to counter altitude drop
             normal = gate_normals[i].copy()
             rot = R.from_quat(self.gates_quat[i])
             right = rot.apply([0, 1, 0])
             up = rot.apply([0, 0, 1])
-
-            flow_dir = pos - raw_path[-1].pos
-
-            # ENTRY SWING (U-turn approach logic). Computed against gate centre
-            # rather than a pre_pos anchor — same dot-product test, ~0.5 m
-            if np.dot(flow_dir, normal) < self.config.ENTRY_SWING_THRESHOLD:
-                if np.dot(raw_path[-1].pos - pos, right) > 0:
-                    swing_pos = pos + right * self.config.ENTRY_SWING_OFFSET
-                else:
-                    swing_pos = pos - right * self.config.ENTRY_SWING_OFFSET
-                raw_path.append(SkeletonPoint(swing_pos, False, None, None, None, gate_idx=i))
-
-            raw_path.append(SkeletonPoint(pos, True, normal, right, up, gate_idx=i))
-
-            # EXIT SWING (Hairpin / Reversal Logic)
-            if i + 1 < len(self.gates_pos):
-                next_pos = self.gates_pos[i + 1]
-                # Test against pos + normal * anchor_gap, the canonical post-gate
-                # exit point, even though no post_pos anchor is in the skeleton.
-                exit_vector = next_pos - (pos + normal * self.config.anchor_gap)
-                if np.dot(exit_vector, normal) < self.config.EXIT_SWING_THRESHOLD:
-                    clearance_dist = self.config.anchor_gap + self.config.EXIT_SWING_CLEARANCE
-                    clearance_pos = pos + normal * clearance_dist
-                    raw_path.append(
-                        SkeletonPoint(clearance_pos, False, None, None, None, gate_idx=i)
-                    )
-                    side_offset = self.config.EXIT_SWING_SIDE_OFFSET
-                    back_offset = self.config.EXIT_SWING_BACK_OFFSET
-                    if np.dot(exit_vector, right) > 0:
-                        exit_swing = clearance_pos + right * side_offset - normal * back_offset
-                    else:
-                        exit_swing = clearance_pos - right * side_offset - normal * back_offset
-                    raw_path.append(SkeletonPoint(exit_swing, False, None, None, None, gate_idx=i))
-
-        # Add an additional waypoint after the final gate to maintain speed through the finish line
+            
+            points_and_attrs.append({
+                "pos": pos,
+                "dir": normal,
+                "normal": normal,
+                "right": right,
+                "up": up,
+                "gate_idx": i,
+                "is_drone": False
+            })
+            
+            # Add a point just after the gate to force the MPCC to pass through cleanly
+            post_pos = pos + normal * self.config.anchor_gap
+            points_and_attrs.append({
+                "pos": post_pos,
+                "dir": normal,
+                "gate_idx": i,
+                "is_drone": False
+            })
+            
+        # Add finish line if needed
         if len(self.gates_pos) > 0 and self.target_gate_idx <= len(self.gates_pos):
             last_gate_idx = len(self.gates_pos) - 1
             last_pos = self.gates_pos[last_gate_idx]
             last_normal = gate_normals[last_gate_idx]
             finish_pos = last_pos + last_normal * self.config.FINISH_LINE_EXT_DIST
-            raw_path.append(
-                SkeletonPoint(finish_pos, False, None, None, None, gate_idx=last_gate_idx)
-            )
+            points_and_attrs.append({
+                "pos": finish_pos,
+                "dir": last_normal,
+                "gate_idx": last_gate_idx,
+                "is_drone": False
+            })
+            
+        for i in range(len(points_and_attrs) - 1):
+            pt0 = points_and_attrs[i]
+            pt1 = points_and_attrs[i + 1]
+            dist = np.linalg.norm(pt1["pos"] - pt0["pos"])
+            
+            if pt0["is_drone"]:
+                m0 = current_vel * self.config.HERMITE_TANGENT_SCALE_DRONE
+            else:
+                m0 = pt0["dir"] * dist * self.config.HERMITE_TANGENT_SCALE_GATE
+                
+            m1 = pt1["dir"] * dist * self.config.HERMITE_TANGENT_SCALE_GATE
+            
+            # Sample Hermite curve
+            samples = self.config.HERMITE_SAMPLES_PER_SEGMENT
+            for j in range(1, samples):
+                t = j / samples
+                pt = cubic_hermite_spline(pt0["pos"], m0, pt1["pos"], m1, t)
+                raw_path.append(SkeletonPoint(pt, False, None, None, None, gate_idx=pt1.get("gate_idx")))
+                
+            raw_path.append(SkeletonPoint(
+                pt1["pos"], 
+                "normal" in pt1, 
+                pt1.get("normal"), 
+                pt1.get("right"), 
+                pt1.get("up"), 
+                gate_idx=pt1.get("gate_idx")
+            ))
 
         return raw_path
 
-    def _apply_obstacle_avoidance(self, raw_path: list[SkeletonPoint]) -> list[SkeletonPoint]:
-        obs_circles = []
+    def _apply_3d_obstacle_repulsion(self, raw_path: list[SkeletonPoint]) -> list[SkeletonPoint]:
         margin = self.config.OBSTACLE_AVOIDANCE_MARGIN
+        capsules = []
+        
         for p in self.obstacles_pos:
-            obs_circles.append((p[:2], self.config.pole_radius + margin))
+            capsules.append((np.array([p[0], p[1], 0.0]), np.array([p[0], p[1], self.config.pole_height]), self.config.pole_radius + margin))
+            
         for j, (p, q) in enumerate(zip(self.gates_pos, self.gates_quat)):
             rot = R.from_quat(q)
             right = rot.apply([0, 1, 0])
+            up = rot.apply([0, 0, 1])
             bar_dist = self.config.gate_bar_dist
-            obs_radius = self.config.gate_bar_radius + self.config.OBSTACLE_AVOIDANCE_MARGIN
-            obs_circles.append(((p - right * bar_dist)[:2], obs_radius))
-            obs_circles.append(((p + right * bar_dist)[:2], obs_radius))
+            obs_radius = self.config.gate_bar_radius + margin
+            half_outer = self.config.gate_outer / 2.0
+            capsules.append((p + up * bar_dist - right * half_outer, p + up * bar_dist + right * half_outer, obs_radius))
+            capsules.append((p - up * bar_dist - right * half_outer, p - up * bar_dist + right * half_outer, obs_radius))
+            capsules.append((p - right * bar_dist + up * half_outer, p - right * bar_dist - up * half_outer, obs_radius))
+            capsules.append((p + right * bar_dist + up * half_outer, p + right * bar_dist - up * half_outer, obs_radius))
 
         path = raw_path
         for _ in range(3):
-            new_path = [path[0]]
-            for i in range(1, len(path)):
-                prev_pt = new_path[-1].pos
-                curr_pt = path[i].pos
-
-                AB = curr_pt[:2] - prev_pt[:2]
-                len_sq = np.dot(AB, AB)
-
-                if len_sq > 1e-6:
-                    first_t = 1.0
-                    avoid_pt = None
-
-                    for C, safe_radius in obs_circles:
-                        dot_val = np.dot(C - prev_pt[:2], AB)
-                        t = np.clip(dot_val / len_sq, 0.0, 1.0)
-                        projection = prev_pt[:2] + t * AB
-                        dist = np.linalg.norm(projection - C)
-
-                        if dist < safe_radius and t < first_t:
-                            first_t = t
-                            push_dir = (
-                                (projection - C) / dist
-                                if dist > 1e-6
-                                else np.array([-AB[1], AB[0]]) / np.linalg.norm(AB)
-                            )
-
-                            push_extra = self.config.OBSTACLE_AVOIDANCE_PUSH_EXTRA
-                            avoidance_pt_2d = C + push_dir * (safe_radius + push_extra)
-                            avoidance_z = prev_pt[2] + t * (curr_pt[2] - prev_pt[2])
-
-                            proposed_pos = np.array(
-                                [avoidance_pt_2d[0], avoidance_pt_2d[1], avoidance_z]
-                            )
-
-                            min_dist = self.config.OBSTACLE_AVOIDANCE_MIN_DIST
-                            if (
-                                np.linalg.norm(proposed_pos - prev_pt) > min_dist
-                                and np.linalg.norm(proposed_pos - curr_pt) > min_dist
-                            ):
-                                avoid_pt = SkeletonPoint(proposed_pos, False, None, None, None)
-
-                    if avoid_pt is not None:
-                        new_path.append(avoid_pt)
-
-                new_path.append(path[i])
+            new_path = []
+            for i, pt in enumerate(path):
+                if pt.is_gate or i == 0 or i == len(path) - 1:
+                    new_path.append(pt)
+                    continue
+                
+                curr_pos = pt.pos.copy()
+                push_accum = np.zeros(3)
+                
+                for c1, c2, safe_radius in capsules:
+                    # Point-to-segment distance
+                    v = c2 - c1
+                    w = curr_pos - c1
+                    v_sq = np.dot(v, v)
+                    t = np.clip(np.dot(w, v) / v_sq, 0.0, 1.0) if v_sq > 1e-6 else 0.0
+                    closest = c1 + t * v
+                    diff = curr_pos - closest
+                    dist = np.linalg.norm(diff)
+                    
+                    if dist < safe_radius:
+                        push_dir = diff / dist if dist > 1e-6 else np.array([1.0, 0.0, 0.0])
+                        push_amount = safe_radius - dist + self.config.OBSTACLE_AVOIDANCE_PUSH_EXTRA
+                        push_accum += push_dir * push_amount
+                        
+                if np.linalg.norm(push_accum) > 0:
+                    new_pos = curr_pos + push_accum
+                    new_path.append(SkeletonPoint(new_pos, pt.is_gate, pt.gate_normal, pt.gate_right, pt.gate_up, pt.gate_idx))
+                else:
+                    new_path.append(pt)
             path = new_path
+            
         return path
 
-    def _calculate_anchors(self, current_pos: NDArray) -> list[SkeletonPoint]:
-        raw_path = self._build_raw_skeleton(current_pos)
-        path = self._apply_obstacle_avoidance(raw_path)
+    def _calculate_anchors(self, current_pos: NDArray, current_vel: NDArray) -> list[SkeletonPoint]:
+        raw_path = self._build_analytical_skeleton(current_pos, current_vel)
+        path = self._apply_3d_obstacle_repulsion(raw_path)
 
         low = np.array(self.config.CORRIDOR_LIMIT_LOW) + self.config.CORRIDOR_BUFFER
         high = np.array(self.config.CORRIDOR_LIMIT_HIGH) - self.config.CORRIDOR_BUFFER

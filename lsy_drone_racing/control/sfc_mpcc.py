@@ -406,7 +406,7 @@ class AttitudeMPC(Controller):
     def _update_current_theta(self, pos: np.ndarray) -> None:
         """Update the path progress parameter `theta` based on current drone position."""
         s_eval = np.linspace(
-            max(0, self._current_theta - 0.5), min(self._s_total, self._current_theta + 0.5), 20
+            max(0, self._current_theta - 0.05), min(self._s_total, self._current_theta + 0.5), 20
         )
         dists = np.linalg.norm(self._des_pos_spline(s_eval) - pos, axis=1)
         self._current_theta = float(s_eval[np.argmin(dists)])
