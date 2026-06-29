@@ -757,11 +757,15 @@ class SfcCorridorPlanner:
             logger.warning(f"SFC CasADi QP failed: {e}. Relaxing constraints.")
             return v_ref[:n_ctrl]
 
-    def _build_analytical_skeleton(self, current_pos: NDArray, current_vel: NDArray) -> list[SkeletonPoint]:
+    def _build_analytical_skeleton(
+        self, current_pos: NDArray, current_vel: NDArray
+    ) -> list[SkeletonPoint]:
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
-        def cubic_hermite_spline(p0: NDArray, m0: NDArray, p1: NDArray, m1: NDArray, t: float) -> NDArray:
+        def cubic_hermite_spline(
+            p0: NDArray, m0: NDArray, p1: NDArray, m1: NDArray, t: float
+        ) -> NDArray:
             t2 = t * t
             t3 = t2 * t
             h00 = 2 * t3 - 3 * t2 + 1
@@ -771,14 +775,18 @@ class SfcCorridorPlanner:
             return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
 
         points_and_attrs = []
-        
+
         # Add drone pos and vel as first point
-        points_and_attrs.append({
-            "pos": current_pos,
-            "dir": current_vel / np.linalg.norm(current_vel) if np.linalg.norm(current_vel) > 1e-3 else current_vel,
-            "is_drone": True
-        })
-        
+        points_and_attrs.append(
+            {
+                "pos": current_pos,
+                "dir": current_vel / np.linalg.norm(current_vel)
+                if np.linalg.norm(current_vel) > 1e-3
+                else current_vel,
+                "is_drone": True,
+            }
+        )
+
         # Add all subsequent gates
         for i in range(self.target_gate_idx, len(self.gates_pos)):
             pos = self.gates_pos[i].copy()
@@ -786,76 +794,87 @@ class SfcCorridorPlanner:
             rot = R.from_quat(self.gates_quat[i])
             right = rot.apply([0, 1, 0])
             up = rot.apply([0, 0, 1])
-            
-            points_and_attrs.append({
-                "pos": pos,
-                "dir": normal,
-                "normal": normal,
-                "right": right,
-                "up": up,
-                "gate_idx": i,
-                "is_drone": False
-            })
-            
+
+            points_and_attrs.append(
+                {
+                    "pos": pos,
+                    "dir": normal,
+                    "normal": normal,
+                    "right": right,
+                    "up": up,
+                    "gate_idx": i,
+                    "is_drone": False,
+                }
+            )
+
             # Add a point just after the gate to force the MPCC to pass through cleanly
             post_pos = pos + normal * self.config.anchor_gap
-            points_and_attrs.append({
-                "pos": post_pos,
-                "dir": normal,
-                "gate_idx": i,
-                "is_drone": False
-            })
-            
+            points_and_attrs.append(
+                {"pos": post_pos, "dir": normal, "gate_idx": i, "is_drone": False}
+            )
+
         # Add finish line if needed
         if len(self.gates_pos) > 0 and self.target_gate_idx <= len(self.gates_pos):
             last_gate_idx = len(self.gates_pos) - 1
             last_pos = self.gates_pos[last_gate_idx]
             last_normal = gate_normals[last_gate_idx]
             finish_pos = last_pos + last_normal * self.config.FINISH_LINE_EXT_DIST
-            points_and_attrs.append({
-                "pos": finish_pos,
-                "dir": last_normal,
-                "gate_idx": last_gate_idx,
-                "is_drone": False
-            })
-            
+            points_and_attrs.append(
+                {
+                    "pos": finish_pos,
+                    "dir": last_normal,
+                    "gate_idx": last_gate_idx,
+                    "is_drone": False,
+                }
+            )
+
         for i in range(len(points_and_attrs) - 1):
             pt0 = points_and_attrs[i]
             pt1 = points_and_attrs[i + 1]
             dist = np.linalg.norm(pt1["pos"] - pt0["pos"])
-            
+
             if pt0["is_drone"]:
                 m0 = current_vel * self.config.HERMITE_TANGENT_SCALE_DRONE
             else:
                 m0 = pt0["dir"] * dist * self.config.HERMITE_TANGENT_SCALE_GATE
-                
+
             m1 = pt1["dir"] * dist * self.config.HERMITE_TANGENT_SCALE_GATE
-            
+
             # Sample Hermite curve
             samples = self.config.HERMITE_SAMPLES_PER_SEGMENT
             for j in range(1, samples):
                 t = j / samples
                 pt = cubic_hermite_spline(pt0["pos"], m0, pt1["pos"], m1, t)
-                raw_path.append(SkeletonPoint(pt, False, None, None, None, gate_idx=pt1.get("gate_idx")))
-                
-            raw_path.append(SkeletonPoint(
-                pt1["pos"], 
-                "normal" in pt1, 
-                pt1.get("normal"), 
-                pt1.get("right"), 
-                pt1.get("up"), 
-                gate_idx=pt1.get("gate_idx")
-            ))
+                raw_path.append(
+                    SkeletonPoint(pt, False, None, None, None, gate_idx=pt1.get("gate_idx"))
+                )
+
+            raw_path.append(
+                SkeletonPoint(
+                    pt1["pos"],
+                    "normal" in pt1,
+                    pt1.get("normal"),
+                    pt1.get("right"),
+                    pt1.get("up"),
+                    gate_idx=pt1.get("gate_idx"),
+                )
+            )
 
         return raw_path
 
     def _apply_3d_obstacle_repulsion(self, raw_path: list[SkeletonPoint]) -> list[SkeletonPoint]:
         margin = self.config.OBSTACLE_AVOIDANCE_MARGIN
         capsules = []
-        
+
         for p in self.obstacles_pos:
-            capsules.append((np.array([p[0], p[1], 0.0]), np.array([p[0], p[1], self.config.pole_height]), self.config.pole_radius + margin))
-            
+            capsules.append(
+                (
+                    np.array([p[0], p[1], 0.0]),
+                    np.array([p[0], p[1], self.config.pole_height]),
+                    self.config.pole_radius + margin,
+                )
+            )
+
         for j, (p, q) in enumerate(zip(self.gates_pos, self.gates_quat)):
             rot = R.from_quat(q)
             right = rot.apply([0, 1, 0])
@@ -863,22 +882,46 @@ class SfcCorridorPlanner:
             bar_dist = self.config.gate_bar_dist
             obs_radius = self.config.gate_bar_radius + margin
             half_outer = self.config.gate_outer / 2.0
-            capsules.append((p + up * bar_dist - right * half_outer, p + up * bar_dist + right * half_outer, obs_radius))
-            capsules.append((p - up * bar_dist - right * half_outer, p - up * bar_dist + right * half_outer, obs_radius))
-            capsules.append((p - right * bar_dist + up * half_outer, p - right * bar_dist - up * half_outer, obs_radius))
-            capsules.append((p + right * bar_dist + up * half_outer, p + right * bar_dist - up * half_outer, obs_radius))
+            capsules.append(
+                (
+                    p + up * bar_dist - right * half_outer,
+                    p + up * bar_dist + right * half_outer,
+                    obs_radius,
+                )
+            )
+            capsules.append(
+                (
+                    p - up * bar_dist - right * half_outer,
+                    p - up * bar_dist + right * half_outer,
+                    obs_radius,
+                )
+            )
+            capsules.append(
+                (
+                    p - right * bar_dist + up * half_outer,
+                    p - right * bar_dist - up * half_outer,
+                    obs_radius,
+                )
+            )
+            capsules.append(
+                (
+                    p + right * bar_dist + up * half_outer,
+                    p + right * bar_dist - up * half_outer,
+                    obs_radius,
+                )
+            )
 
         path = raw_path
         for _ in range(3):
             new_path = []
             for i, pt in enumerate(path):
-                if pt.is_gate or i == 0 or i == len(path) - 1:
+                if i == 0 or i == len(path) - 1:
                     new_path.append(pt)
                     continue
-                
+
                 curr_pos = pt.pos.copy()
                 push_accum = np.zeros(3)
-                
+
                 for c1, c2, safe_radius in capsules:
                     # Point-to-segment distance
                     v = c2 - c1
@@ -888,19 +931,38 @@ class SfcCorridorPlanner:
                     closest = c1 + t * v
                     diff = curr_pos - closest
                     dist = np.linalg.norm(diff)
-                    
+
                     if dist < safe_radius:
                         push_dir = diff / dist if dist > 1e-6 else np.array([1.0, 0.0, 0.0])
                         push_amount = safe_radius - dist + self.config.OBSTACLE_AVOIDANCE_PUSH_EXTRA
                         push_accum += push_dir * push_amount
-                        
+
                 if np.linalg.norm(push_accum) > 0:
+                    if pt.is_gate and pt.gate_normal is not None:
+                        # Project push onto gate plane to keep the waypoint inside the gate frame
+                        push_accum -= np.dot(push_accum, pt.gate_normal) * pt.gate_normal
+
+                        # Limit the push to stay within the inner gate dimensions
+                        max_push = (self.config.gate_inner / 2.0) * 0.5
+                        push_mag = np.linalg.norm(push_accum)
+                        if push_mag > max_push:
+                            push_accum = (push_accum / push_mag) * max_push
+
                     new_pos = curr_pos + push_accum
-                    new_path.append(SkeletonPoint(new_pos, pt.is_gate, pt.gate_normal, pt.gate_right, pt.gate_up, pt.gate_idx))
+                    new_path.append(
+                        SkeletonPoint(
+                            new_pos,
+                            pt.is_gate,
+                            pt.gate_normal,
+                            pt.gate_right,
+                            pt.gate_up,
+                            pt.gate_idx,
+                        )
+                    )
                 else:
                     new_path.append(pt)
             path = new_path
-            
+
         return path
 
     def _calculate_anchors(self, current_pos: NDArray, current_vel: NDArray) -> list[SkeletonPoint]:
