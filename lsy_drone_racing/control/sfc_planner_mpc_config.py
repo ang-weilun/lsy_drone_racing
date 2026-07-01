@@ -43,13 +43,16 @@ class PlannerConfig:
     """Minimum number of ticks to wait before allowing another replan."""
 
     # --- Geometry / Spline Builder ---
-    anchor_gap: float = 0.9
-    """Distance (m) from gate to place entry/exit anchors along the normal."""
+    pre_gate_entry_dist: float = 0.7
+    """Distance (m) from gate to place entry anchor along the normal."""
+
+    anchor_gap: float = 0.7
+    """Distance (m) from gate to place exit anchors along the normal."""
 
     points_per_segment: int = 4
     """Number of B-spline control points per inter-gate segment."""
 
-    safety_margin: float = 0.15
+    safety_margin: float = 0.2
     """Extra collision margin (m) added to obstacle and gate radii."""
 
     # --- Drone/Track Physical Dimensions ---
