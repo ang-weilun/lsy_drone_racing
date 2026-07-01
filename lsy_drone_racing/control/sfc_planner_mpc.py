@@ -32,6 +32,7 @@ class SkeletonPoint(NamedTuple):
     gate_up: NDArray | None
     gate_idx: int | None = None
     is_in_tube: bool = False
+    is_waypoint: bool = False
 
 
 class Capsule(NamedTuple):
@@ -441,6 +442,9 @@ class SfcCorridorPlanner:
         self.is_gate_ca = self.opti.parameter(self.MAX_CTRL)
         self.gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
 
+        self.is_waypoint_ca = self.opti.parameter(self.MAX_CTRL)
+        self.waypoint_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
+
         self.tube_mask_ca = self.opti.parameter(self.MAX_CTRL)
         self.tube_gate_pos_ca = self.opti.parameter(self.MAX_CTRL, 3)
         self.tube_normal_ca = self.opti.parameter(self.MAX_CTRL, 3)
@@ -503,6 +507,11 @@ class SfcCorridorPlanner:
                 self.config.W_GATE_HARD
                 * self.end_mask_ca[i]
                 * ca.sumsqr(self.P_ca[i, :].T - self.end_pos_ca)
+            )
+            cost += (
+                self.config.W_WAYPOINT_SOFT
+                * self.is_waypoint_ca[i]
+                * ca.sumsqr(self.P_ca[i, :].T - self.waypoint_pos_ca[i, :].T)
             )
 
         cost += self.config.W_P0_REF * ca.sumsqr(self.P_ca[0, :].T - self.P0_ref_ca)
@@ -586,6 +595,8 @@ class SfcCorridorPlanner:
     ) -> dict:
         v_is_gate = np.zeros(self.MAX_CTRL)
         v_gate_pos = np.zeros((self.MAX_CTRL, 3))
+        v_is_waypoint = np.zeros(self.MAX_CTRL)
+        v_waypoint_pos = np.zeros((self.MAX_CTRL, 3))
         v_tube_mask = np.zeros(self.MAX_CTRL)
         v_tube_gate = np.zeros((self.MAX_CTRL, 3))
         v_tube_norm = np.zeros((self.MAX_CTRL, 3))
@@ -645,10 +656,15 @@ class SfcCorridorPlanner:
                     v_align_mask[cp_idx] = 1.0
                     v_tube_gate[cp_idx] = skeleton_path[i].pos
                     v_tube_norm[cp_idx] = skeleton_path[i].gate_normal
+            if getattr(skeleton_path[i], "is_waypoint", False):
+                v_is_waypoint[cp_idx] = 1.0
+                v_waypoint_pos[cp_idx] = skeleton_path[i].pos
 
         return {
             "is_gate": v_is_gate,
             "gate_pos": v_gate_pos,
+            "is_waypoint": v_is_waypoint,
+            "waypoint_pos": v_waypoint_pos,
             "tube_mask": v_tube_mask,
             "tube_gate": v_tube_gate,
             "tube_norm": v_tube_norm,
@@ -744,6 +760,8 @@ class SfcCorridorPlanner:
         self.opti.set_value(self.b_corr_ca, corridor_params["b"])
         self.opti.set_value(self.is_gate_ca, gate_params["is_gate"])
         self.opti.set_value(self.gate_pos_ca, gate_params["gate_pos"])
+        self.opti.set_value(self.is_waypoint_ca, gate_params["is_waypoint"])
+        self.opti.set_value(self.waypoint_pos_ca, gate_params["waypoint_pos"])
         self.opti.set_value(self.tube_mask_ca, gate_params["tube_mask"])
         self.opti.set_value(self.tube_gate_pos_ca, gate_params["tube_gate"])
         self.opti.set_value(self.tube_normal_ca, gate_params["tube_norm"])
@@ -814,11 +832,8 @@ class SfcCorridorPlanner:
                 {
                     "pos": pre_pos,
                     "dir": normal,
-                    "normal": normal,
-                    "right": right,
-                    "up": up,
                     "gate_idx": i,
-                    "is_tube": True,
+                    "is_waypoint": True,
                     "is_drone": False,
                 }
             )
@@ -842,11 +857,8 @@ class SfcCorridorPlanner:
                 {
                     "pos": post_pos,
                     "dir": normal,
-                    "normal": normal,
-                    "right": right,
-                    "up": up,
                     "gate_idx": i,
-                    "is_tube": True,
+                    "is_waypoint": True,
                     "is_drone": False,
                 }
             )
@@ -905,6 +917,7 @@ class SfcCorridorPlanner:
                     pt1.get("up"),
                     gate_idx=pt1.get("gate_idx"),
                     is_in_tube=pt1.get("is_tube", False),
+                    is_waypoint=pt1.get("is_waypoint", False),
                 )
             )
 

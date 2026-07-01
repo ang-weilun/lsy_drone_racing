@@ -118,6 +118,9 @@ class PlannerConfig:
     W_GATE_HARD: float = 1e5
     """Constraint penalty multiplier forcing gate-control points to match gate centers exactly."""
 
+    W_WAYPOINT_SOFT: float = 1e3
+    """Penalty multiplier to encourage passing near intermediate waypoints."""
+
     # --- Heuristics, Swing Waypoints & Exit Mechanics ---
     PREV_GATE_EXIT_THRESHOLD: float = 0.4
     """Maximum distance (m) along gate normal within which the
