@@ -42,7 +42,7 @@ class MPCCConfig:
     """Penalty for entering the obstacle barrier."""
 
     # --- Reference Parameters ---
-    mu: float = 10.0
+    mu: float = 15.0
     """Speed scaling; reference virtual velocity v_ref = mu / W_v_theta."""
 
     # --- Smoothness Penalties ---
