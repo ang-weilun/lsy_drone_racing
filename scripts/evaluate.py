@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     """Run the simulation N times and save the results as 'evaluation.csv'."""
-    n_runs = 20
+    n_runs = 50
     config_file = "level2.toml"
     config = load_config(Path(__file__).parents[1] / "config" / config_file)
     ep_times = simulate(
@@ -35,8 +35,18 @@ def main():
         logger.error("More than 50% of all runs failed! Aborting evaluation.")
         raise RuntimeError("Too many runs failed!")
 
-    successful_times_avg = np.mean([x for x in ep_times if x is not None])
-    logger.info(f"Average Time: successful_times_avg (s): {successful_times_avg}")
+    successful_times = [x for x in ep_times if x is not None]
+    successful_times_avg = np.mean(successful_times)
+    successful_times_std = np.std(successful_times)
+    successful_times_median = np.median(successful_times)
+    successful_times_min = np.min(successful_times)
+    successful_times_max = np.max(successful_times)
+    
+    logger.info(f"Average Time (s): {successful_times_avg:.3f}")
+    logger.info(f"Std Dev (s): {successful_times_std:.3f}")
+    logger.info(f"Median Time (s): {successful_times_median:.3f}")
+    logger.info(f"Min Time (s): {successful_times_min:.3f}")
+    logger.info(f"Max Time (s): {successful_times_max:.3f}")
     logger.info(f"Success Rate: {success_rate * 100}%")
     file = Path(__file__).parents[1] / "evaluation.csv"
     with open(file, "w") as f:
