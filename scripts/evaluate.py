@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def main():
     """Run the simulation N times and save the results as 'evaluation.csv'."""
     n_runs = 50
-    config_file = "level2.toml"
+    config_file = "level3.toml"
     config = load_config(Path(__file__).parents[1] / "config" / config_file)
     ep_times = simulate(
         config=config_file, controller=config.controller.file, n_runs=n_runs, render=False
