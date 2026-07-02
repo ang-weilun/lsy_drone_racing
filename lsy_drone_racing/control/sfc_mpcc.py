@@ -134,7 +134,15 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 
 
 def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
-    """Build the C1-continuous barrier function for obstacle avoidance."""
+    """Build the C1-continuous barrier function for obstacle avoidance.
+
+    Args:
+        p_capsules: The symbolic representation of obstacle capsules.
+        pos: The symbolic representation of the drone position.
+
+    Returns:
+        The barrier penalty expression.
+    """
     y_obs = cs.MX.zeros(24)
     for i in range(24):
         p1 = p_capsules[i * 7 + 0 : i * 7 + 3]
@@ -159,7 +167,14 @@ def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
 
 
 def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Get the cost weight matrices for the MPCC."""
+    """Get the cost weight matrices for the MPCC.
+
+    Args:
+        config: The MPCC configuration.
+
+    Returns:
+        A tuple of (W, W_e) weight matrices.
+    """
     W_diag = [
         config.Q_c,
         config.Q_c,
@@ -205,7 +220,17 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
 def create_ocp_solver(
     time_steps: np.ndarray, parameters: dict, config: MPCCConfig, verbose: bool = False
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Create the Acados OCP solver for the MPCC."""
+    """Create the Acados OCP solver for the MPCC.
+
+    Args:
+        time_steps: The time step schedule for the MPC horizon.
+        parameters: The drone parameters dictionary.
+        config: The MPCC configuration.
+        verbose: Whether to print Acados solver output.
+
+    Returns:
+        A tuple of the configured AcadosOcpSolver and AcadosOcp instance.
+    """
     ocp = AcadosOcp()
     ocp.model = create_acados_model(parameters)
 
@@ -404,7 +429,11 @@ class AttitudeMPC(Controller):
         self._s_total = float(s[-1])
 
     def _update_current_theta(self, pos: np.ndarray) -> None:
-        """Update the path progress parameter `theta` based on current drone position."""
+        """Update the path progress parameter `theta` based on current drone position.
+
+        Args:
+            pos: The current 3D position of the drone.
+        """
         s_eval = np.linspace(
             max(0, self._current_theta - 0.05), min(self._s_total, self._current_theta + 0.5), 20
         )
@@ -443,7 +472,14 @@ class AttitudeMPC(Controller):
     def _extract_closest_obstacles(
         self, ref_points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, float]:
-        """Extract the closest obstacle capsules and gate flags for the MPC horizon."""
+        """Extract the closest obstacle capsules and gate flags for the MPC horizon.
+
+        Args:
+            ref_points: The reference positions along the horizon to check against.
+
+        Returns:
+            A tuple of (capsule_params, is_gate_flags, min_obs_dist).
+        """
         capsule_params = np.zeros(168)
         for i in range(24):
             capsule_params[i * 7 : i * 7 + 6] = 1000.0
@@ -471,7 +507,13 @@ class AttitudeMPC(Controller):
         return capsule_params, is_gate_flags, min_obs_dist
 
     def _warm_start_solver(self, x0: np.ndarray, replanned: bool, obs: dict) -> None:
-        """Warm-start the OCP solver with the initial state and reference."""
+        """Warm-start the OCP solver with the initial state and reference.
+
+        Args:
+            x0: The initial state vector.
+            replanned: Whether the path was just replanned.
+            obs: The current observation dict.
+        """
         self._acados_ocp_solver.set(0, "lbx", x0)
         self._acados_ocp_solver.set(0, "ubx", x0)
 
@@ -522,7 +564,11 @@ class AttitudeMPC(Controller):
             self._acados_ocp_solver.set(0, "x", x0)
 
     def _set_mpc_horizon_parameters(self, capsule_params: np.ndarray) -> None:
-        """Set the reference parameters and cost weights along the MPC horizon."""
+        """Set the reference parameters and cost weights along the MPC horizon.
+
+        Args:
+            capsule_params: Flattened array of obstacle capsule parameters.
+        """
         gates_pos = getattr(self.planner, "gates_pos", None)
         target_gate_idx = getattr(self.planner, "target_gate_idx", -1)
         for j in range(self._N + 1):
@@ -558,7 +604,14 @@ class AttitudeMPC(Controller):
             self._acados_ocp_solver.cost_set(j, "W", W)
 
     def _compute_hover_control(self, obs: dict[str, np.ndarray]) -> np.ndarray:
-        """Compute hover fallback control if MPCC fails."""
+        """Compute hover fallback control if MPCC fails.
+
+        Args:
+            obs: The current observation dict.
+
+        Returns:
+            The fallback control command array.
+        """
         if not hasattr(self, "_hover_pos"):
             self._hover_pos = obs["pos"].copy()
 

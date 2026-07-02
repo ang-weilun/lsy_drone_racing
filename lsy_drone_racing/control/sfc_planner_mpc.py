@@ -71,7 +71,12 @@ class FlightCorridor:
         self.add_halfspace(np.array([0, -1, 0]), np.array([0, limit_low[1], 0]))
 
     def add_halfspace(self, n: NDArray, p: NDArray):
-        """Adds a constraint (x - p) * n <= 0, where n is the OUTWARD normal."""
+        """Adds a constraint (x - p) * n <= 0, where n is the OUTWARD normal.
+
+        Args:
+            n: Outward normal vector of the halfspace.
+            p: A point on the halfspace plane.
+        """
         self.A.append(n)
         self.b.append(np.dot(n, p))
 
@@ -79,7 +84,17 @@ class FlightCorridor:
 def closest_points_segments(
     p1: NDArray, q1: NDArray, p2: NDArray, q2: NDArray
 ) -> tuple[NDArray, NDArray]:
-    """Finds the closest points c1 on segment p1-q1 and c2 on segment p2-q2."""
+    """Finds the closest points c1 on segment p1-q1 and c2 on segment p2-q2.
+
+    Args:
+        p1: Start point of the first segment.
+        q1: End point of the first segment.
+        p2: Start point of the second segment.
+        q2: End point of the second segment.
+
+    Returns:
+        A tuple of (c1, c2) representing the closest points on each segment.
+    """
     d1 = q1 - p1
     d2 = q2 - p2
     r = p1 - p2
@@ -148,7 +163,14 @@ class SfcCorridorPlanner:
         self._record_replan_event(reason="init")
 
     def update(self, obs: dict[str, NDArray]) -> bool:
-        """Sync target_gate_idx from obs and replan if any object moved or gate passed."""
+        """Sync target_gate_idx from obs and replan if any object moved or gate passed.
+
+        Args:
+            obs: The current observation dict containing gate and obstacle positions.
+
+        Returns:
+            True if a replan was triggered, False otherwise.
+        """
         self._tick += 1
 
         env_target = int(obs.get("target_gate", self.target_gate_idx))
@@ -251,6 +273,12 @@ class SfcCorridorPlanner:
         self._traj_history = []
 
     def _build_spline(self, current_pos: NDArray, current_vel: NDArray) -> None:
+        """Build the B-spline path based on the current state and track.
+
+        Args:
+            current_pos: The current 3D position of the drone.
+            current_vel: The current 3D velocity of the drone.
+        """
         skeleton_path = self._calculate_anchors(current_pos[:3], current_vel)
         self.skeleton_path = skeleton_path
         self._current_pos_for_spline = current_pos[:3].copy()
@@ -280,6 +308,11 @@ class SfcCorridorPlanner:
         self._des_pos_spline = BSpline(knots, control_points, k)
 
     def _get_all_obstacle_capsules(self) -> list[Capsule]:
+        """Convert poles and gates into obstacle capsules.
+
+        Returns:
+            A list of constructed Capsule objects.
+        """
         capsules = []
         margin = self.config.safety_margin
 
@@ -356,7 +389,15 @@ class SfcCorridorPlanner:
     def _generate_flight_corridors(
         self, skeleton_path: list[SkeletonPoint], capsules: list[Capsule]
     ) -> list[FlightCorridor]:
-        """Constructs a convex polyhedron for each segment via separating planes."""
+        """Constructs a convex polyhedron for each segment via separating planes.
+
+        Args:
+            skeleton_path: The list of skeleton anchor points.
+            capsules: The list of obstacle capsules.
+
+        Returns:
+            A list of FlightCorridor objects representing safe convex spaces.
+        """
         # Precompute per-gate normal in world frame; used to scope the gate-skip rule.
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         corridors = []
@@ -425,6 +466,7 @@ class SfcCorridorPlanner:
         return corridors
 
     def _init_casadi_planner(self) -> None:
+        """Initialize the CasADi optimization problem for B-spline control points."""
         import casadi as ca
 
         self.MAX_CTRL = self.config.MAX_CTRL
@@ -560,6 +602,16 @@ class SfcCorridorPlanner:
     def _prepare_corridor_constraints(
         self, corridors: list[FlightCorridor], n_pts_first: int, n_pts_rest: int
     ) -> tuple[int, dict]:
+        """Pack flight corridor polyhedron constraints into CasADi parameters.
+
+        Args:
+            corridors: List of flight corridor constraints.
+            n_pts_first: Number of control points in the first segment.
+            n_pts_rest: Number of control points in subsequent segments.
+
+        Returns:
+            A tuple of (number of active points, dictionary of packed constraints).
+        """
         v_mask = np.zeros(self.MAX_CTRL)
         v_ref = np.zeros((self.MAX_CTRL, 3))
         v_A = np.zeros((self.MAX_CTRL * self.MAX_PLANES, 3))
@@ -593,6 +645,18 @@ class SfcCorridorPlanner:
         n_pts_first: int,
         n_pts_rest: int,
     ) -> dict:
+        """Prepare CasADi parameters for gate positions and tube constraints.
+
+        Args:
+            skeleton_path: The sequence of anchor points containing gate info.
+            n_segments: Number of path segments.
+            n_ctrl: Total number of control points.
+            n_pts_first: Control points for the first segment.
+            n_pts_rest: Control points for subsequent segments.
+
+        Returns:
+            A dictionary of mapped gate position and alignment parameters.
+        """
         v_is_gate = np.zeros(self.MAX_CTRL)
         v_gate_pos = np.zeros((self.MAX_CTRL, 3))
         v_is_waypoint = np.zeros(self.MAX_CTRL)
@@ -679,6 +743,16 @@ class SfcCorridorPlanner:
         corridors: list[FlightCorridor],
         current_vel: NDArray,
     ) -> NDArray:
+        """Solve the QP to find the optimal B-spline control points.
+
+        Args:
+            skeleton_path: The sequence of anchor points.
+            corridors: The convex flight corridors for each segment.
+            current_vel: The current drone velocity.
+
+        Returns:
+            An Nx3 array of the optimized B-spline control points.
+        """
         if getattr(self, "_casadi_initialized", False) is False:
             self._init_casadi_planner()
 
@@ -791,12 +865,33 @@ class SfcCorridorPlanner:
     def _build_analytical_skeleton(
         self, current_pos: NDArray, current_vel: NDArray
     ) -> list[SkeletonPoint]:
+        """Construct the initial analytical skeleton path using Hermite splines.
+
+        Args:
+            current_pos: The current 3D position of the drone.
+            current_vel: The current 3D velocity of the drone.
+
+        Returns:
+            A list of SkeletonPoint anchors outlining the path.
+        """
         gate_normals = R.from_quat(self.gates_quat).apply([1.0, 0.0, 0.0])
         raw_path = [SkeletonPoint(current_pos, False, None, None, None)]
 
         def cubic_hermite_spline(
             p0: NDArray, m0: NDArray, p1: NDArray, m1: NDArray, t: float
         ) -> NDArray:
+            """Evaluate a cubic Hermite spline at parameter t in [0, 1].
+
+            Args:
+                p0: Start position.
+                m0: Start tangent.
+                p1: End position.
+                m1: End tangent.
+                t: Interpolation parameter.
+
+            Returns:
+                The interpolated 3D position.
+            """
             t2 = t * t
             t3 = t2 * t
             h00 = 2 * t3 - 3 * t2 + 1
@@ -924,6 +1019,14 @@ class SfcCorridorPlanner:
         return raw_path
 
     def _apply_3d_obstacle_repulsion(self, raw_path: list[SkeletonPoint]) -> list[SkeletonPoint]:
+        """Modify the skeleton path by pushing points away from obstacles.
+
+        Args:
+            raw_path: The initial list of skeleton points.
+
+        Returns:
+            The modified list of skeleton points with collision avoidance applied.
+        """
         margin = self.config.OBSTACLE_AVOIDANCE_MARGIN
         capsules = []
 
@@ -1017,6 +1120,15 @@ class SfcCorridorPlanner:
         return path
 
     def _calculate_anchors(self, current_pos: NDArray, current_vel: NDArray) -> list[SkeletonPoint]:
+        """Generate the fully processed anchor points for the B-spline.
+
+        Args:
+            current_pos: The current 3D position of the drone.
+            current_vel: The current 3D velocity of the drone.
+
+        Returns:
+            A list of processed SkeletonPoint anchors.
+        """
         raw_path = self._build_analytical_skeleton(current_pos, current_vel)
         path = self._apply_3d_obstacle_repulsion(raw_path)
 
@@ -1039,6 +1151,14 @@ class SfcCorridorPlanner:
         return clipped_path
 
     def _check_objects_moved(self, obs: dict[str, NDArray]) -> tuple[bool, str]:
+        """Determine if gates or obstacles have moved significantly, requiring a replan.
+
+        Args:
+            obs: The current observation dict containing gate and obstacle positions.
+
+        Returns:
+            A tuple of (moved_flag, reason_string).
+        """
         gate_moved = False
         obs_moved = False
         new_gates_pos = obs["gates_pos"]
@@ -1081,6 +1201,11 @@ class SfcCorridorPlanner:
         }
 
     def _record_replan_event(self, reason: str) -> None:
+        """Record the current replan event for debugging and tracing.
+
+        Args:
+            reason: The reason for the replan event.
+        """
         evt = {
             "tick": int(self._tick),
             "reason": reason,
