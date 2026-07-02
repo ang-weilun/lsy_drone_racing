@@ -73,7 +73,7 @@ class MPCCConfig:
     """Linear-velocity penalty. Zero: cost references vel=0, so >0 rewards flying slow."""
 
     # --- Dynamic Tuning ---
-    dynamic_addition: float = 750.0
+    dynamic_addition: float = 1200.0
     """Extra contouring weight near target gates. Sized for the 0.7 m sensor reveal
     (gate true pose snaps up to ~0.2 m): 300->1200 recovered L2 SR 5->14/20.
     """
