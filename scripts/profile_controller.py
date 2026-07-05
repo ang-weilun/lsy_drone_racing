@@ -1,14 +1,20 @@
+"""Profiling script for controllers."""
+
 import time
-import numpy as np
+from pathlib import Path
+
 import fire
 import gymnasium
+import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
-from pathlib import Path
 
 from lsy_drone_racing.utils import load_config, load_controller
 
 
-def profile(config_file="level2.toml", controller_file="sfc_mpcc.py", n_runs=1):
+def profile(
+    config_file: str = "level2.toml", controller_file: str = "sfc_mpcc.py", n_runs: int = 1
+):
+    """Profile a controller over a given number of runs."""
     config = load_config(Path(__file__).parents[1] / "config" / config_file)
     config.sim.render = False
 
@@ -66,7 +72,7 @@ def profile(config_file="level2.toml", controller_file="sfc_mpcc.py", n_runs=1):
     print(f"Max time            : {np.max(times_ms):.3f} ms")
     print(f"99th percentile     : {np.percentile(times_ms, 99):.3f} ms")
     print("----------------------------------------")
-    print("Target              : 500 Hz (2.0 ms per step)")
+    print("Target              : 50 Hz (20.0 ms per step)")
     print("=" * 40)
 
 
