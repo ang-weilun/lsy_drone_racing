@@ -1,4 +1,5 @@
 """Geometry utilities for computing drone path corridors and obstacle avoidance."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

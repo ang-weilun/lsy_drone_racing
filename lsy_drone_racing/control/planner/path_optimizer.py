@@ -1,4 +1,5 @@
 """CasADi optimizer for B-spline control points."""
+
 from __future__ import annotations
 
 import logging
@@ -30,7 +31,7 @@ class CasadiPlanner:
 
     def init_casadi_planner(self) -> None:
         """Initialize CasADi variables, parameters, and constraints.
-        
+
         Builds the optimization problem for B-spline control point generation.
         """
         import casadi as ca

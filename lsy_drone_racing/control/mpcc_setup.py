@@ -1,4 +1,5 @@
 """Setup utilities for the MPCC CasADi/Acados model and solver."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -44,6 +45,7 @@ def _build_obstacle_barrier(p_capsules: cs.MX, pos: cs.MX) -> cs.MX:
         y_obs[i] = cs.fmax(0.0, 1.0 - d2 / (r**2 + 1e-6)) ** 2
     return y_obs
 
+
 def create_acados_model(parameters: dict) -> AcadosModel:
     """Create the Acados model for the MPCC.
 
@@ -73,7 +75,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     a_rpy = cs.MX.sym("a_rpy", 3)
     f_thrust = cs.MX.sym("f_thrust")
     cmd_thrust = cs.MX.sym("cmd_thrust")
-    
+
     X_dot = cs.substitute(X_dot, U, cs.vertcat(c_rpy, f_thrust))
     tau_thrust = float(parameters["thrust_time_coef"])
     f_thrust_dot = (cmd_thrust - f_thrust) / tau_thrust
@@ -115,16 +117,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     y_obs = _build_obstacle_barrier(p_capsules, pos)
 
     y_expr = cs.vertcat(
-        e_c_vec,
-        e_l,
-        v_theta,
-        X[3:6],
-        X[6:9],
-        X[9:12],
-        a_rpy,
-        cmd_thrust,
-        delta_v_theta,
-        y_obs,
+        e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12], a_rpy, cmd_thrust, delta_v_theta, y_obs
     )
 
     y_expr_e = cs.vertcat(e_c_vec, e_l, v_theta, X[3:6], X[6:9], X[9:12], y_obs)
@@ -140,6 +133,7 @@ def create_acados_model(parameters: dict) -> AcadosModel:
     model.cost_y_expr_e = y_expr_e
 
     return model
+
 
 def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
     """Get the cost weight matrices for the MPCC.
@@ -190,6 +184,7 @@ def _get_cost_weights(config: MPCCConfig) -> tuple[np.ndarray, np.ndarray]:
     ] + [config.obstacle_penalty] * 24
 
     return np.diag(W_diag), np.diag(W_e_diag)
+
 
 def create_ocp_solver(
     time_steps: np.ndarray, parameters: dict, config: MPCCConfig, verbose: bool = False

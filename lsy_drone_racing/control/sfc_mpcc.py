@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+
 class AttitudeMPC(Controller):
     """Example of a MPCC using the collective thrust and attitude interface."""
 
@@ -80,10 +81,10 @@ class AttitudeMPC(Controller):
 
         self._current_theta = 0.0
         self._current_v_theta = 0.5
-        
+
         self._current_cmd_rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         self._current_vc_rpy = np.zeros(3)
-        
+
         hover_force = float(self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1])
         self._hover_thrust = hover_force / float(self.drone_params["cmd_f_coef"])
         self._current_thrust = self._hover_thrust

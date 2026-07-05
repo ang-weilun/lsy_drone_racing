@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+
 class SfcCorridorPlanner:
     """Pure SFC trajectory planner. Build once, update each tick, evaluate at any time."""
 
@@ -52,7 +53,7 @@ class SfcCorridorPlanner:
         self.replan_events: list[dict] = []
         self.last_replan_event: dict | None = None
         self._traj_history = []
-        
+
         self._casadi_planner = CasadiPlanner(self.config)
 
         initial_vel = obs.get("vel", np.zeros(3))

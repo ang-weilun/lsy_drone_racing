@@ -1,4 +1,5 @@
 """Common types used by the trajectory planner."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, NamedTuple
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
 
 class SkeletonPoint(NamedTuple):
     """Represents a skeleton point in the planned path with gate information."""
+
     pos: NDArray
     is_gate: bool
     gate_normal: NDArray | None
@@ -20,16 +22,20 @@ class SkeletonPoint(NamedTuple):
     is_in_tube: bool = False
     is_waypoint: bool = False
 
+
 class Capsule(NamedTuple):
     """Represents a capsule obstacle (cylinder with spherical ends)."""
+
     p1: NDArray
     p2: NDArray
     radius: float
     is_gate: bool
     gate_idx: int | None = None
 
+
 class FlightCorridor:
     """Represents a convex polyhedron (flight corridor) defined by half-spaces."""
+
     def __init__(self, p1: NDArray, p2: NDArray, limit_low: NDArray, limit_high: NDArray) -> None:
         """Initialize the FlightCorridor with bounding box limits.
 

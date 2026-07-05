@@ -41,7 +41,7 @@ def main():
     successful_times_median = np.median(successful_times)
     successful_times_min = np.min(successful_times)
     successful_times_max = np.max(successful_times)
-    
+
     logger.info(f"Average Time (s): {successful_times_avg:.3f}")
     logger.info(f"Std Dev (s): {successful_times_std:.3f}")
     logger.info(f"Median Time (s): {successful_times_median:.3f}")

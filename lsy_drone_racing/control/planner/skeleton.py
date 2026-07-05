@@ -1,4 +1,5 @@
 """Skeleton path planning for drone navigation."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from lsy_drone_racing.control.sfc_planner_mpc_config import PlannerConfig
+
+
 def build_analytical_skeleton(
     current_pos: NDArray,
     current_vel: NDArray,

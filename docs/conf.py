@@ -1,4 +1,5 @@
 """Configuration file for the Sphinx documentation builder."""
+
 #
 # This file only contains a selection of the most common options. For a full
 # list see the documentation:
@@ -13,7 +14,7 @@ author = "Martin Schuck"
 
 # The full version, including alpha/beta/rc tags
 release = "0.1.0"
-on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
+on_rtd = os.environ.get("READTHEDOCS", None) == "True"
 
 # -- General configuration ---------------------------------------------------
 
