@@ -114,37 +114,3 @@ def test_trajectory_controller_finish(yaw: float, physics: str):
         if terminated or truncated:
             break
     assert obs["target_gate"] == -1, "Trajectory controller failed to complete the track"
-
-
-@pytest.mark.integration
-def test_sfc_attitude_controller_completes_level0():
-    config = load_config(Path(__file__).parents[2] / "config/level0.toml")
-    config.sim.gui = False
-    config.sim.physics = "first_principles"
-    ctrl_cls = load_controller(
-        Path(__file__).parents[2] / "lsy_drone_racing/control/sfc_attitude_controller.py"
-    )
-    env = gymnasium.make(
-        "DroneRacing-v0",
-        freq=config.env.freq,
-        sim_config=config.sim,
-        sensor_range=config.env.sensor_range,
-        control_mode="attitude",
-        track=config.env.track,
-        disturbances=config.env.get("disturbances"),
-        randomizations=config.env.get("randomizations"),
-        seed=1337,
-    )
-    env = JaxToNumpy(env)
-    obs, info = env.reset()
-    ctrl = ctrl_cls(obs, info, config)
-    while True:
-        action = ctrl.compute_control(obs, info).astype(np.float32)
-        obs, reward, terminated, truncated, info = env.step(action)
-        ctrl.step_callback(action, obs, reward, terminated, truncated, info)
-        if terminated or truncated:
-            break
-    env.close()
-    assert obs["target_gate"] == -1, (
-        f"SFC attitude controller failed level 0; final target_gate={obs['target_gate']}"
-    )

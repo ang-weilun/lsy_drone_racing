@@ -32,6 +32,7 @@ import jax.numpy as jp
 import mujoco
 import numpy as np
 from crazyflow.sim import Sim
+from crazyflow.sim.pipeline import append_fn, insert_fn_before
 from crazyflow.sim.sim import seed_sim, sync_sim2mjx, use_box_collision
 from crazyflow.utils import leaf_replace
 from drone_controllers.mellinger.params import ForceTorqueParams
@@ -355,8 +356,8 @@ class RaceCoreEnv:
         self.sim = Sim(
             n_worlds=n_envs,
             n_drones=n_drones,
-            physics=sim_config.physics,
-            drone_model=sim_config.drone_model,
+            dynamics=sim_config.physics,
+            drone=sim_config.drone_model,
             control=control_mode,
             freq=sim_config.freq,
             state_freq=freq,
@@ -547,7 +548,7 @@ class RaceCoreEnv:
 
     def build_apply_action_fn(self) -> Callable[[Array, EnvData, EnvSettings], EnvData]:
         """Build a function that applies the action to the simulation."""
-        action_space = build_action_space(self.sim.control, self.sim.drone_model)
+        action_space = build_action_space(self.sim.control, self.sim.drone)
         if self.sim.control == "state":
             ctrl_fn = F.state_control
         elif self.sim.control == "attitude":
@@ -637,13 +638,11 @@ class RaceCoreEnv:
         self.sim.data = self.sim.data.replace(states=states)
         self.sim.build_default_data()
         # Build the reset randomizations and disturbances into the sim itself
-        self.sim.reset_pipeline = self.sim.reset_pipeline + (build_drone_reset_fn(randomizations),)
+        append_fn(self.sim.reset_pipeline, build_drone_reset_fn(randomizations), name="randomize_drone")
         self.sim.build_reset_fn()
         if dist := self.settings.disturbances.get("dynamics"):
             disturbance_fn = build_dynamics_disturbance_fn(dist)
-            self.sim.step_pipeline = (
-                self.sim.step_pipeline[:2] + (disturbance_fn,) + self.sim.step_pipeline[2:]
-            )
+            insert_fn_before(self.sim.step_pipeline, "integration", disturbance_fn, name="disturbance")
             self.sim.build_step_fn()
 
     def _load_track_into_sim(self, track: ConfigDict):
@@ -869,7 +868,7 @@ def build_drone_reset_fn(randomizations: dict) -> Callable[[SimData, Array], Sim
             case _:
                 raise ValueError(f"Invalid target: {target}")
 
-    def reset_fn(data: SimData, mask: Array) -> SimData:
+    def reset_fn(data: SimData, default_data: SimData, mask: Array | None) -> SimData:
         for randomize_fn in randomization_fns:
             data = randomize_fn(data, mask)
         return data
