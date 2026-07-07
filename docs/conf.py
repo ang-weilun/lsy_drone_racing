@@ -1,4 +1,5 @@
-# Configuration file for the Sphinx documentation builder.
+"""Configuration file for the Sphinx documentation builder."""
+
 #
 # This file only contains a selection of the most common options. For a full
 # list see the documentation:
@@ -13,7 +14,7 @@ author = "Martin Schuck"
 
 # The full version, including alpha/beta/rc tags
 release = "0.1.0"
-on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
+on_rtd = os.environ.get("READTHEDOCS", None) == "True"
 
 # -- General configuration ---------------------------------------------------
 
@@ -27,7 +28,16 @@ add_module_names = False
 autodoc_member_order = "bysource"
 
 # Mock imports on ReadTheDocs that are not available with pip or that we do not want to install
-autodoc_mock_imports = ["cflib", "crazyflow", "drone_models", "drone_estimators", "torch", "rclpy", "mujoco", "acados_template"]
+autodoc_mock_imports = [
+    "cflib",
+    "crazyflow",
+    "drone_models",
+    "drone_estimators",
+    "torch",
+    "rclpy",
+    "mujoco",
+    "acados_template",
+]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ["_templates"]
