@@ -1,55 +1,85 @@
-name: Online Competition
+name: Evaluate and Update Leaderboard
 
 on:
-  push:
-    branches:
-      - master
-      - main
   workflow_dispatch:
+    inputs:
+      repository:
+        description: 'The student repository (e.g., org/repo)'
+        required: true
+        type: string
+      sha:
+        description: 'The commit SHA to checkout'
+        required: true
+        type: string
+      actor:
+        description: 'The GitHub username of the student'
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  online-competition:
-    # Skip this job if running on the main repo to prevent failing CI/CD. Only run on student forks.
-    if: ${{ github.repository != 'learnsyslab/lsy_drone_racing' }}
-
+  evaluate:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Trigger Central Evaluation and Wait
+      - name: Checkout Competition Repo
+        uses: actions/checkout@v4
+        with:
+          ref: competition
+
+      - name: Checkout Clean Main Branch (For Anti-Cheat)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: original_main
+
+      - name: Checkout Student Code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          path: student_code
+
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@v0.9.3
+        with:
+          manifest-path: student_code/pyproject.toml
+          pixi-version: v0.70.0
+          cache: true
+          cache-write: false
+          activate-environment: false
+          locked: true
+
+      - name: Run Anti-Cheat Check
+        run: pixi run --manifest-path student_code/pyproject.toml python scripts/check_cheat.py
+
+      - name: Check Whitelist by Username
         env:
-          # The GitHub CLI uses this token to auth with the central repo
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-        run: |
-          echo "Dispatching evaluation to central repository..."
-          
-          # 1. Trigger the workflow with inputs
-          gh workflow run competition.yaml \
-            --repo learnsyslab/lsy_drone_racing \
-            --ref competition \
-            -f repository="${{ github.repository }}" \
-            -f sha="${{ github.sha }}" \
-            -f actor="${{ github.actor }}"
-          
-          echo "Waiting 10 seconds for GitHub to queue the run..."
-          sleep 10
-          
-          # 2. Fetch the ID of the run that was just created
-          RUN_ID=$(gh run list \
-            --repo learnsyslab/lsy_drone_racing \
-            --workflow "competition.yaml" \
-            --json databaseId \
-            --jq '.[0].databaseId')
-            
-          if [ -z "$RUN_ID" ]; then
-            echo "❌ Could not find the central workflow run. Check your DISPATCH_TOKEN permissions."
-            exit 1
-          fi
-          
-          echo "✅ Evaluation started! Watching Run ID: $RUN_ID"
-          echo "You can view the live central logs here: https://github.com/learnsyslab/lsy_drone_racing/actions/runs/$RUN_ID"
-          
-          # 3. Watch the run until it finishes. 
-          # The --exit-status flag ensures that if the central evaluation fails, this student job fails too!
-          gh run watch $RUN_ID \
-            --repo learnsyslab/lsy_drone_racing \
-            --exit-status
+          STUDENT_REPO: ${{ inputs.repository }}
+        run: pixi run --manifest-path student_code/pyproject.toml python scripts/check_whitelist.py "${STUDENT_REPO%%/*}"
+
+      - name: Run Student Evaluation
+        working-directory: student_code
+        run: pixi run evaluate
+
+      # Pull latest to prevent concurrent push conflicts.
+      - name: Fetch Latest Leaderboard Data
+        run: git pull --rebase origin competition
+
+      - name: Update Leaderboard TOML
+        env:
+          STUDENT_REPO: ${{ inputs.repository }}
+        run: pixi run --manifest-path student_code/pyproject.toml python scripts/update_leaderboard.py "${STUDENT_REPO%%/*}"
+
+      - name: Generate README
+        run: pixi run --manifest-path student_code/pyproject.toml python scripts/update_readme.py
+
+      - name: Commit and Push
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🏆 Leaderboard update by ${{ inputs.actor }}"
+          file_pattern: "scripts/leaderboard.toml README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
