@@ -18,7 +18,7 @@ def _load(path: Path) -> dict:
     return dict(np.load(path, allow_pickle=True))
 
 
-def _gate_bars_xy(gate_pos: np.ndarray, gate_quat: np.ndarray, bar_dist: float = 0.28):
+def _gate_bars_xy(gate_pos: np.ndarray, gate_quat: np.ndarray, bar_dist: float = 0.28):  # noqa: ANN202
     """Return the two side-bar xy positions for a gate (matching planner geometry)."""
     gate_pos = np.asarray(gate_pos, dtype=np.float64)
     gate_quat = np.asarray(gate_quat, dtype=np.float64)
@@ -32,8 +32,10 @@ def summarize(dump_dir: str = "/tmp/sfc_sweep_v3") -> None:
     p = Path(dump_dir)
     files = sorted(p.glob("run_*.npz"))
     print(f"# {len(files)} dumps in {dump_dir}\n")
-    print(f"{'seed':>5} {'gates':>5} {'reason':>12} {'t':>5} "
-          f"{'tg@last':>8} {'pos_at_term':>22} {'dist_to_g2_bar':>15}")
+    print(
+        f"{'seed':>5} {'gates':>5} {'reason':>12} {'t':>5} "
+        f"{'tg@last':>8} {'pos_at_term':>22} {'dist_to_g2_bar':>15}"
+    )
     rows = []
     for f in files:
         d = _load(f)

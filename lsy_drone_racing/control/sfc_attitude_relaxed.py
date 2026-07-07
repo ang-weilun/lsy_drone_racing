@@ -24,17 +24,17 @@ from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 KP = np.array([0.8, 0.8, 1.25])
 KI = np.array([0.05, 0.05, 0.05])
 KD = np.array([0.283, 0.283, 0.4])
-KI_RANGE = np.array([2.0, 2.0, 2.0])         # symmetric integrator clamp
+KI_RANGE = np.array([2.0, 2.0, 2.0])  # symmetric integrator clamp
 G = 9.81
 
 # Saturation / smoothing
-TILT_LIMIT = 0.7                              # rad (~40°)
-TILT_RATE_LIMIT = 0.3                         # rad per 50 Hz tick
-YAW_SPEED_THRESHOLD = 0.1                     # m/s
-Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_des, x_c)
+TILT_LIMIT = 0.7  # rad (~40°)
+TILT_RATE_LIMIT = 0.3  # rad per 50 Hz tick
+YAW_SPEED_THRESHOLD = 0.1  # m/s
+Y_CROSS_EPS = 1e-3  # singularity guard for cross(z_b_des, x_c)
 
 # Replan handling (used by the controller class, not the helper)
-REPLAN_I_RESET_THRESHOLD = 0.10               # m, horizontal-I reset gate
+REPLAN_I_RESET_THRESHOLD = 0.10  # m, horizontal-I reset gate
 
 # Acceleration-FF lookahead. Evaluates the planner's a_ref at t + ACC_FF_LOOKAHEAD
 # (instead of t) when feeding mass·a_ref into F_des. Compensates for crazyflie
@@ -43,7 +43,7 @@ REPLAN_I_RESET_THRESHOLD = 0.10               # m, horizontal-I reset gate
 # point rather than one tick behind. Set to 0.0 to disable. p_ref / v_ref are
 # still evaluated at t so the position/velocity error terms refer to the actual
 # current schedule point.
-ACC_FF_LOOKAHEAD = 0.10                       # s (5 outer-loop ticks at 50 Hz)
+ACC_FF_LOOKAHEAD = 0.10  # s (5 outer-loop ticks at 50 Hz)
 
 
 def compute_attitude_command(
@@ -78,10 +78,7 @@ def compute_attitude_command(
     integrator_tentative = np.clip(integrator + e_p * dt, -KI_RANGE, KI_RANGE)
 
     # Mellinger-Kumar: F_des = m·a_ref + Kp·e_p + Ki·∫e_p + Kd·e_v + m·g·ẑ
-    F_des = (
-        mass * a_ref
-        + KP * e_p + KI * integrator_tentative + KD * e_v
-    )
+    F_des = mass * a_ref + KP * e_p + KI * integrator_tentative + KD * e_v
     F_des[2] += mass * G
 
     # Scalar collective thrust = projection on current body z, clamped
@@ -146,7 +143,7 @@ def compute_attitude_command(
 class SfcAttitudeController(Controller):
     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
 
-    def __init__(self, obs, info, config) -> None:
+    def __init__(self, obs, info, config) -> None:  # noqa: ANN001, D107
         super().__init__(obs, info, config)
         self._freq = config.env.freq
         params = load_params(config.sim.physics, config.sim.drone_model)
@@ -159,14 +156,14 @@ class SfcAttitudeController(Controller):
         self._spline_tick = 0
         self._finished = False
         self._i_error = np.zeros(3)
-        self._yaw_prev = None       # lazy-init from current heading on first tick
+        self._yaw_prev = None  # lazy-init from current heading on first tick
         self._rpy_prev = np.zeros(3)
         self._y_b_prev = None
         self._replan_idx = 0
         self._last_diag: dict | None = None
         self.planner = SfcPlanner(obs, self._freq)
 
-    def compute_control(self, obs, info=None):
+    def compute_control(self, obs, info=None):  # noqa: ANN001, ANN201, D102
         if self._yaw_prev is None:
             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
 
@@ -193,14 +190,23 @@ class SfcAttitudeController(Controller):
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
 
-        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
+        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = (
             compute_attitude_command(
-                obs["pos"], obs.get("vel", np.zeros(3)),
-                des_pos, des_vel, des_acc_ff,
-                obs["quat"], self._mass,
-                self._i_error, self._thrust_min, self._thrust_max,
-                self._yaw_prev, self._y_b_prev, self._rpy_prev,
+                obs["pos"],
+                obs.get("vel", np.zeros(3)),
+                des_pos,
+                des_vel,
+                des_acc_ff,
+                obs["quat"],
+                self._mass,
+                self._i_error,
+                self._thrust_min,
+                self._thrust_max,
+                self._yaw_prev,
+                self._y_b_prev,
+                self._rpy_prev,
             )
+        )
 
         rpy_act = np.asarray(R.from_quat(obs["quat"]).as_euler("xyz"), dtype=np.float64)
         thrust_cmd = float(action[3])
@@ -219,12 +225,12 @@ class SfcAttitudeController(Controller):
 
         return action
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info):
+    def step_callback(self, action, obs, reward, terminated, truncated, info):  # noqa: ANN001, ANN201, D102
         self._tick += 1
         self._spline_tick += 1
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self):  # noqa: D102
         self._tick = 0
         self._spline_tick = 0
         self._finished = False
@@ -235,12 +241,15 @@ class SfcAttitudeController(Controller):
         self._replan_idx = 0
         self.planner.episode_reset()
 
-    def render_callback(self, sim):
+    def render_callback(self, sim):  # noqa: ANN001, D102
         if self.planner.t_total <= 0:
             return
         from crazyflow.sim.visualize import draw_line, draw_points
+
         u = min(self._spline_tick / self._freq, self.planner.t_total) / self.planner.t_total
-        draw_points(sim, self.planner.des_pos_spline(u).reshape(1, -1),
-                    rgba=(1.0, 0.0, 0.0, 1.0), size=0.04)
-        draw_line(sim, self.planner.des_pos_spline(np.linspace(0.0, 1.0, 100)),
-                  rgba=(0.0, 1.0, 0.0, 1.0))
+        draw_points(
+            sim, self.planner.des_pos_spline(u).reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.04
+        )
+        draw_line(
+            sim, self.planner.des_pos_spline(np.linspace(0.0, 1.0, 100)), rgba=(0.0, 1.0, 0.0, 1.0)
+        )

@@ -1,0 +1,832 @@
+D107 Missing docstring in `__init__`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:138:9
+    |
+136 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+137 |
+138 |     def __init__(self, obs, info, config) -> None:
+    |         ^^^^^^^^
+139 |         super().__init__(obs, info, config)
+140 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:138:24
+    |
+136 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+137 |
+138 |     def __init__(self, obs, info, config) -> None:
+    |                        ^^^
+139 |         super().__init__(obs, info, config)
+140 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:138:29
+    |
+136 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+137 |
+138 |     def __init__(self, obs, info, config) -> None:
+    |                             ^^^^
+139 |         super().__init__(obs, info, config)
+140 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `config`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:138:35
+    |
+136 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+137 |
+138 |     def __init__(self, obs, info, config) -> None:
+    |                                   ^^^^^^
+139 |         super().__init__(obs, info, config)
+140 |         self._freq = config.env.freq
+    |
+
+ANN201 Missing return type annotation for public function `compute_control`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:157:9
+    |
+155 |         self.planner = SfcPlanner(obs, self._freq)
+156 |
+157 |     def compute_control(self, obs, info=None):
+    |         ^^^^^^^^^^^^^^^
+158 |         if self._yaw_prev is None:
+159 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:157:9
+    |
+155 |         self.planner = SfcPlanner(obs, self._freq)
+156 |
+157 |     def compute_control(self, obs, info=None):
+    |         ^^^^^^^^^^^^^^^
+158 |         if self._yaw_prev is None:
+159 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:157:31
+    |
+155 |         self.planner = SfcPlanner(obs, self._freq)
+156 |
+157 |     def compute_control(self, obs, info=None):
+    |                               ^^^
+158 |         if self._yaw_prev is None:
+159 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:157:36
+    |
+155 |         self.planner = SfcPlanner(obs, self._freq)
+156 |
+157 |     def compute_control(self, obs, info=None):
+    |                                    ^^^^
+158 |         if self._yaw_prev is None:
+159 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN201 Missing return type annotation for public function `step_callback`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:9
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:9
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `action`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:29
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                             ^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:37
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                     ^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `reward`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:42
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                          ^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `terminated`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:50
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                  ^^^^^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `truncated`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:62
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                              ^^^^^^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:221:73
+    |
+219 |         return action
+220 |
+221 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                                         ^^^^
+222 |         self._tick += 1
+223 |         self._spline_tick += 1
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:226:9
+    |
+224 |         return self._finished
+225 |
+226 |     def episode_callback(self):
+    |         ^^^^^^^^^^^^^^^^
+227 |         self._tick = 0
+228 |         self._spline_tick = 0
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:237:9
+    |
+235 |         self.planner.episode_reset()
+236 |
+237 |     def render_callback(self, sim):
+    |         ^^^^^^^^^^^^^^^
+238 |         if self.planner.t_total <= 0:
+239 |             return
+    |
+
+ANN001 Missing type annotation for function argument `sim`
+   --> lsy_drone_racing/control/sfc_attitude_controller.py:237:31
+    |
+235 |         self.planner.episode_reset()
+236 |
+237 |     def render_callback(self, sim):
+    |                               ^^^
+238 |         if self.planner.t_total <= 0:
+239 |             return
+    |
+
+D107 Missing docstring in `__init__`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:146:9
+    |
+144 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+145 |
+146 |     def __init__(self, obs, info, config) -> None:
+    |         ^^^^^^^^
+147 |         super().__init__(obs, info, config)
+148 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:146:24
+    |
+144 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+145 |
+146 |     def __init__(self, obs, info, config) -> None:
+    |                        ^^^
+147 |         super().__init__(obs, info, config)
+148 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:146:29
+    |
+144 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+145 |
+146 |     def __init__(self, obs, info, config) -> None:
+    |                             ^^^^
+147 |         super().__init__(obs, info, config)
+148 |         self._freq = config.env.freq
+    |
+
+ANN001 Missing type annotation for function argument `config`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:146:35
+    |
+144 |     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
+145 |
+146 |     def __init__(self, obs, info, config) -> None:
+    |                                   ^^^^^^
+147 |         super().__init__(obs, info, config)
+148 |         self._freq = config.env.freq
+    |
+
+ANN201 Missing return type annotation for public function `compute_control`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:166:9
+    |
+164 |         self.planner = SfcPlanner(obs, self._freq)
+165 |
+166 |     def compute_control(self, obs, info=None):
+    |         ^^^^^^^^^^^^^^^
+167 |         if self._yaw_prev is None:
+168 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:166:9
+    |
+164 |         self.planner = SfcPlanner(obs, self._freq)
+165 |
+166 |     def compute_control(self, obs, info=None):
+    |         ^^^^^^^^^^^^^^^
+167 |         if self._yaw_prev is None:
+168 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:166:31
+    |
+164 |         self.planner = SfcPlanner(obs, self._freq)
+165 |
+166 |     def compute_control(self, obs, info=None):
+    |                               ^^^
+167 |         if self._yaw_prev is None:
+168 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:166:36
+    |
+164 |         self.planner = SfcPlanner(obs, self._freq)
+165 |
+166 |     def compute_control(self, obs, info=None):
+    |                                    ^^^^
+167 |         if self._yaw_prev is None:
+168 |             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
+    |
+
+ANN201 Missing return type annotation for public function `step_callback`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:9
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:9
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `action`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:29
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                             ^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:37
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                     ^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `reward`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:42
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                          ^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `terminated`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:50
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                  ^^^^^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `truncated`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:62
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                              ^^^^^^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:228:73
+    |
+226 |         return action
+227 |
+228 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                                         ^^^^
+229 |         self._tick += 1
+230 |         self._spline_tick += 1
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:233:9
+    |
+231 |         return self._finished
+232 |
+233 |     def episode_callback(self):
+    |         ^^^^^^^^^^^^^^^^
+234 |         self._tick = 0
+235 |         self._spline_tick = 0
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:244:9
+    |
+242 |         self.planner.episode_reset()
+243 |
+244 |     def render_callback(self, sim):
+    |         ^^^^^^^^^^^^^^^
+245 |         if self.planner.t_total <= 0:
+246 |             return
+    |
+
+ANN001 Missing type annotation for function argument `sim`
+   --> lsy_drone_racing/control/sfc_attitude_relaxed.py:244:31
+    |
+242 |         self.planner.episode_reset()
+243 |
+244 |     def render_callback(self, sim):
+    |                               ^^^
+245 |         if self.planner.t_total <= 0:
+246 |             return
+    |
+
+D100 Missing docstring in public module
+--> lsy_drone_racing/control/sfc_config.py:1:1
+
+D107 Missing docstring in `__init__`
+  --> lsy_drone_racing/control/sfc_controller.py:31:9
+   |
+29 |     """SFC tracker emitting a 13D state command (env's position controller closes the loop)."""
+30 |
+31 |     def __init__(self, obs, info, config) -> None:
+   |         ^^^^^^^^
+32 |         super().__init__(obs, info, config)
+33 |         self._freq = config.env.freq
+   |
+
+ANN001 Missing type annotation for function argument `obs`
+  --> lsy_drone_racing/control/sfc_controller.py:31:24
+   |
+29 |     """SFC tracker emitting a 13D state command (env's position controller closes the loop)."""
+30 |
+31 |     def __init__(self, obs, info, config) -> None:
+   |                        ^^^
+32 |         super().__init__(obs, info, config)
+33 |         self._freq = config.env.freq
+   |
+
+ANN001 Missing type annotation for function argument `info`
+  --> lsy_drone_racing/control/sfc_controller.py:31:29
+   |
+29 |     """SFC tracker emitting a 13D state command (env's position controller closes the loop)."""
+30 |
+31 |     def __init__(self, obs, info, config) -> None:
+   |                             ^^^^
+32 |         super().__init__(obs, info, config)
+33 |         self._freq = config.env.freq
+   |
+
+ANN001 Missing type annotation for function argument `config`
+  --> lsy_drone_racing/control/sfc_controller.py:31:35
+   |
+29 |     """SFC tracker emitting a 13D state command (env's position controller closes the loop)."""
+30 |
+31 |     def __init__(self, obs, info, config) -> None:
+   |                                   ^^^^^^
+32 |         super().__init__(obs, info, config)
+33 |         self._freq = config.env.freq
+   |
+
+ANN201 Missing return type annotation for public function `compute_control`
+  --> lsy_drone_racing/control/sfc_controller.py:55:9
+   |
+53 |             self._dump_episode_idx = 0
+54 |
+55 |     def compute_control(self, obs, info=None):
+   |         ^^^^^^^^^^^^^^^
+56 |         replanned = self.planner.update(obs)
+57 |         if replanned:
+   |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+  --> lsy_drone_racing/control/sfc_controller.py:55:9
+   |
+53 |             self._dump_episode_idx = 0
+54 |
+55 |     def compute_control(self, obs, info=None):
+   |         ^^^^^^^^^^^^^^^
+56 |         replanned = self.planner.update(obs)
+57 |         if replanned:
+   |
+
+ANN001 Missing type annotation for function argument `obs`
+  --> lsy_drone_racing/control/sfc_controller.py:55:31
+   |
+53 |             self._dump_episode_idx = 0
+54 |
+55 |     def compute_control(self, obs, info=None):
+   |                               ^^^
+56 |         replanned = self.planner.update(obs)
+57 |         if replanned:
+   |
+
+ANN001 Missing type annotation for function argument `info`
+  --> lsy_drone_racing/control/sfc_controller.py:55:36
+   |
+53 |             self._dump_episode_idx = 0
+54 |
+55 |     def compute_control(self, obs, info=None):
+   |                                    ^^^^
+56 |         replanned = self.planner.update(obs)
+57 |         if replanned:
+   |
+
+ANN001 Missing type annotation for function argument `obs`
+  --> lsy_drone_racing/control/sfc_controller.py:95:39
+   |
+93 |         return action
+94 |
+95 |     def _record_replan_snapshot(self, obs):
+   |                                       ^^^
+96 |         skel = self.planner._calculate_anchors(obs["pos"][:3])  # for dump only
+97 |         anchors_pos = np.array([p.pos for p in skel], dtype=np.float64)
+   |
+
+ANN201 Missing return type annotation for public function `step_callback`
+   --> lsy_drone_racing/control/sfc_controller.py:125:9
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+help: Add return type annotation
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_controller.py:125:9
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |         ^^^^^^^^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `action`
+   --> lsy_drone_racing/control/sfc_controller.py:125:29
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                             ^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `obs`
+   --> lsy_drone_racing/control/sfc_controller.py:125:37
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                     ^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `reward`
+   --> lsy_drone_racing/control/sfc_controller.py:125:42
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                          ^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `terminated`
+   --> lsy_drone_racing/control/sfc_controller.py:125:50
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                  ^^^^^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `truncated`
+   --> lsy_drone_racing/control/sfc_controller.py:125:62
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                              ^^^^^^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+ANN001 Missing type annotation for function argument `info`
+   --> lsy_drone_racing/control/sfc_controller.py:125:73
+    |
+123 |         )
+124 |
+125 |     def step_callback(self, action, obs, reward, terminated, truncated, info):
+    |                                                                         ^^^^
+126 |         self._tick += 1
+127 |         self._spline_tick += 1
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_controller.py:141:9
+    |
+139 |         return self._finished
+140 |
+141 |     def episode_callback(self) -> None:
+    |         ^^^^^^^^^^^^^^^^
+142 |         if self._dump_active:
+143 |             self._write_dump()
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_controller.py:154:9
+    |
+152 |         self.planner.episode_reset()
+153 |
+154 |     def render_callback(self, sim) -> None:
+    |         ^^^^^^^^^^^^^^^
+155 |         if self.planner.t_total <= 0:
+156 |             return
+    |
+
+ANN001 Missing type annotation for function argument `sim`
+   --> lsy_drone_racing/control/sfc_controller.py:154:31
+    |
+152 |         self.planner.episode_reset()
+153 |
+154 |     def render_callback(self, sim) -> None:
+    |                               ^^^
+155 |         if self.planner.t_total <= 0:
+156 |             return
+    |
+
+D415 First line should end with a period, question mark, or exclamation point
+   --> lsy_drone_racing/control/sfc_controller.py:168:9
+    |
+167 |       def _write_dump(self) -> None:
+168 | /         """Serialize collected dump buffers to an .npz file. Path resolution:
+169 | |
+170 | |         - SFC_DUMP_PATH unset → ./sfc_dump.npz (or sfc_dump_ep{N}.npz for n_runs>1)
+171 | |         - SFC_DUMP_PATH ends with /  → directory; episode files inside
+172 | |         - SFC_DUMP_PATH otherwise → exact file (single-episode runs) or
+173 | |           stem-suffixed (multi-episode runs, appends `_ep{N}`)
+174 | |         """
+    | |___________^
+175 |           out = _dump_path() or "sfc_dump.npz"
+176 |           path = Path(out)
+    |
+help: Add closing punctuation
+
+TC002 Move third-party import `numpy.typing.NDArray` into a type-checking block
+  --> lsy_drone_racing/control/sfc_planner.py:15:26
+   |
+13 | import cvxpy as cp
+14 | import numpy as np
+15 | from numpy.typing import NDArray
+   |                          ^^^^^^^
+16 | from scipy.interpolate import BSpline, CubicSpline
+17 | from scipy.spatial.transform import Rotation as R
+   |
+help: Move into type-checking block
+
+D107 Missing docstring in `__init__`
+   --> lsy_drone_racing/control/sfc_planner.py:130:9
+    |
+128 |     N_TOPP_SAMPLES = cfg.N_TOPP_SAMPLES
+129 |
+130 |     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
+    |         ^^^^^^^^
+131 |         self._freq = freq
+132 |         self.anchor_gap = 0.5
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner.py:217:9
+    |
+216 |     @property
+217 |     def t_total(self) -> float:
+    |         ^^^^^^^
+218 |         return self._t_total
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner.py:221:9
+    |
+220 |     @property
+221 |     def des_pos_spline(self) -> BSpline:
+    |         ^^^^^^^^^^^^^^
+222 |         return self._des_pos_spline
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner.py:225:9
+    |
+224 |     @property
+225 |     def control_points(self) -> NDArray:
+    |         ^^^^^^^^^^^^^^
+226 |         return self._control_points
+    |
+
+E501 Line too long (104 > 100)
+   --> lsy_drone_racing/control/sfc_planner.py:662:101
+    |
+660 |                     swing_pos = pre_pos + up * 0.8
+661 |                 else:
+662 |                     # Lateral U-turn: For side-by-side gates or gates facing the same general direction.
+    |                                                                                                     ^^^^
+663 |                     # Choose left or right approach based on the drone's incoming position.
+664 |                     dot_r = np.dot(raw_path[-1].pos - pos, right)
+    |
+
+E501 Line too long (106 > 100)
+   --> lsy_drone_racing/control/sfc_planner.py:702:101
+    |
+700 |                     # and prepare for the next gate.
+701 |                     if faces_different and not is_next_to:
+702 |                         # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.
+    |                                                                                                     ^^^^^^
+703 |                         # The drone reverses direction by flying up and directly over the current gate.
+704 |                         exit_swing = pos + up * 1.2
+    |
+
+E501 Line too long (103 > 100)
+   --> lsy_drone_racing/control/sfc_planner.py:703:101
+    |
+701 |                     if faces_different and not is_next_to:
+702 |                         # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.
+703 |                         # The drone reverses direction by flying up and directly over the current gate.
+    |                                                                                                     ^^^
+704 |                         exit_swing = pos + up * 1.2
+705 |                     else:
+    |
+
+TC002 Move third-party import `numpy.typing.NDArray` into a type-checking block
+  --> lsy_drone_racing/control/sfc_planner_relaxed.py:15:26
+   |
+13 | import cvxpy as cp
+14 | import numpy as np
+15 | from numpy.typing import NDArray
+   |                          ^^^^^^^
+16 | from scipy.interpolate import BSpline, CubicSpline
+17 | from scipy.spatial.transform import Rotation as R
+   |
+help: Move into type-checking block
+
+D107 Missing docstring in `__init__`
+   --> lsy_drone_racing/control/sfc_planner_relaxed.py:139:9
+    |
+137 |     N_TOPP_SAMPLES = 200  # Number of points to sample u ∈ [0, 1] when building the schedule.
+138 |
+139 |     def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
+    |         ^^^^^^^^
+140 |         self._freq = freq
+141 |         self.anchor_gap = 0.5
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner_relaxed.py:230:9
+    |
+229 |     @property
+230 |     def t_total(self) -> float:
+    |         ^^^^^^^
+231 |         return self._t_total
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner_relaxed.py:234:9
+    |
+233 |     @property
+234 |     def des_pos_spline(self) -> BSpline:
+    |         ^^^^^^^^^^^^^^
+235 |         return self._des_pos_spline
+    |
+
+D102 Missing docstring in public method
+   --> lsy_drone_racing/control/sfc_planner_relaxed.py:238:9
+    |
+237 |     @property
+238 |     def control_points(self) -> NDArray:
+    |         ^^^^^^^^^^^^^^
+239 |         return self._control_points
+    |
+
+ANN202 Missing return type annotation for private function `_gate_bars_xy`
+  --> scripts/analyze_dumps.py:21:5
+   |
+21 | def _gate_bars_xy(gate_pos: np.ndarray, gate_quat: np.ndarray, bar_dist: float = 0.28):
+   |     ^^^^^^^^^^^^^
+22 |     """Return the two side-bar xy positions for a gate (matching planner geometry)."""
+23 |     gate_pos = np.asarray(gate_pos, dtype=np.float64)
+   |
+help: Add return type annotation
+
+ANN202 Missing return type annotation for private function `_minimal_obs`
+  --> tests/unit/control/test_sfc_planner_relaxed.py:44:5
+   |
+44 | def _minimal_obs():
+   |     ^^^^^^^^^^^^
+45 |     """Obs fixture matching what level 0 emits at t=0: 4 gates, 4 obstacles, drone at start."""
+46 |     return {
+   |
+help: Add return type annotation
+
+D205 1 blank line required between summary line and description
+   --> tests/unit/control/test_sfc_planner_relaxed.py:225:5
+    |
+224 |   def test_diagonal_gate_entry_when_prior_anchor_is_offset():
+225 | /     """When the previous skeleton anchor is offset laterally from the gate normal,
+226 | |     the spline should pass through the gate centre with a non-trivial cross angle —
+227 | |     confirming the QP is using its diagonal freedom rather than forcing on-normal entry.
+228 | |     """
+    | |_______^
+229 |       from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
+    |
+help: Insert single blank line
+
+Found 76 errors.
+No fixes available (2 hidden fixes can be enabled with the `--unsafe-fixes` option).

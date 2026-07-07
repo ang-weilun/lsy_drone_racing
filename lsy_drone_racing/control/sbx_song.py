@@ -80,9 +80,7 @@ class RLSBXController(Controller):
                 mu[0], env_obs["quat"], thrust_min, thrust_max, alpha_max=alpha_max
             )
 
-        self._forward = jax.jit(
-            _forward, static_argnames=("thrust_min", "thrust_max", "alpha_max")
-        )
+        self._forward = jax.jit(_forward, static_argnames=("thrust_min", "thrust_max", "alpha_max"))
 
     def compute_control(
         self, obs: dict[str, npt.NDArray[np.floating]], info: dict | None = None

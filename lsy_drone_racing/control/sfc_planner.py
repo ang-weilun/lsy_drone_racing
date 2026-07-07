@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 import cvxpy as cp
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import NDArray  # noqa: TC002
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.spatial.transform import Rotation as R
 
@@ -127,7 +127,7 @@ class SfcPlanner:
     V_FLOOR = cfg.V_FLOOR
     N_TOPP_SAMPLES = cfg.N_TOPP_SAMPLES
 
-    def __init__(self, obs: dict[str, NDArray], freq: int) -> None:
+    def __init__(self, obs: dict[str, NDArray], freq: int) -> None:  # noqa: D107
         self._freq = freq
         self.anchor_gap = 0.5
         self.base_speed = 1.0
@@ -214,15 +214,15 @@ class SfcPlanner:
         return pos, vel, acc
 
     @property
-    def t_total(self) -> float:
+    def t_total(self) -> float:  # noqa: D102
         return self._t_total
 
     @property
-    def des_pos_spline(self) -> BSpline:
+    def des_pos_spline(self) -> BSpline:  # noqa: D102
         return self._des_pos_spline
 
     @property
-    def control_points(self) -> NDArray:
+    def control_points(self) -> NDArray:  # noqa: D102
         return self._control_points
 
     def episode_reset(self) -> None:
@@ -266,17 +266,13 @@ class SfcPlanner:
 
         v_start = float(np.linalg.norm(current_vel))
         try:
-            self._t_to_u, self._t_total = self._compute_time_schedule(
-                self._des_pos_spline, v_start
-            )
+            self._t_to_u, self._t_total = self._compute_time_schedule(self._des_pos_spline, v_start)
         except Exception as exc:  # noqa: BLE001 — fallback path
             logger.warning("TOPP scheduling failed (%s); falling back to uniform schedule.", exc)
             self._t_to_u = None
             self._t_total = float(np.sum(cp_dists) / self.base_speed)
 
-    def _compute_time_schedule(
-        self, spline: BSpline, v_start: float
-    ) -> tuple[CubicSpline, float]:
+    def _compute_time_schedule(self, spline: BSpline, v_start: float) -> tuple[CubicSpline, float]:
         """TOPP-style time parameterization: build a t→u cubic spline.
 
         Given a fixed-geometry BSpline over u ∈ [0, 1] and the drone's current
@@ -299,10 +295,10 @@ class SfcPlanner:
         u_k = np.linspace(0.0, 1.0, N)
 
         # --- Step 1: sample geometry at each u_k ---
-        d1 = spline.derivative(nu=1)(u_k)        # shape (N, 3)
-        d2 = spline.derivative(nu=2)(u_k)        # shape (N, 3)
-        ds_du = np.linalg.norm(d1, axis=1)       # shape (N,)
-        cross = np.cross(d1, d2)                 # shape (N, 3)
+        d1 = spline.derivative(nu=1)(u_k)  # shape (N, 3)
+        d2 = spline.derivative(nu=2)(u_k)  # shape (N, 3)
+        ds_du = np.linalg.norm(d1, axis=1)  # shape (N,)
+        cross = np.cross(d1, d2)  # shape (N, 3)
         kappa = np.linalg.norm(cross, axis=1) / np.maximum(ds_du**3, eps)
 
         # --- Step 2: lateral-accel envelope + global cap ---
@@ -610,9 +606,7 @@ class SfcPlanner:
         # the perpendicular exit_swing detour, which over-commits when the
         # drone has already started its turn.
         prev_gate_idx = self.target_gate_idx - 1
-        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(
-            self.gates_pos
-        ):
+        if 0 <= prev_gate_idx < len(self.gates_pos) and self.target_gate_idx < len(self.gates_pos):
             prev_pos = self.gates_pos[prev_gate_idx]
             prev_normal = gate_normals[prev_gate_idx]
             d_post = float(np.dot(current_pos - prev_pos, prev_normal))
@@ -645,16 +639,16 @@ class SfcPlanner:
                     prev_pos = self.gates_pos[i - 1]
                     prev_normal = gate_normals[i - 1]
                     dp = pos - prev_pos
-                    
+
                     # Calculate lateral (side-to-side) vs longitudinal (front-to-back) offset
                     # relative to the CURRENT gate's orientation.
                     dist_lat = abs(float(np.dot(dp, right)))
                     dist_long = abs(float(np.dot(dp, normal)))
-                    
+
                     # If the lateral offset is larger, the gates are placed side-by-side.
                     # If the longitudinal offset is larger, they are placed in-line (back-to-back).
                     is_next_to = dist_lat > dist_long
-                    
+
                     # Check if the previous gate and current gate face opposite directions.
                     faces_different = np.dot(normal, prev_normal) < 0.0
 
@@ -665,7 +659,7 @@ class SfcPlanner:
                     # Vertical U-turn: Drop down into the gate from above
                     swing_pos = pre_pos + up * 0.8
                 else:
-                    # Lateral U-turn: For side-by-side gates or gates facing the same general direction.
+                    # Lateral U-turn: For side-by-side gates or gates facing the same general direction.  # noqa: E501
                     # Choose left or right approach based on the drone's incoming position.
                     dot_r = np.dot(raw_path[-1].pos - pos, right)
                     lat_dir = right if dot_r > 0 else -right
@@ -694,19 +688,19 @@ class SfcPlanner:
                     dp = next_pos - pos
                     dist_lat = abs(float(np.dot(dp, right)))
                     dist_long = abs(float(np.dot(dp, normal)))
-                    
+
                     # If the lateral offset is larger, the next gate is placed side-by-side.
                     # If the longitudinal offset is larger, it is in-line (back-to-back).
                     is_next_to = dist_lat > dist_long
-                    
+
                     # Check if the current gate and the next gate face opposite directions.
                     faces_different = np.dot(normal, next_normal) < 0.0
 
                     # Determine the type of U-turn needed to exit the current gate
                     # and prepare for the next gate.
                     if faces_different and not is_next_to:
-                        # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.
-                        # The drone reverses direction by flying up and directly over the current gate.
+                        # Over-the-top U-turn: Used for in-line (back-to-back) gates facing opposite ways.  # noqa: E501
+                        # The drone reverses direction by flying up and directly over the current gate.  # noqa: E501
                         exit_swing = pos + up * 1.2
                     else:
                         # Lateral U-turn: Used for side-by-side gates.
@@ -722,17 +716,17 @@ class SfcPlanner:
                     dp = (next_pre_pos - post_pos)[:2]
                     d1 = normal[:2]
                     d2 = -next_normal[:2]
-                    
+
                     det = d1[0] * d2[1] - d1[1] * d2[0]
                     if abs(det) > 1e-3:
                         t1 = (dp[0] * d2[1] - dp[1] * d2[0]) / det
                         t2 = (d1[0] * dp[1] - d1[1] * dp[0]) / det
-                        
+
                         if t1 > 0.2 and t2 > 0.2:
                             intersect1 = post_pos + normal * t1
                             intersect2 = next_pre_pos - next_normal * t2
                             midpoint = (intersect1 + intersect2) / 2.0
-                            
+
                             max_dist = np.linalg.norm(next_pre_pos - post_pos)
                             if np.linalg.norm(midpoint - post_pos) < max_dist * 1.5:
                                 raw_path.append(SkeletonPoint(midpoint, False, None, None, None))

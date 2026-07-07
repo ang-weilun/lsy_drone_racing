@@ -64,9 +64,7 @@ class Actor(nn.Module):
 
         # log_std declared so checkpoints from the training-time Actor (with a
         # state-independent Gaussian std) load cleanly; unused on the deploy path.
-        _ = self.param(
-            "log_std", nn.initializers.constant(self.log_std_init), (self.action_dim,)
-        )
+        _ = self.param("log_std", nn.initializers.constant(self.log_std_init), (self.action_dim,))
         return mu
 
 

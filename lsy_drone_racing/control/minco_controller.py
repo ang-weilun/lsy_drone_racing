@@ -61,22 +61,12 @@ def quintic_bvp(
     v1 = np.asarray(v1, dtype=np.float64)
     a1 = np.asarray(a1, dtype=np.float64)
     # Matrix is the same for every axis, so solve once as a batched RHS.
-    T2, T3, T4, T5 = T * T, T ** 3, T ** 4, T ** 5
+    T2, T3, T4, T5 = T * T, T**3, T**4, T**5
     A = np.array(
-        [
-            [T3, T4, T5],
-            [3 * T2, 4 * T3, 5 * T4],
-            [6 * T, 12 * T2, 20 * T3],
-        ],
-        dtype=np.float64,
+        [[T3, T4, T5], [3 * T2, 4 * T3, 5 * T4], [6 * T, 12 * T2, 20 * T3]], dtype=np.float64
     )
     rhs = np.stack(
-        [
-            p1 - p0 - v0 * T - 0.5 * a0 * T2,
-            v1 - v0 - a0 * T,
-            a1 - a0,
-        ],
-        axis=0,
+        [p1 - p0 - v0 * T - 0.5 * a0 * T2, v1 - v0 - a0 * T, a1 - a0], axis=0
     )  # shape (3, 3); one column per xyz axis.
     c345 = np.linalg.solve(A, rhs)  # (3, 3)
     coeffs = np.zeros((6, 3), dtype=np.float64)
@@ -96,19 +86,15 @@ def _eval_poly(
     coefficients shift to represent ṗ (a quartic in τ); same for =2.
     """
     if derivative == 0:
-        powers = np.array(
-            [1.0, tau, tau ** 2, tau ** 3, tau ** 4, tau ** 5], dtype=np.float64
-        )
+        powers = np.array([1.0, tau, tau**2, tau**3, tau**4, tau**5], dtype=np.float64)
         return powers @ coeffs
     if derivative == 1:
         d = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
-        powers = np.array(
-            [1.0, tau, tau ** 2, tau ** 3, tau ** 4], dtype=np.float64
-        )
+        powers = np.array([1.0, tau, tau**2, tau**3, tau**4], dtype=np.float64)
         return (d * powers) @ coeffs[1:6]
     if derivative == 2:
         d = np.array([2.0, 6.0, 12.0, 20.0], dtype=np.float64)
-        powers = np.array([1.0, tau, tau ** 2, tau ** 3], dtype=np.float64)
+        powers = np.array([1.0, tau, tau**2, tau**3], dtype=np.float64)
         return (d * powers) @ coeffs[2:6]
     raise ValueError(f"unsupported derivative order: {derivative}")
 
@@ -118,8 +104,8 @@ def _segment_peak_v_a(coeffs: NDArray[np.floating], T: float, n: int = 20) -> tu
     taus = np.linspace(0.0, T, n)
     d1 = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
     d2 = np.array([2.0, 6.0, 12.0, 20.0], dtype=np.float64)
-    p1 = np.stack([taus ** i for i in range(5)], axis=1)  # (n,5)
-    p2 = np.stack([taus ** i for i in range(4)], axis=1)  # (n,4)
+    p1 = np.stack([taus**i for i in range(5)], axis=1)  # (n,5)
+    p2 = np.stack([taus**i for i in range(4)], axis=1)  # (n,4)
     vel = (p1 * d1) @ coeffs[1:6]  # (n, 3)
     acc = (p2 * d2) @ coeffs[2:6]  # (n, 3)
     v_peak = float(np.linalg.norm(vel, axis=1).max())
@@ -340,11 +326,7 @@ class MincoController(Controller):
             first_target = gate_knots[0][0]
             for avoid_gp, avoid_gq in reversed(avoidance_gate_frames):
                 frame_vias = self._gate_frame_via_points(
-                    positions[-1],
-                    first_target,
-                    avoid_gp,
-                    avoid_gq,
-                    obstacles_pos,
+                    positions[-1], first_target, avoid_gp, avoid_gq, obstacles_pos
                 )
                 if not frame_vias:
                     continue
@@ -363,11 +345,7 @@ class MincoController(Controller):
                     axial_vels.append(None)
                 break
             via = self._obstacle_via_point(
-                positions[-1],
-                first_target,
-                obs_xy,
-                prev_dir_xy,
-                endpoint_margin=endpoint_margin,
+                positions[-1], first_target, obs_xy, prev_dir_xy, endpoint_margin=endpoint_margin
             )
             if via is not None:
                 positions.append(via)
@@ -407,15 +385,11 @@ class MincoController(Controller):
                 )
             wps.append({"pos": positions[i], "vel": vel, "acc": np.zeros(3)})
         if len(positions) >= 2:
-            wps.append(
-                {"pos": positions[-1], "vel": np.zeros(3), "acc": np.zeros(3)}
-            )
+            wps.append({"pos": positions[-1], "vel": np.zeros(3), "acc": np.zeros(3)})
         return wps
 
     def _start_velocity_for_plan(
-        self,
-        start_vel: NDArray[np.floating],
-        positions: list[NDArray[np.floating]],
+        self, start_vel: NDArray[np.floating], positions: list[NDArray[np.floating]]
     ) -> NDArray[np.floating]:
         """Use only the component of measured velocity that helps the new plan.
 
@@ -437,10 +411,7 @@ class MincoController(Controller):
         return direction * speed
 
     @staticmethod
-    def _obstacle_clearance_xy(
-        point: NDArray[np.floating],
-        obs_xy: NDArray[np.floating],
-    ) -> float:
+    def _obstacle_clearance_xy(point: NDArray[np.floating], obs_xy: NDArray[np.floating]) -> float:
         """Return the closest XY distance from ``point`` to any obstacle."""
         if obs_xy.shape[0] == 0:
             return np.inf
@@ -457,11 +428,7 @@ class MincoController(Controller):
         """Place a pre/exit gate knot, shortening it if an obstacle is too close."""
         target_offset = self.D_OFFSET
         point = centre + sign * target_offset * axis_unit
-        if (
-            obs_xy.shape[0] == 0
-            or self._obstacle_clearance_xy(point, obs_xy)
-            >= required_clearance
-        ):
+        if obs_xy.shape[0] == 0 or self._obstacle_clearance_xy(point, obs_xy) >= required_clearance:
             return point
         if self._obstacle_clearance_xy(centre, obs_xy) < required_clearance:
             return point
@@ -552,9 +519,7 @@ class MincoController(Controller):
 
     @staticmethod
     def _box_signed_distance(
-        p_local: NDArray[np.floating],
-        center: NDArray[np.floating],
-        half_size: NDArray[np.floating],
+        p_local: NDArray[np.floating], center: NDArray[np.floating], half_size: NDArray[np.floating]
     ) -> float:
         """Signed distance from a point to an axis-aligned box."""
         q = np.abs(p_local - center) - half_size
@@ -570,10 +535,7 @@ class MincoController(Controller):
         )
 
     def _chord_gate_frame_distance(
-        self,
-        a_local: NDArray[np.floating],
-        b_local: NDArray[np.floating],
-        n: int = 40,
+        self, a_local: NDArray[np.floating], b_local: NDArray[np.floating], n: int = 40
     ) -> float:
         """Sample a local-frame chord and return its closest gate-frame distance."""
         return min(
@@ -582,9 +544,7 @@ class MincoController(Controller):
         )
 
     def _polyline_obstacle_clearance(
-        self,
-        points: list[NDArray[np.floating]],
-        obstacles_pos: NDArray[np.floating],
+        self, points: list[NDArray[np.floating]], obstacles_pos: NDArray[np.floating]
     ) -> float:
         """Return the minimum XY clearance from a candidate polyline to obstacles."""
         obstacles_pos = np.asarray(obstacles_pos, dtype=np.float64)
@@ -641,26 +601,9 @@ class MincoController(Controller):
                 if abs(b_local[0]) >= min_axial_clearance
                 else np.copysign(self.GATE_FRAME_AXIAL_CLEARANCE, b_local[0] or 1.0)
             )
-            via1_local = np.array(
-                [
-                    via1_x,
-                    y_side,
-                    a_local[2],
-                ],
-                dtype=np.float64,
-            )
-            via2_local = np.array(
-                [
-                    via2_x,
-                    y_side,
-                    b_local[2],
-                ],
-                dtype=np.float64,
-            )
-            via_points = [
-                rot.apply(via1_local) + gate_pos,
-                rot.apply(via2_local) + gate_pos,
-            ]
+            via1_local = np.array([via1_x, y_side, a_local[2]], dtype=np.float64)
+            via2_local = np.array([via2_x, y_side, b_local[2]], dtype=np.float64)
+            via_points = [rot.apply(via1_local) + gate_pos, rot.apply(via2_local) + gate_pos]
             polyline = [
                 np.asarray(a, dtype=np.float64),
                 *via_points,
@@ -687,9 +630,7 @@ class MincoController(Controller):
         """
         T = max(float(T0), self.T_MIN_SEG)
         coeffs = quintic_bvp(
-            wp0["pos"], wp0["vel"], wp0["acc"],
-            wp1["pos"], wp1["vel"], wp1["acc"],
-            T,
+            wp0["pos"], wp0["vel"], wp0["acc"], wp1["pos"], wp1["vel"], wp1["acc"], T
         )
         for _ in range(4):
             v_peak, a_peak = _segment_peak_v_a(coeffs, T)
@@ -700,9 +641,7 @@ class MincoController(Controller):
                 return coeffs, T
             T = T * scale
             coeffs = quintic_bvp(
-                wp0["pos"], wp0["vel"], wp0["acc"],
-                wp1["pos"], wp1["vel"], wp1["acc"],
-                T,
+                wp0["pos"], wp0["vel"], wp0["acc"], wp1["pos"], wp1["vel"], wp1["acc"], T
             )
         return coeffs, T
 
@@ -751,9 +690,7 @@ class MincoController(Controller):
         # Cache trajectory samples for viz; also used for debug reads.
         if segments:
             ss = np.linspace(0.0, self._total_T, 120)
-            self._traj_samples = np.stack(
-                [self._eval(s, derivative=0) for s in ss], axis=0
-            )
+            self._traj_samples = np.stack([self._eval(s, derivative=0) for s in ss], axis=0)
             ds = np.linalg.norm(np.diff(self._traj_samples, axis=0), axis=1)
             self._traj_arc = np.concatenate(([0.0], np.cumsum(ds)))
         else:
@@ -1038,10 +975,7 @@ class MincoController(Controller):
                 path = path.with_suffix(f".{i}{path.suffix}")
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "wb") as f:
-                pickle.dump(
-                    {"replans": self._dump_replans, "ticks": self._dump_ticks},
-                    f,
-                )
+                pickle.dump({"replans": self._dump_replans, "ticks": self._dump_ticks}, f)
             self._dump_replans = []
             self._dump_ticks = []
 
@@ -1060,7 +994,4 @@ class MincoController(Controller):
         """Draw the planned trajectory (green) and the commanded setpoint (red)."""
         if self._traj_samples.shape[0] >= 2:
             draw_line(sim, self._traj_samples, rgba=(0.0, 1.0, 0.0, 1.0))
-        draw_points(
-            sim, self._cmd_pos.reshape(1, -1),
-            rgba=(1.0, 0.0, 0.0, 1.0), size=0.03,
-        )
+        draw_points(sim, self._cmd_pos.reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.03)

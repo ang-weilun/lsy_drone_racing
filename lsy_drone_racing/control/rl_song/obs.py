@@ -159,9 +159,7 @@ def build_actor_obs(
     vel_xy_body = vel_body[:2]
     vel_proj = unit_to_obstacle @ vel_xy_body
 
-    identity_onehot = jax.nn.one_hot(
-        nearest_indices, num_classes=N_OBSTACLES, dtype=jnp.float32
-    )
+    identity_onehot = jax.nn.one_hot(nearest_indices, num_classes=N_OBSTACLES, dtype=jnp.float32)
 
     obstacle_chan = jnp.concatenate(
         [nearest_xy_body, vel_proj[:, None], identity_onehot, nearest_visited[:, None]], axis=-1

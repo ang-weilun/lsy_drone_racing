@@ -145,5 +145,6 @@ def test_sfc_attitude_controller_completes_level0():
         if terminated or truncated:
             break
     env.close()
-    assert obs["target_gate"] == -1, \
+    assert obs["target_gate"] == -1, (
         f"SFC attitude controller failed level 0; final target_gate={obs['target_gate']}"
+    )

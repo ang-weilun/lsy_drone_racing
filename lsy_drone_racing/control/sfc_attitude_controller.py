@@ -17,9 +17,9 @@ if TYPE_CHECKING:
 
 from drone_models.core import load_params
 
+import lsy_drone_racing.control.sfc_config as cfg
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.sfc_planner import SfcPlanner
-import lsy_drone_racing.control.sfc_config as cfg
 
 # Position-controller gains (Newtons / metre, ported from attitude_controller.py)
 KP = cfg.KP
@@ -31,11 +31,11 @@ G = 9.81
 # Saturation / smoothing
 TILT_LIMIT = cfg.TILT_LIMIT
 TILT_RATE_LIMIT = cfg.TILT_RATE_LIMIT
-YAW_SPEED_THRESHOLD = 0.3                     # m/s
-Y_CROSS_EPS = 1e-3                            # singularity guard for cross(z_b_des, x_c)
+YAW_SPEED_THRESHOLD = 0.3  # m/s
+Y_CROSS_EPS = 1e-3  # singularity guard for cross(z_b_des, x_c)
 
 # Replan handling (used by the controller class, not the helper)
-REPLAN_I_RESET_THRESHOLD = 0.10               # m, horizontal-I reset gate
+REPLAN_I_RESET_THRESHOLD = 0.10  # m, horizontal-I reset gate
 
 
 def compute_attitude_command(
@@ -70,10 +70,7 @@ def compute_attitude_command(
     integrator_tentative = np.clip(integrator + e_p * dt, -KI_RANGE, KI_RANGE)
 
     # Mellinger-Kumar: F_des = m·a_ref + Kp·e_p + Ki·∫e_p + Kd·e_v + m·g·ẑ
-    F_des = (
-        mass * a_ref
-        + KP * e_p + KI * integrator_tentative + KD * e_v
-    )
+    F_des = mass * a_ref + KP * e_p + KI * integrator_tentative + KD * e_v
     F_des[2] += mass * G
 
     # Scalar collective thrust = projection on current body z, clamped
@@ -138,7 +135,7 @@ def compute_attitude_command(
 class SfcAttitudeController(Controller):
     """SFC tracker emitting [roll, pitch, yaw, thrust] via PID + acceleration FF."""
 
-    def __init__(self, obs, info, config) -> None:
+    def __init__(self, obs, info, config) -> None:  # noqa: ANN001, D107
         super().__init__(obs, info, config)
         self._freq = config.env.freq
         params = load_params(config.sim.physics, config.sim.drone_model)
@@ -151,13 +148,13 @@ class SfcAttitudeController(Controller):
         self._spline_tick = 0
         self._finished = False
         self._i_error = np.zeros(3)
-        self._yaw_prev = None       # lazy-init from current heading on first tick
+        self._yaw_prev = None  # lazy-init from current heading on first tick
         self._rpy_prev = np.zeros(3)
         self._y_b_prev = None
         self._replan_idx = 0
         self.planner = SfcPlanner(obs, self._freq)
 
-    def compute_control(self, obs, info=None):
+    def compute_control(self, obs, info=None):  # noqa: ANN001, ANN201, D102
         if self._yaw_prev is None:
             self._yaw_prev = float(R.from_quat(obs["quat"]).as_euler("xyz")[2])
 
@@ -185,14 +182,14 @@ class SfcAttitudeController(Controller):
                     t_search = np.linspace(t, t_max, 10)
                     min_dist = float(np.linalg.norm(obs["pos"] - des_pos))
                     best_t = t
-                    
+
                     for ts in t_search[1:]:
                         p, _, _ = self.planner.evaluate(float(ts))
                         dist = float(np.linalg.norm(obs["pos"] - p))
                         if dist < min_dist:
                             min_dist = dist
                             best_t = float(ts)
-                    
+
                     if best_t > t:
                         self._spline_tick = best_t * self._freq
                         t = best_t
@@ -201,23 +198,32 @@ class SfcAttitudeController(Controller):
         if t >= self.planner.t_total and obs.get("target_gate", 0) == -1:
             self._finished = True
 
-        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = \
+        action, self._i_error, self._yaw_prev, self._y_b_prev, self._rpy_prev = (
             compute_attitude_command(
-                obs["pos"], obs.get("vel", np.zeros(3)),
-                des_pos, des_vel, des_acc,
-                obs["quat"], self._mass,
-                self._i_error, self._thrust_min, self._thrust_max,
-                self._yaw_prev, self._y_b_prev, self._rpy_prev,
+                obs["pos"],
+                obs.get("vel", np.zeros(3)),
+                des_pos,
+                des_vel,
+                des_acc,
+                obs["quat"],
+                self._mass,
+                self._i_error,
+                self._thrust_min,
+                self._thrust_max,
+                self._yaw_prev,
+                self._y_b_prev,
+                self._rpy_prev,
             )
+        )
 
         return action
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info):
+    def step_callback(self, action, obs, reward, terminated, truncated, info):  # noqa: ANN001, ANN201, D102
         self._tick += 1
         self._spline_tick += 1
         return self._finished
 
-    def episode_callback(self):
+    def episode_callback(self):  # noqa: D102
         self._tick = 0
         self._spline_tick = 0
         self._finished = False
@@ -228,12 +234,15 @@ class SfcAttitudeController(Controller):
         self._replan_idx = 0
         self.planner.episode_reset()
 
-    def render_callback(self, sim):
+    def render_callback(self, sim):  # noqa: ANN001, D102
         if self.planner.t_total <= 0:
             return
         from crazyflow.sim.visualize import draw_line, draw_points
+
         u = min(self._spline_tick / self._freq, self.planner.t_total) / self.planner.t_total
-        draw_points(sim, self.planner.des_pos_spline(u).reshape(1, -1),
-                    rgba=(1.0, 0.0, 0.0, 1.0), size=0.04)
-        draw_line(sim, self.planner.des_pos_spline(np.linspace(0.0, 1.0, 100)),
-                  rgba=(0.0, 1.0, 0.0, 1.0))
+        draw_points(
+            sim, self.planner.des_pos_spline(u).reshape(1, -1), rgba=(1.0, 0.0, 0.0, 1.0), size=0.04
+        )
+        draw_line(
+            sim, self.planner.des_pos_spline(np.linspace(0.0, 1.0, 100)), rgba=(0.0, 1.0, 0.0, 1.0)
+        )

@@ -93,9 +93,7 @@ def sweep(
             reason = "collision"
 
         summary_lines.append(f"{seed},{int(gates_passed)},{reason},{curr_time:.3f}")
-        logger.info(
-            "seed=%d gates=%d reason=%s t=%.2f", seed, int(gates_passed), reason, curr_time
-        )
+        logger.info("seed=%d gates=%d reason=%s t=%.2f", seed, int(gates_passed), reason, curr_time)
 
         controller_inst.episode_reset()
 

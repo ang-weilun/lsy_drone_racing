@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from lsy_drone_racing.control.sfc_planner_relaxed import (
     Capsule,
@@ -42,19 +41,14 @@ def test_flight_corridor_initializes_room_bounds():
     assert len(corr.b) == 6
 
 
-def _minimal_obs():
+def _minimal_obs():  # noqa: ANN202
     """Obs fixture matching what level 0 emits at t=0: 4 gates, 4 obstacles, drone at start."""
     return {
         "pos": np.array([-1.5, 0.75, 0.05]),
         "vel": np.array([0.0, 0.0, 0.0]),
         "quat": np.array([0.0, 0.0, 0.0, 1.0]),
         "gates_pos": np.array(
-            [
-                [0.5, 0.25, 0.7],
-                [1.05, 0.75, 1.2],
-                [-1.0, -0.25, 0.7],
-                [0.0, -0.75, 1.2],
-            ]
+            [[0.5, 0.25, 0.7], [1.05, 0.75, 1.2], [-1.0, -0.25, 0.7], [0.0, -0.75, 1.2]]
         ),
         "gates_quat": np.array(
             [
@@ -80,7 +74,7 @@ def test_sfc_planner_constructs_initial_spline():
 
 
 def test_sfc_planner_evaluate_returns_time_scaled_derivatives():
-    """vel and acc must be in m/s and m/s², not in BSpline parameter units."""
+    """Vel and acc must be in m/s and m/s², not in BSpline parameter units."""
     from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
@@ -196,8 +190,9 @@ def test_sfc_planner_episode_reset_clears_replan_events():
 
 def test_tube_fence_holds_at_gate_planes():
     """Spline lateral offset at each gate's plane must stay inside the tube."""
-    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
     from scipy.spatial.transform import Rotation as R
+
+    from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     planner = SfcPlanner(_minimal_obs(), freq=50)
     spline = planner.des_pos_spline
@@ -230,7 +225,7 @@ def test_diagonal_gate_entry_when_prior_anchor_is_offset():
     """When the previous skeleton anchor is offset laterally from the gate normal,
     the spline should pass through the gate centre with a non-trivial cross angle —
     confirming the QP is using its diagonal freedom rather than forcing on-normal entry.
-    """
+    """  # noqa: D205
     from lsy_drone_racing.control.sfc_planner_relaxed import SfcPlanner
 
     # Build an obs where the drone starts well off the normal axis of gate 0.
@@ -241,9 +236,7 @@ def test_diagonal_gate_entry_when_prior_anchor_is_offset():
         "vel": np.array([0.0, 0.0, 0.0]),
         "quat": np.array([0.0, 0.0, 0.0, 1.0]),
         "gates_pos": np.array([[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]]),
-        "gates_quat": np.array(
-            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]
-        ),
+        "gates_quat": np.array([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]),
         "obstacles_pos": np.array([]).reshape(0, 3),
         "target_gate": 0,
     }
