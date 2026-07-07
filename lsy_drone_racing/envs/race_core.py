@@ -638,11 +638,15 @@ class RaceCoreEnv:
         self.sim.data = self.sim.data.replace(states=states)
         self.sim.build_default_data()
         # Build the reset randomizations and disturbances into the sim itself
-        append_fn(self.sim.reset_pipeline, build_drone_reset_fn(randomizations), name="randomize_drone")
+        append_fn(
+            self.sim.reset_pipeline, build_drone_reset_fn(randomizations), name="randomize_drone"
+        )
         self.sim.build_reset_fn()
         if dist := self.settings.disturbances.get("dynamics"):
             disturbance_fn = build_dynamics_disturbance_fn(dist)
-            insert_fn_before(self.sim.step_pipeline, "integration", disturbance_fn, name="disturbance")
+            insert_fn_before(
+                self.sim.step_pipeline, "integration", disturbance_fn, name="disturbance"
+            )
             self.sim.build_step_fn()
 
     def _load_track_into_sim(self, track: ConfigDict):
